@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import sqlite3
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
@@ -77,6 +77,13 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     _add_column(conn, "sale_items", "supplier_name", "TEXT DEFAULT ''")
     _add_column(conn, "sale_items", "supplier_due", "REAL NOT NULL DEFAULT 0")
     _add_column(conn, "sale_items", "shop_profit", "REAL NOT NULL DEFAULT 0")
+    conn.execute(
+        """
+        UPDATE sale_items
+        SET shop_profit = subtotal - purchase_price * quantity
+        WHERE shop_profit = 0 AND subtotal != 0
+        """
+    )
 
 
 def init_db() -> None:
@@ -88,8 +95,6 @@ def init_db() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
                 category TEXT NOT NULL DEFAULT 'accessory',
-                ownership_type TEXT NOT NULL DEFAULT 'own',
-                supplier_name TEXT DEFAULT '',
                 brand TEXT DEFAULT '',
                 sku TEXT DEFAULT '',
                 barcode TEXT DEFAULT '',
@@ -115,13 +120,9 @@ def init_db() -> None:
                 sale_id INTEGER NOT NULL,
                 product_id INTEGER,
                 product_name TEXT NOT NULL,
-                ownership_type TEXT NOT NULL DEFAULT 'own',
-                supplier_name TEXT DEFAULT '',
                 quantity INTEGER NOT NULL,
                 unit_price REAL NOT NULL,
                 purchase_price REAL NOT NULL DEFAULT 0,
-                supplier_due REAL NOT NULL DEFAULT 0,
-                shop_profit REAL NOT NULL DEFAULT 0,
                 subtotal REAL NOT NULL,
                 FOREIGN KEY (sale_id) REFERENCES sales(id) ON DELETE CASCADE
             );
@@ -133,14 +134,17 @@ def init_db() -> None:
                 notes TEXT DEFAULT '',
                 created_at TEXT NOT NULL
             );
-
+            """
+        )
+        migrate_db(conn)
+        conn.executescript(
+            """
             CREATE INDEX IF NOT EXISTS idx_products_name ON products(name);
             CREATE INDEX IF NOT EXISTS idx_products_barcode ON products(barcode);
             CREATE INDEX IF NOT EXISTS idx_products_ownership ON products(ownership_type);
             CREATE INDEX IF NOT EXISTS idx_sales_created ON sales(created_at);
             """
         )
-        migrate_db(conn)
 
         count = conn.execute("SELECT COUNT(*) FROM products").fetchone()[0]
         if count == 0:
@@ -275,14 +279,15 @@ class SupplierPaymentIn(BaseModel):
     notes: str = ""
 
 
-app = FastAPI(title=settings.store_name)
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-
-
-@app.on_event("startup")
-def on_startup():
+@asynccontextmanager
+async def lifespan(_: FastAPI):
     init_db()
     logger.info("DB: %s", DB_PATH)
+    yield
+
+
+app = FastAPI(title=settings.store_name, lifespan=lifespan)
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 @app.get("/")
