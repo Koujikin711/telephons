@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Магазин телефонов — Касса</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div id="login-screen" class="login-screen hidden">
+    <div class="login-card">
+      <div class="logo">📱</div>
+      <h1>Магазин телефонов</h1>
+      <p>Введите PIN для входа</p>
+      <input type="password" id="pin-input" placeholder="PIN" maxlength="12" autocomplete="off">
+      <button id="pin-submit" class="btn btn-primary">Войти</button>
+      <p id="pin-error" class="error hidden"></p>
+    </div>
+  </div>
+
+  <div id="app" class="app hidden">
+    <header class="header">
+      <div class="header-left">
+        <span class="logo-sm">📱</span>
+        <h1>Магазин телефонов</h1>
+      </div>
+      <nav class="tabs" id="tabs">
+        <button class="tab active" data-tab="pos">Касса</button>
+        <button class="tab" data-tab="sales">Продажи</button>
+        <button class="tab" data-tab="products">Товары</button>
+        <button class="tab" data-tab="analytics">Аналитика</button>
+      </nav>
+      <div class="header-right">
+        <span id="clock" class="clock"></span>
+      </div>
+    </header>
+
+    <main>
+      <!-- КАССА -->
+      <section id="tab-pos" class="tab-panel active">
+        <div class="pos-layout">
+          <div class="pos-catalog">
+            <div class="search-bar">
+              <input type="search" id="pos-search" placeholder="Поиск: название, штрихкод, бренд…" autofocus>
+              <select id="pos-category">
+                <option value="">Все категории</option>
+                <option value="phone">Телефоны</option>
+                <option value="accessory">Аксессуары</option>
+              </select>
+            </div>
+            <div id="pos-products" class="product-grid"></div>
+          </div>
+          <div class="pos-cart">
+            <h2>Чек</h2>
+            <div id="cart-items" class="cart-items"></div>
+            <div class="cart-empty" id="cart-empty">Добавьте товары в чек</div>
+            <div class="cart-summary">
+              <div class="row"><span>Подытог</span><span id="cart-subtotal">0 ₽</span></div>
+              <div class="row discount-row">
+                <label>Скидка</label>
+                <input type="number" id="cart-discount" value="0" min="0" step="10">
+              </div>
+              <div class="row total-row"><span>Итого</span><span id="cart-total">0 ₽</span></div>
+            </div>
+            <div class="payment-methods">
+              <button class="pay-btn active" data-pay="cash">💵 Наличные</button>
+              <button class="pay-btn" data-pay="card">💳 Карта</button>
+              <button class="pay-btn" data-pay="transfer">📲 Перевод</button>
+            </div>
+            <button id="checkout-btn" class="btn btn-checkout" disabled>Оформить продажу</button>
+            <button id="clear-cart-btn" class="btn btn-ghost">Очистить чек</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ПРОДАЖИ -->
+      <section id="tab-sales" class="tab-panel">
+        <div class="panel-header">
+          <h2>История продаж</h2>
+          <button id="refresh-sales" class="btn btn-ghost">Обновить</button>
+        </div>
+        <div id="sales-list" class="sales-list"></div>
+      </section>
+
+      <!-- ТОВАРЫ -->
+      <section id="tab-products" class="tab-panel">
+        <div class="panel-header">
+          <h2>Склад</h2>
+          <button id="add-product-btn" class="btn btn-primary">+ Добавить товар</button>
+        </div>
+        <div class="search-bar">
+          <input type="search" id="products-search" placeholder="Поиск товаров…">
+          <label class="checkbox-label">
+            <input type="checkbox" id="low-stock-filter"> Мало на складе
+          </label>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table" id="products-table">
+            <thead>
+              <tr>
+                <th>Название</th>
+                <th>Категория</th>
+                <th>Бренд</th>
+                <th>Закупка</th>
+                <th>Цена</th>
+                <th>Остаток</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="products-tbody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- АНАЛИТИКА -->
+      <section id="tab-analytics" class="tab-panel">
+        <div class="panel-header">
+          <h2>Аналитика</h2>
+          <select id="analytics-period">
+            <option value="day">Сегодня</option>
+            <option value="week">Неделя</option>
+            <option value="month" selected>Месяц</option>
+            <option value="all">Всё время</option>
+          </select>
+        </div>
+        <div class="stats-grid" id="stats-grid"></div>
+        <div class="analytics-charts">
+          <div class="chart-card">
+            <h3>Выручка по дням</h3>
+            <div id="daily-chart" class="bar-chart"></div>
+          </div>
+          <div class="chart-card">
+            <h3>Топ товаров</h3>
+            <div id="top-products" class="top-list"></div>
+          </div>
+          <div class="chart-card">
+            <h3>По категориям</h3>
+            <div id="category-stats" class="category-stats"></div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- Модалка товара -->
+  <dialog id="product-modal" class="modal">
+    <form id="product-form" method="dialog">
+      <h3 id="product-modal-title">Новый товар</h3>
+      <input type="hidden" id="pf-id">
+      <label>Название<input id="pf-name" required></label>
+      <div class="form-row">
+        <label>Категория
+          <select id="pf-category">
+            <option value="phone">Телефон</option>
+            <option value="accessory">Аксессуар</option>
+          </select>
+        </label>
+        <label>Бренд<input id="pf-brand"></label>
+      </div>
+      <div class="form-row">
+        <label>Артикул<input id="pf-sku"></label>
+        <label>Штрихкод<input id="pf-barcode"></label>
+      </div>
+      <div class="form-row">
+        <label>Закупка, ₽<input type="number" id="pf-purchase" min="0" step="1" required></label>
+        <label>Цена продажи, ₽<input type="number" id="pf-sale" min="0" step="1" required></label>
+      </div>
+      <div class="form-row">
+        <label>Остаток<input type="number" id="pf-stock" min="0" step="1" required></label>
+        <label>Мин. остаток<input type="number" id="pf-min-stock" min="0" step="1" value="2"></label>
+      </div>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-ghost" id="product-cancel">Отмена</button>
+        <button type="submit" class="btn btn-primary">Сохранить</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Модалка чека -->
+  <dialog id="receipt-modal" class="modal receipt-modal">
+    <div id="receipt-content"></div>
+    <div class="modal-actions">
+      <button class="btn btn-primary" id="receipt-close">Готово</button>
+      <button class="btn btn-ghost" id="receipt-print">Печать</button>
+    </div>
+  </dialog>
+
+  <!-- Toast -->
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
