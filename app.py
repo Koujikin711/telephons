@@ -1468,12 +1468,28 @@ async def stock_transfer(body: StockTransferIn, x_pin: str | None = Header(defau
 # --- Products ---
 
 
+@app.get("/api/products/meta/colors")
+async def product_colors(x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin)
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT TRIM(color) AS color
+            FROM products
+            WHERE TRIM(color) != ''
+            ORDER BY LOWER(color)
+            """
+        ).fetchall()
+    return [r["color"] for r in rows]
+
+
 @app.get("/api/products")
 async def list_products(
     q: str = "",
     category: str = "",
     ownership_type: str = "",
     supplier: str = "",
+    color: str = "",
     warehouse_id: int | None = None,
     low_stock: bool = False,
     x_pin: str | None = Header(default=None, alias="X-Pin"),
@@ -1490,12 +1506,14 @@ async def list_products(
         """
         params.append(warehouse_id)
     if q:
+        like = f"%{q.strip()}%"
         sql += """
-            AND (p.name LIKE ? OR p.brand LIKE ? OR p.sku LIKE ? OR p.barcode LIKE ?
-                 OR p.supplier_name LIKE ? OR p.model LIKE ? OR p.color LIKE ? OR p.memory LIKE ?)
+            AND (LOWER(p.name) LIKE LOWER(?) OR LOWER(p.brand) LIKE LOWER(?) OR LOWER(p.sku) LIKE LOWER(?)
+                 OR LOWER(p.barcode) LIKE LOWER(?) OR LOWER(p.supplier_name) LIKE LOWER(?)
+                 OR LOWER(p.model) LIKE LOWER(?) OR LOWER(p.color) LIKE LOWER(?)
+                 OR LOWER(p.memory) LIKE LOWER(?) OR LOWER(p.specs_extra) LIKE LOWER(?))
         """
-        like = f"%{q}%"
-        params.extend([like] * 8)
+        params.extend([like] * 9)
     if category:
         sql += " AND p.category = ?"
         params.append(category)
@@ -1505,6 +1523,9 @@ async def list_products(
     if supplier:
         sql += " AND p.supplier_name LIKE ?"
         params.append(f"%{supplier}%")
+    if color:
+        sql += " AND LOWER(TRIM(p.color)) LIKE LOWER(?)"
+        params.append(f"%{color.strip()}%")
     if low_stock:
         sql += " AND p.stock <= p.min_stock"
     sql += " ORDER BY p.ownership_type, p.name"

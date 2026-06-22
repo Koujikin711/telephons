@@ -46,8 +46,28 @@ function renderProductVisual(p, size = "") {
   return `<div class="product-visual ${cls}"><span class="product-visual-icon">${productPhIcon(p)}</span></div>`;
 }
 function productSpecChips(p) {
-  return [p.model, p.color, p.memory, p.ram, p.size].filter(Boolean).slice(0, 4)
-    .map((s) => `<span class="spec-chip">${esc(s)}</span>`).join("");
+  const parts = [];
+  if (p.color) parts.push(colorChipHtml(p.color));
+  [p.model, p.memory, p.ram, p.size].forEach((s) => {
+    if (!s) return;
+    const sLow = s.toLocaleLowerCase("ru");
+    if (p.color && p.color.toLocaleLowerCase("ru") === sLow) return;
+    parts.push(`<span class="spec-chip">${esc(s)}</span>`);
+  });
+  return parts.slice(0, 4).join("");
+}
+function productCatalogTitle(p) {
+  const name = String(p.name || "").trim();
+  const color = String(p.color || "").trim();
+  if (!color) return name;
+  const nLow = name.toLocaleLowerCase("ru");
+  const cLow = color.toLocaleLowerCase("ru");
+  if (nLow.includes(cLow)) return name;
+  return `${name} · ${color}`;
+}
+function colorChipHtml(color) {
+  if (!color) return "";
+  return `<span class="spec-chip spec-chip-color">${esc(color)}</span>`;
 }
 function stockBadgeClass(p) {
   if (p.stock <= 0) return "out";
@@ -151,7 +171,10 @@ async function handleProductImageFile(file) {
       pendingProductImageUrl = null;
       setProductImagePreview(updated);
       toast("Фото загружено");
-      if (currentPage === "catalog") loadCatalog();
+      if (currentPage === "catalog") {
+      loadCatalog();
+      loadCatalogColors();
+    }
     } catch (err) {
       toast(err.message, "error");
     } finally {
@@ -814,10 +837,11 @@ window.voidSale = async (id) => {
 
 /* ── Catalog ── */
 function bindCatalog() {
-  ["catalog-search", "catalog-category", "catalog-ownership", "catalog-sort"].forEach((id) => {
-    const el = document.getElementById(id);
-    el?.addEventListener(id === "catalog-search" ? "input" : "change", debounce(loadCatalog, 280));
+  ["catalog-search", "catalog-category", "catalog-ownership", "catalog-color", "catalog-sort"].forEach((id) => {
+    const node = document.getElementById(id);
+    node?.addEventListener(id === "catalog-search" ? "input" : "change", debounce(loadCatalog, 280));
   });
+  loadCatalogColors();
   document.getElementById("catalog-detail-close")?.addEventListener("click", () => {
     document.getElementById("catalog-detail-modal").close();
   });
@@ -827,14 +851,30 @@ function bindCatalog() {
   });
 }
 
+async function loadCatalogColors() {
+  const sel = document.getElementById("catalog-color");
+  if (!sel) return;
+  const cur = sel.value;
+  try {
+    const colors = await api("/api/products/meta/colors");
+    sel.innerHTML = '<option value="">Все цвета</option>' +
+      colors.map((c) => `<option value="${esc(c)}">${esc(c)}</option>`).join("");
+    if (cur && colors.includes(cur)) sel.value = cur;
+  } catch {
+    /* ignore */
+  }
+}
+
 async function loadCatalog() {
   const q = document.getElementById("catalog-search")?.value || "";
   const cat = document.getElementById("catalog-category")?.value || "";
   const own = document.getElementById("catalog-ownership")?.value || "";
+  const color = document.getElementById("catalog-color")?.value || "";
   const sort = document.getElementById("catalog-sort")?.value || "name";
   let url = `/api/products?q=${encodeURIComponent(q)}`;
   if (cat) url += `&category=${cat}`;
   if (own) url += `&ownership_type=${own}`;
+  if (color) url += `&color=${encodeURIComponent(color)}`;
   catalogProducts = await api(url);
   const items = sortCatalogItems(catalogProducts, sort);
   const grid = document.getElementById("catalog-grid");
@@ -862,8 +902,8 @@ async function loadCatalog() {
         </div>
       </div>
       <div class="catalog-card-body">
-        <div class="catalog-card-title">${esc(p.name)}</div>
-        <div class="catalog-card-meta">${esc(p.brand || "—")}${p.sku ? ` · ${esc(p.sku)}` : ""}</div>
+        <div class="catalog-card-title">${esc(productCatalogTitle(p))}</div>
+        <div class="catalog-card-meta">${esc(p.brand || "—")}${p.model && !productCatalogTitle(p).toLocaleLowerCase("ru").includes(String(p.model).toLocaleLowerCase("ru")) ? ` · ${esc(p.model)}` : ""}${p.sku ? ` · ${esc(p.sku)}` : ""}</div>
         <div class="catalog-card-specs">${productSpecChips(p) || `<span class="spec-chip">${conditionLabel(p.condition)}</span>`}</div>
         <div class="catalog-card-footer">
           <div class="catalog-card-price">${fmt(p.sale_price)}</div>
@@ -900,7 +940,7 @@ window.openCatalogDetail = async (id) => {
         <span class="tag tag-${p.category}">${catLabel(p.category)}</span>
         ${p.track_units ? '<span class="tag tag-phone">Учёт IMEI</span>' : ""}
       </div>
-      <h3>${esc(p.name)}</h3>
+      <h3>${esc(productCatalogTitle(p))}</h3>
       <div class="catalog-detail-brand">${esc(p.brand || "")}${p.supplier_name ? ` · ${esc(p.supplier_name)}` : ""}</div>
       <div class="catalog-detail-price">${fmt(p.sale_price)}</div>
       <span class="catalog-card-stock ${stockBadgeClass(p)}">${stockBadgeText(p)}</span>
@@ -1592,7 +1632,10 @@ function bindProducts() {
       try {
         await api(`/api/products/${id}/image`, { method: "DELETE" });
         toast("Фото удалено");
-        if (currentPage === "catalog") loadCatalog();
+        if (currentPage === "catalog") {
+      loadCatalog();
+      loadCatalogColors();
+    }
       } catch (err) { toast(err.message, "error"); return; }
     }
     setProductImagePreview({ category: document.getElementById("pf-category").value });
@@ -1827,7 +1870,10 @@ window.deleteProduct = async (id) => {
     toast("Удалено");
     loadOwnProducts();
     loadConsProducts();
-    if (currentPage === "catalog") loadCatalog();
+    if (currentPage === "catalog") {
+      loadCatalog();
+      loadCatalogColors();
+    }
     if (currentPage === "pos") loadProducts();
   } catch (e) { toast(e.message, "error"); }
 };
@@ -1896,7 +1942,10 @@ async function saveProduct(e) {
     toast(id ? "Товар обновлён" : "Товар создан");
     loadOwnProducts();
     loadConsProducts();
-    if (currentPage === "catalog") loadCatalog();
+    if (currentPage === "catalog") {
+      loadCatalog();
+      loadCatalogColors();
+    }
     if (currentPage === "pos") loadProducts();
   } catch (err) {
     toast(err.message || "Ошибка сохранения", "error");
