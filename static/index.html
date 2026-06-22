@@ -211,9 +211,17 @@
               </table></div>
             </div>
           </div>
+          <div class="card">
+            <div class="card-header">
+              <h3>Журнал перемещений</h3>
+              <button id="wh-refresh-movements" class="btn btn-ghost btn-sm">Обновить</button>
+            </div>
+            <div class="table-wrap"><table class="data-table">
+              <thead><tr><th>Дата</th><th>Откуда</th><th>Куда</th><th>Товар</th><th>Кол-во</th><th></th></tr></thead>
+              <tbody id="wh-movements-tbody"></tbody>
+            </table></div>
+          </div>
         </section>
-
-        <!-- OWN PRODUCTS -->
         <section id="page-products-own" class="page">
           <div class="toolbar">
             <input type="search" id="own-search" class="input" placeholder="Поиск…">
@@ -311,7 +319,21 @@
               </form>
             </div>
             <div class="card">
-              <div class="card-header"><h3>История обменов</h3></div>
+              <div class="card-header">
+                <h3>История обменов</h3>
+                <div class="wh-actions">
+                  <select id="ti-report-period" class="select sm-select">
+                    <option value="day">Сегодня</option>
+                    <option value="week">Неделя</option>
+                    <option value="month" selected>Месяц</option>
+                    <option value="quarter">Квартал</option>
+                    <option value="year">Год</option>
+                    <option value="all">Всё время</option>
+                  </select>
+                  <button id="ti-print-report" class="btn btn-ghost btn-sm">Печать отчёта</button>
+                </div>
+              </div>
+              <div id="ti-report-summary" class="card-body ti-report-kpi"></div>
               <div class="table-wrap"><table class="data-table">
                 <thead><tr><th>Дата</th><th>Выдано</th><th>Принято</th><th>Зачёт</th><th>Доплата</th><th>Склады</th></tr></thead>
                 <tbody id="ti-history-tbody"></tbody>
@@ -327,6 +349,7 @@
               <button class="seg active" data-scope="all">Общий</button>
               <button class="seg" data-scope="own">Собственные</button>
               <button class="seg" data-scope="consignment">Реализация</button>
+              <button class="seg" data-scope="trade_ins">Обмены</button>
             </div>
             <select id="report-period" class="select">
               <option value="day">Сегодня</option>
@@ -483,6 +506,14 @@
     <div class="modal-actions">
       <button class="btn btn-primary" id="receipt-close">Готово</button>
       <button class="btn btn-ghost" id="receipt-print">Печать</button>
+    </div>
+  </dialog>
+
+  <dialog id="transfer-doc-modal" class="modal modal-lg">
+    <div id="transfer-doc-content" class="transfer-doc"></div>
+    <div class="modal-actions">
+      <button class="btn btn-primary" id="transfer-doc-close">Закрыть</button>
+      <button class="btn btn-secondary" id="transfer-doc-print">Печать накладной</button>
     </div>
   </dialog>
 

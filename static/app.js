@@ -17,7 +17,7 @@ const pct = (a, b) => b ? Math.round((a / b) * 100) : 0;
 const catLabel = (c) => ({ phone: "Телефон", accessory: "Аксессуар" }[c] || c);
 const ownLabel = (o) => ({ own: "Собственный", consignment: "Реализация" }[o] || o);
 const payLabel = (p) => ({ cash: "Наличные", card: "Карта", transfer: "Перевод", trade_in: "Обмен" }[p] || p);
-const scopeLabel = (s) => ({ all: "Общий", own: "Собственные", consignment: "Реализация" }[s] || s);
+const scopeLabel = (s) => ({ all: "Общий", own: "Собственные", consignment: "Реализация", trade_ins: "Обмены" }[s] || s);
 const conditionLabel = (c) => ({ new: "Новый", used: "Б/у", refurbished: "Восстановленный" }[c] || c);
 const esc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 const dash = (s) => s ? esc(s) : "—";
@@ -480,6 +480,9 @@ function bindWarehouses() {
       ? "Показать выбранный склад" : "Сводка по всем складам";
     loadWarehouseStock();
   };
+  document.getElementById("wh-refresh-movements").onclick = loadWarehouseMovements;
+  document.getElementById("transfer-doc-close").onclick = () => document.getElementById("transfer-doc-modal").close();
+  document.getElementById("transfer-doc-print").onclick = () => printTransferDocument();
 }
 
 async function loadWarehousesPage() {
@@ -487,6 +490,7 @@ async function loadWarehousesPage() {
   renderWarehouseList();
   if (!selectedWarehouseId) selectedWarehouseId = defaultWarehouseId();
   await loadWarehouseStock();
+  await loadWarehouseMovements();
 }
 
 function renderWarehouseList() {
@@ -630,21 +634,100 @@ async function submitStockMove(e) {
     if (type === "transfer") {
       const to = +document.getElementById("sm-to-warehouse").value;
       if (!to) { toast("Выберите склад назначения", "error"); return; }
-      await api("/api/stock/transfer", {
+      const res = await api("/api/stock/transfer", {
         method: "POST",
         body: JSON.stringify({ product_id, from_warehouse_id: selectedWarehouseId, to_warehouse_id: to, quantity, notes }),
       });
+      document.getElementById("stock-move-modal").close();
+      toast("Перемещение проведено");
+      if (res.transfer_document) showTransferDocument(res.transfer_document);
     } else {
       await api(`/api/stock/${type}`, {
         method: "POST",
         body: JSON.stringify({ warehouse_id: selectedWarehouseId, product_id, quantity, notes }),
       });
+      document.getElementById("stock-move-modal").close();
+      toast("Проведено");
     }
-    document.getElementById("stock-move-modal").close();
-    toast("Проведено");
     loadWarehouseStock();
+    loadWarehouseMovements();
     if (currentPage === "pos") loadProducts();
   } catch (err) { toast(err.message, "error"); }
+}
+
+function renderTransferDocHtml(d) {
+  const specs = [d.product_model, d.product_color, d.product_memory].filter(Boolean).join(" · ");
+  return `
+    <div class="td-header">
+      <div class="td-title">НАКЛАДНАЯ НА ПЕРЕМЕЩЕНИЕ</div>
+      <div class="td-meta">№ ${d.id} · ${d.created_at}</div>
+    </div>
+    <table class="td-table">
+      <tr><td class="td-lbl">Склад отправления</td><td><strong>${esc(d.from_warehouse_name)}</strong>${d.from_warehouse_address ? `<br><span class="td-sub">${esc(d.from_warehouse_address)}</span>` : ""}</td></tr>
+      <tr><td class="td-lbl">Склад назначения</td><td><strong>${esc(d.to_warehouse_name)}</strong>${d.to_warehouse_address ? `<br><span class="td-sub">${esc(d.to_warehouse_address)}</span>` : ""}</td></tr>
+      <tr><td class="td-lbl">Товар</td><td><strong>${esc(d.product_name)}</strong>${specs ? `<br><span class="td-sub">${esc(specs)}</span>` : ""}${d.product_sku ? `<br><span class="td-sub">Арт: ${esc(d.product_sku)}</span>` : ""}</td></tr>
+      <tr><td class="td-lbl">Количество</td><td><strong>${d.quantity} шт.</strong></td></tr>
+      ${d.notes ? `<tr><td class="td-lbl">Примечание</td><td>${esc(d.notes)}</td></tr>` : ""}
+    </table>
+    <div class="td-signatures">
+      <div><span>Отпустил</span><div class="td-line"></div></div>
+      <div><span>Принял</span><div class="td-line"></div></div>
+    </div>`;
+}
+
+function showTransferDocument(doc) {
+  document.getElementById("transfer-doc-content").innerHTML = renderTransferDocHtml(doc);
+  document.getElementById("transfer-doc-modal").showModal();
+}
+
+window.printTransferById = async (id) => {
+  try {
+    const d = await api(`/api/stock/transfers/${id}/document`);
+    const w = window.open("", "_blank");
+    w.document.write(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Накладная №${d.id}</title>
+      <style>body{font-family:Arial,sans-serif;padding:32px;max-width:720px;margin:0 auto}
+      .td-title{font-size:18px;font-weight:700;text-align:center;margin-bottom:4px}
+      .td-meta{text-align:center;color:#666;margin-bottom:24px}
+      table{width:100%;border-collapse:collapse;margin:16px 0}
+      td{padding:8px;border-bottom:1px solid #ddd;vertical-align:top}
+      .td-lbl{width:180px;color:#555}
+      .td-sub{font-size:12px;color:#666}
+      .td-signatures{display:flex;gap:48px;margin-top:48px}
+      .td-signatures div{flex:1}
+      .td-line{border-bottom:1px solid #000;margin-top:32px}</style></head><body>${renderTransferDocHtml(d)}</body></html>`);
+    w.document.close();
+    w.print();
+  } catch (e) { toast(e.message, "error"); }
+};
+
+function printTransferDocument() {
+  const html = document.getElementById("transfer-doc-content").innerHTML;
+  const w = window.open("", "_blank");
+  w.document.write(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Накладная</title>
+    <style>body{font-family:Arial,sans-serif;padding:32px;max-width:720px;margin:0 auto}
+    .td-title{font-size:18px;font-weight:700;text-align:center}.td-meta{text-align:center;color:#666}
+    table{width:100%;border-collapse:collapse;margin:16px 0}td{padding:8px;border-bottom:1px solid #ddd}
+    .td-lbl{width:180px;color:#555}.td-sub{font-size:12px;color:#666}
+    .td-signatures{display:flex;gap:48px;margin-top:48px}.td-signatures div{flex:1}
+    .td-line{border-bottom:1px solid #000;margin-top:32px}</style></head><body>${html}</body></html>`);
+  w.document.close();
+  w.print();
+}
+
+async function loadWarehouseMovements() {
+  let url = "/api/stock/movements?movement_type=transfer_out&limit=30";
+  if (selectedWarehouseId && !whStockViewTotal) url += `&warehouse_id=${selectedWarehouseId}`;
+  const rows = await api(url);
+  const tb = document.getElementById("wh-movements-tbody");
+  tb.innerHTML = rows.map((m) => `
+    <tr>
+      <td>${m.created_at}</td>
+      <td>${esc(m.warehouse_name)}</td>
+      <td>${esc(m.target_warehouse_name || "—")}</td>
+      <td>${esc(m.product_name)}${m.product_model ? `<br><span style="font-size:.75rem;color:var(--muted)">${esc(m.product_model)}</span>` : ""}</td>
+      <td>${m.quantity}</td>
+      <td><button class="btn btn-ghost btn-sm" onclick="printTransferById(${m.id})">Печать</button></td>
+    </tr>`).join("") || '<tr><td colspan="6" style="text-align:center;color:var(--muted)">Нет перемещений</td></tr>';
 }
 
 /* ── Trade-in ── */
@@ -655,6 +738,8 @@ function bindTradeIn() {
     document.getElementById(id).addEventListener("input", updateTiSummary);
   });
   document.getElementById("trade-in-form").onsubmit = submitTradeIn;
+  document.getElementById("ti-report-period").addEventListener("change", loadTiReport);
+  document.getElementById("ti-print-report").onclick = printTiReport;
 }
 
 async function loadTradeInPage() {
@@ -663,6 +748,38 @@ async function loadTradeInPage() {
   fillWarehouseSelect(document.getElementById("ti-received-warehouse"), document.getElementById("ti-received-warehouse").value || defaultWarehouseId());
   await loadTiGivenProducts();
   await loadTiHistory();
+  await loadTiReport();
+}
+
+async function loadTiReport() {
+  const period = document.getElementById("ti-report-period").value;
+  const r = await api(`/api/reports/trade-ins?period=${period}`);
+  document.getElementById("ti-report-summary").innerHTML = `
+    <div class="report-kpi" style="margin:0">
+      <div class="report-box"><div class="lbl">Сделок</div><div class="val">${r.deals_count}</div></div>
+      <div class="report-box"><div class="lbl">Зачёт (trade-in)</div><div class="val">${fmt(r.total_trade_credit)}</div></div>
+      <div class="report-box"><div class="lbl">Наличные</div><div class="val">${fmt(r.total_cash)}</div></div>
+      <div class="report-box"><div class="lbl">Карта</div><div class="val">${fmt(r.total_card)}</div></div>
+      <div class="report-box"><div class="lbl">Деньги всего</div><div class="val" style="color:var(--success)">${fmt(r.total_money)}</div></div>
+      <div class="report-box"><div class="lbl">Сумма сделок</div><div class="val">${fmt(r.total_deal_value)}</div></div>
+    </div>`;
+}
+
+function printTiReport() {
+  const period = document.getElementById("ti-report-period").selectedOptions[0].textContent;
+  const summary = document.getElementById("ti-report-summary").innerHTML;
+  const table = document.querySelector("#page-trade-in .data-table").outerHTML;
+  const w = window.open("", "_blank");
+  w.document.write(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Отчёт по обменам</title>
+    <style>body{font-family:Arial;padding:24px}h2{margin:0 0 8px}p{color:#666}
+    table{border-collapse:collapse;width:100%;margin-top:16px;font-size:12px}
+    th,td{border:1px solid #ccc;padding:6px;text-align:left}
+    .report-kpi{display:flex;flex-wrap:wrap;gap:8px;margin:16px 0}
+    .report-box{border:1px solid #ddd;padding:8px 12px;border-radius:6px;min-width:120px}
+    .lbl{font-size:10px;color:#666;text-transform:uppercase}.val{font-size:16px;font-weight:700}</style>
+    </head><body><h2>Отчёт по обменам (trade-in)</h2><p>Период: ${period}</p>${summary}${table}</body></html>`);
+  w.document.close();
+  w.print();
 }
 
 async function loadTiGivenProducts() {
@@ -743,6 +860,7 @@ async function submitTradeIn(e) {
     document.getElementById("ti-received-condition").value = "used";
     await loadTiGivenProducts();
     await loadTiHistory();
+    await loadTiReport();
   } catch (err) { toast(err.message, "error"); }
 }
 
@@ -1080,6 +1198,43 @@ async function loadReport() {
   const period = document.getElementById("report-period").value;
   const from = document.getElementById("report-from").value;
   const to = document.getElementById("report-to").value;
+  const combinedEl = document.getElementById("report-combined");
+
+  if (reportScope === "trade_ins") {
+    let url = `/api/reports/trade-ins?period=${period}`;
+    if (from) url += `&date_from=${from}`;
+    if (to) url += `&date_to=${to}`;
+    const r = await api(url);
+    combinedEl.classList.add("hidden");
+    document.getElementById("report-content").innerHTML = `
+      <div class="report-header"><h3>Отчёт по обменам (trade-in)</h3><p>${r.period_label}</p></div>
+      <div class="report-kpi">
+        <div class="report-box"><div class="lbl">Сделок</div><div class="val">${r.deals_count}</div></div>
+        <div class="report-box"><div class="lbl">Зачёт старых телефонов</div><div class="val">${fmt(r.total_trade_credit)}</div></div>
+        <div class="report-box"><div class="lbl">Наличные доплата</div><div class="val">${fmt(r.total_cash)}</div></div>
+        <div class="report-box"><div class="lbl">Карта доплата</div><div class="val">${fmt(r.total_card)}</div></div>
+        <div class="report-box"><div class="lbl">Деньги в кассу</div><div class="val" style="color:var(--success)">${fmt(r.total_money)}</div></div>
+        <div class="report-box"><div class="lbl">Объём сделок</div><div class="val">${fmt(r.total_deal_value)}</div></div>
+      </div>
+      ${r.by_warehouse?.length ? `<div class="card"><div class="card-header"><h3>По складам выдачи</h3></div><div class="card-body"><table class="data-table"><thead><tr><th>Склад</th><th>Сделок</th><th>Деньги</th><th>Зачёт</th></tr></thead><tbody>
+        ${r.by_warehouse.map((w) => `<tr><td>${esc(w.warehouse_name)}</td><td>${w.deals}</td><td>${fmt(w.money)}</td><td>${fmt(w.trade_credit)}</td></tr>`).join("")}
+      </tbody></table></div></div>` : ""}
+      <div class="card"><div class="card-header"><h3>Детализация</h3></div><div class="card-body table-wrap"><table class="data-table"><thead><tr>
+        <th>Дата</th><th>Выдано</th><th>Принято</th><th>Зачёт</th><th>Наличные</th><th>Карта</th><th>Склады</th>
+      </tr></thead><tbody>
+        ${r.items.map((t) => `<tr>
+          <td>${t.created_at}</td>
+          <td>${esc(t.given_product_name)}</td>
+          <td>${esc(t.received_name)}</td>
+          <td>${fmt(t.received_value)}</td>
+          <td>${fmt(t.cash_amount)}</td>
+          <td>${fmt(t.card_amount)}</td>
+          <td>${esc(t.given_warehouse_name)} → ${esc(t.received_warehouse_name)}</td>
+        </tr>`).join("") || '<tr><td colspan="7">Нет данных</td></tr>'}
+      </tbody></table></div></div>`;
+    return;
+  }
+
   let url = `/api/reports/finance?scope=${reportScope}&period=${period}`;
   if (from) url += `&date_from=${from}`;
   if (to) url += `&date_to=${to}`;

@@ -212,6 +212,17 @@ body { font-family: 'Inter', system-ui, sans-serif; background: var(--bg); color
 .textarea { resize: vertical; min-height: 56px; font-family: inherit; }
 .form-divider { border: none; border-top: 1px solid var(--border); margin: .75rem 0; }
 #pos-warehouse { min-width: 140px; max-width: 180px; flex: 0 1 auto; }
+.sm-select { font-size: .8rem; padding: .35rem .5rem; }
+.ti-report-kpi { padding-top: 0 !important; }
+.transfer-doc .td-title { font-size: 1.1rem; font-weight: 700; text-align: center; margin-bottom: .25rem; }
+.transfer-doc .td-meta { text-align: center; color: var(--muted); margin-bottom: 1rem; font-size: .85rem; }
+.transfer-doc .td-table { width: 100%; border-collapse: collapse; margin: 1rem 0; font-size: .9rem; }
+.transfer-doc .td-table td { padding: .6rem .5rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+.transfer-doc .td-lbl { width: 40%; color: var(--text-secondary); font-weight: 500; }
+.transfer-doc .td-sub { font-size: .8rem; color: var(--muted); }
+.transfer-doc .td-signatures { display: flex; gap: 2rem; margin-top: 2rem; font-size: .85rem; }
+.transfer-doc .td-signatures div { flex: 1; }
+.transfer-doc .td-line { border-bottom: 1px solid var(--text); margin-top: 2rem; }
 
 @media (max-width: 1100px) {
   .grid-3, .compare-grid, .grid-2 { grid-template-columns: 1fr; }

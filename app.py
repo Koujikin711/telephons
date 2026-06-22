@@ -378,8 +378,8 @@ def record_stock_movement(
     target_warehouse_id: int | None = None,
     reference_id: int | None = None,
     notes: str = "",
-) -> None:
-    conn.execute(
+) -> int:
+    cur = conn.execute(
         """
         INSERT INTO stock_movements
         (warehouse_id, product_id, movement_type, quantity, target_warehouse_id, reference_id, notes, created_at)
@@ -387,6 +387,7 @@ def record_stock_movement(
         """,
         (warehouse_id, product_id, movement_type, quantity, target_warehouse_id, reference_id, notes, utc_now()),
     )
+    return int(cur.lastrowid)
 
 
 def adjust_warehouse_stock(
@@ -399,9 +400,9 @@ def adjust_warehouse_stock(
     target_warehouse_id: int | None = None,
     reference_id: int | None = None,
     notes: str = "",
-) -> int:
+) -> tuple[int, int | None]:
     if delta == 0:
-        return get_warehouse_stock(conn, warehouse_id, product_id)
+        return get_warehouse_stock(conn, warehouse_id, product_id), None
     current = get_warehouse_stock(conn, warehouse_id, product_id)
     new_qty = current + delta
     if new_qty < 0:
@@ -427,14 +428,14 @@ def adjust_warehouse_stock(
             """,
             (new_qty, warehouse_id, product_id),
         )
-    record_stock_movement(
+    movement_id = record_stock_movement(
         conn, warehouse_id, product_id, movement_type, abs(delta),
         target_warehouse_id=target_warehouse_id,
         reference_id=reference_id,
         notes=notes,
     )
     sync_product_stock(conn, product_id)
-    return new_qty
+    return new_qty, movement_id
 
 
 def enrich_product(conn: sqlite3.Connection, product: sqlite3.Row) -> dict[str, Any]:
@@ -813,6 +814,108 @@ async def stock_outbound(body: StockMovementIn, x_pin: str | None = Header(defau
         return enrich_product(conn, product) if product else {"ok": True}
 
 
+def _build_transfer_document(
+    conn: sqlite3.Connection,
+    movement_id: int,
+    body: StockTransferIn,
+    created_at: str,
+) -> dict[str, Any]:
+    product = conn.execute("SELECT * FROM products WHERE id = ?", (body.product_id,)).fetchone()
+    from_wh = conn.execute("SELECT * FROM warehouses WHERE id = ?", (body.from_warehouse_id,)).fetchone()
+    to_wh = conn.execute("SELECT * FROM warehouses WHERE id = ?", (body.to_warehouse_id,)).fetchone()
+    return {
+        "id": movement_id,
+        "created_at": created_at,
+        "from_warehouse_id": body.from_warehouse_id,
+        "from_warehouse_name": from_wh["name"] if from_wh else "",
+        "from_warehouse_address": from_wh["address"] if from_wh else "",
+        "to_warehouse_id": body.to_warehouse_id,
+        "to_warehouse_name": to_wh["name"] if to_wh else "",
+        "to_warehouse_address": to_wh["address"] if to_wh else "",
+        "product_id": body.product_id,
+        "product_name": product["name"] if product else "",
+        "product_model": product["model"] if product else "",
+        "product_color": product["color"] if product else "",
+        "product_memory": product["memory"] if product else "",
+        "product_sku": product["sku"] if product else "",
+        "quantity": body.quantity,
+        "notes": body.notes or "",
+    }
+
+
+@app.get("/api/stock/movements")
+async def list_stock_movements(
+    warehouse_id: int | None = None,
+    movement_type: str = "",
+    limit: int = Query(default=50, ge=1, le=200),
+    x_pin: str | None = Header(default=None, alias="X-Pin"),
+):
+    check_pin(x_pin)
+    sql = """
+        SELECT m.*,
+               p.name AS product_name, p.model AS product_model, p.sku AS product_sku,
+               w.name AS warehouse_name,
+               tw.name AS target_warehouse_name
+        FROM stock_movements m
+        JOIN products p ON p.id = m.product_id
+        JOIN warehouses w ON w.id = m.warehouse_id
+        LEFT JOIN warehouses tw ON tw.id = m.target_warehouse_id
+        WHERE 1=1
+    """
+    params: list[Any] = []
+    if warehouse_id is not None:
+        sql += " AND (m.warehouse_id = ? OR m.target_warehouse_id = ?)"
+        params.extend([warehouse_id, warehouse_id])
+    if movement_type:
+        sql += " AND m.movement_type = ?"
+        params.append(movement_type)
+    sql += " ORDER BY m.created_at DESC LIMIT ?"
+    params.append(limit)
+    with db() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return [row_to_dict(r) for r in rows]
+
+
+@app.get("/api/stock/transfers/{movement_id}/document")
+async def get_transfer_document(movement_id: int, x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin)
+    with db() as conn:
+        m = conn.execute(
+            """
+            SELECT m.*, p.name AS product_name, p.model AS product_model,
+                   p.color AS product_color, p.memory AS product_memory, p.sku AS product_sku,
+                   w.name AS from_warehouse_name, w.address AS from_warehouse_address,
+                   tw.name AS to_warehouse_name, tw.address AS to_warehouse_address
+            FROM stock_movements m
+            JOIN products p ON p.id = m.product_id
+            JOIN warehouses w ON w.id = m.warehouse_id
+            LEFT JOIN warehouses tw ON tw.id = m.target_warehouse_id
+            WHERE m.id = ? AND m.movement_type = 'transfer_out'
+            """,
+            (movement_id,),
+        ).fetchone()
+        if not m:
+            raise HTTPException(status_code=404, detail="Накладная не найдена")
+    return {
+        "id": m["id"],
+        "created_at": m["created_at"],
+        "from_warehouse_id": m["warehouse_id"],
+        "from_warehouse_name": m["from_warehouse_name"],
+        "from_warehouse_address": m["from_warehouse_address"] or "",
+        "to_warehouse_id": m["target_warehouse_id"],
+        "to_warehouse_name": m["to_warehouse_name"] or "",
+        "to_warehouse_address": m["to_warehouse_address"] or "",
+        "product_id": m["product_id"],
+        "product_name": m["product_name"],
+        "product_model": m["product_model"] or "",
+        "product_color": m["product_color"] or "",
+        "product_memory": m["product_memory"] or "",
+        "product_sku": m["product_sku"] or "",
+        "quantity": m["quantity"],
+        "notes": m["notes"] or "",
+    }
+
+
 @app.post("/api/stock/transfer")
 async def stock_transfer(body: StockTransferIn, x_pin: str | None = Header(default=None, alias="X-Pin")):
     check_pin(x_pin)
@@ -823,18 +926,24 @@ async def stock_transfer(body: StockTransferIn, x_pin: str | None = Header(defau
             raise HTTPException(status_code=404, detail="Товар не найден")
         resolve_warehouse_id(conn, body.from_warehouse_id)
         resolve_warehouse_id(conn, body.to_warehouse_id)
-        adjust_warehouse_stock(
+        now = utc_now()
+        notes = body.notes or "Перемещение между складами"
+        _, movement_id = adjust_warehouse_stock(
             conn, body.from_warehouse_id, body.product_id, -body.quantity,
-            "transfer_out", target_warehouse_id=body.to_warehouse_id,
-            notes=body.notes or "Перемещение между складами",
+            "transfer_out", target_warehouse_id=body.to_warehouse_id, notes=notes,
         )
         adjust_warehouse_stock(
             conn, body.to_warehouse_id, body.product_id, body.quantity,
-            "transfer_in", target_warehouse_id=body.from_warehouse_id,
-            notes=body.notes or "Перемещение между складами",
+            "transfer_in", target_warehouse_id=body.from_warehouse_id, notes=notes,
         )
+        document = _build_transfer_document(conn, movement_id or 0, body, now)
         product = conn.execute("SELECT * FROM products WHERE id = ?", (body.product_id,)).fetchone()
-        return enrich_product(conn, product) if product else {"ok": True}
+        result = enrich_product(conn, product) if product else {"ok": True}
+        if isinstance(result, dict):
+            result["transfer_document"] = document
+        else:
+            result = {"ok": True, "transfer_document": document}
+        return result
 
 
 # --- Products ---
@@ -1432,6 +1541,91 @@ def _finance_report(conn: sqlite3.Connection, period: str, scope: str, date_from
             {"method": r["payment_method"], "count": r["cnt"], "amount": float(r["amount"])}
             for r in payment_rows
         ],
+    }
+
+
+@app.get("/api/reports/trade-ins")
+async def trade_ins_report(
+    period: str = Query(default="month", pattern="^(day|week|month|quarter|year|all)$"),
+    date_from: str = "",
+    date_to: str = "",
+    x_pin: str | None = Header(default=None, alias="X-Pin"),
+):
+    check_pin(x_pin)
+    with db() as conn:
+        if date_from or date_to:
+            since_clause, params = date_filter_sql(date_from, date_to, "t.created_at")
+            period_label = f"{date_from or '…'} — {date_to or '…'}"
+        elif period == "all":
+            since_clause, params = "", []
+            period_label = "Всё время"
+        else:
+            since_clause = " AND t.created_at >= ?"
+            params = [period_start(period)]
+            period_label = {
+                "day": "Сегодня", "week": "Неделя", "month": "Месяц",
+                "quarter": "Квартал", "year": "Год",
+            }.get(period, period)
+
+        agg = conn.execute(
+            f"""
+            SELECT COUNT(*) AS deals_count,
+                   COALESCE(SUM(t.received_value), 0) AS total_trade_credit,
+                   COALESCE(SUM(t.cash_amount), 0) AS total_cash,
+                   COALESCE(SUM(t.card_amount), 0) AS total_card,
+                   COALESCE(SUM(t.cash_amount + t.card_amount), 0) AS total_money,
+                   COALESCE(SUM(t.cash_amount + t.card_amount + t.received_value), 0) AS total_deal_value
+            FROM trade_ins t
+            WHERE 1=1 {since_clause}
+            """,
+            params,
+        ).fetchone()
+
+        items = conn.execute(
+            f"""
+            SELECT t.*,
+                   gp.name AS given_product_name, gp.sale_price AS given_sale_price,
+                   rp.name AS received_product_name,
+                   gw.name AS given_warehouse_name,
+                   rw.name AS received_warehouse_name
+            FROM trade_ins t
+            LEFT JOIN products gp ON gp.id = t.given_product_id
+            LEFT JOIN products rp ON rp.id = t.received_product_id
+            LEFT JOIN warehouses gw ON gw.id = t.given_warehouse_id
+            LEFT JOIN warehouses rw ON rw.id = t.received_warehouse_id
+            WHERE 1=1 {since_clause}
+            ORDER BY t.created_at DESC
+            LIMIT 500
+            """,
+            params,
+        ).fetchall()
+
+        by_warehouse = conn.execute(
+            f"""
+            SELECT gw.name AS warehouse_name,
+                   COUNT(*) AS deals,
+                   COALESCE(SUM(t.cash_amount + t.card_amount), 0) AS money,
+                   COALESCE(SUM(t.received_value), 0) AS trade_credit
+            FROM trade_ins t
+            JOIN warehouses gw ON gw.id = t.given_warehouse_id
+            WHERE 1=1 {since_clause}
+            GROUP BY gw.name
+            ORDER BY deals DESC
+            """,
+            params,
+        ).fetchall()
+
+    return {
+        "period": period,
+        "period_label": period_label,
+        "deals_count": agg["deals_count"],
+        "total_trade_credit": float(agg["total_trade_credit"]),
+        "total_cash": float(agg["total_cash"]),
+        "total_card": float(agg["total_card"]),
+        "total_money": float(agg["total_money"]),
+        "total_deal_value": float(agg["total_deal_value"]),
+        "items": [row_to_dict(i) for i in items],
+        "by_warehouse": [row_to_dict(w) for w in by_warehouse],
     }
 
 
