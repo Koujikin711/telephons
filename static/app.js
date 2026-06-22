@@ -149,9 +149,9 @@ async function api(path, opts = {}) {
 function toast(msg, type = "success") {
   const el = document.getElementById("toast");
   el.textContent = msg;
-  el.className = `toast${type === "error" ? " error" : ""}`;
-  el.classList.remove("hidden");
-  setTimeout(() => el.classList.add("hidden"), 3200);
+  el.className = `toast toast-show${type === "error" ? " error" : ""}`;
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => el.classList.remove("toast-show"), 3200);
 }
 
 function showLogin() {
@@ -175,8 +175,13 @@ function navigate(page) {
   }
   currentPage = page;
   document.querySelectorAll(".nav-item").forEach((n) => n.classList.toggle("active", n.dataset.page === page));
-  document.querySelectorAll(".page").forEach((p) => p.classList.remove("active"));
-  document.getElementById(`page-${page}`)?.classList.add("active");
+  document.querySelectorAll(".page").forEach((p) => {
+    p.classList.remove("active");
+    p.classList.remove("page-enter");
+  });
+  const pageEl = document.getElementById(`page-${page}`);
+  pageEl?.classList.add("active");
+  requestAnimationFrame(() => pageEl?.classList.add("page-enter"));
   document.getElementById("page-title").textContent = PAGE_TITLES[page] || page;
   const loaders = {
     dashboard: loadDashboard,
@@ -428,6 +433,11 @@ function renderCart() {
   const empty = document.getElementById("cart-empty");
   const count = cart.reduce((s, c) => s + c.quantity, 0);
   document.getElementById("cart-count").textContent = count;
+  if (count > 0) {
+    const badge = document.getElementById("cart-count");
+    badge.style.transform = "scale(1.2)";
+    setTimeout(() => { badge.style.transform = ""; }, 200);
+  }
   if (!cart.length) {
     box.innerHTML = "";
     empty.classList.remove("hidden");

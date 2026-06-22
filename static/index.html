@@ -5,19 +5,26 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>TeleStore ERP — Управление магазином</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
+  <div class="mesh-bg" aria-hidden="true"></div>
+
   <div id="login-screen" class="login-screen hidden">
+    <div class="login-aurora" aria-hidden="true"></div>
     <div class="login-card">
       <div class="login-brand">
-        <div class="brand-icon">TS</div>
-        <h1>TeleStore ERP</h1>
-        <p>Система управления магазином</p>
+        <div class="brand-icon brand-glow">TS</div>
+        <h1>TeleStore</h1>
+        <p>Управление магазином нового поколения</p>
       </div>
-      <input type="password" id="pin-input" placeholder="PIN-код доступа" maxlength="12" autocomplete="off">
-      <button id="pin-submit" class="btn btn-primary btn-block">Войти в систему</button>
+      <div class="login-field">
+        <label for="pin-input">PIN-код доступа</label>
+        <input type="password" id="pin-input" placeholder="••••" maxlength="12" autocomplete="off">
+      </div>
+      <button id="pin-submit" class="btn btn-primary btn-block btn-glow">Войти в систему</button>
       <p id="pin-error" class="error hidden"></p>
     </div>
   </div>
@@ -25,8 +32,8 @@
   <div id="app" class="app-shell hidden">
     <aside class="sidebar">
       <div class="sidebar-brand">
-        <div class="brand-icon sm">TS</div>
-        <div>
+        <div class="brand-icon sm brand-glow">TS</div>
+        <div class="sidebar-brand-text">
           <strong id="store-name">TeleStore</strong>
           <span>Retail ERP</span>
         </div>
@@ -85,7 +92,10 @@
 
     <div class="main-area">
       <header class="topbar">
-        <h2 id="page-title">Обзор</h2>
+        <div class="topbar-left">
+          <h2 id="page-title">Обзор</h2>
+          <p class="topbar-sub">TeleStore · панель управления</p>
+        </div>
         <div class="topbar-actions" id="topbar-actions"></div>
       </header>
 
@@ -130,7 +140,7 @@
               <div id="pos-products" class="product-grid"></div>
             </div>
             <div class="pos-right card">
-              <div class="card-header"><h3>Текущий чек</h3><span class="badge" id="cart-count">0</span></div>
+              <div class="card-header"><h3>Текущий чек</h3><span class="cart-badge" id="cart-count">0</span></div>
               <div id="cart-items" class="cart-items"></div>
               <div class="cart-empty" id="cart-empty">Сканируйте или выберите товар</div>
               <div class="cart-totals">
@@ -650,7 +660,7 @@
     </form>
   </dialog>
 
-  <div id="toast" class="toast hidden"></div>
+  <div id="toast" class="toast"></div>
   <script src="/static/app.js"></script>
 </body>
 </html>
