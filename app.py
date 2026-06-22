@@ -1652,7 +1652,7 @@ async def upload_product_image(
     file: UploadFile = File(...),
     x_pin: str | None = Header(default=None, alias="X-Pin"),
 ):
-    check_pin(x_pin, min_role="warehouse")
+    check_pin(x_pin)
     if not file.filename:
         raise HTTPException(status_code=400, detail="Файл не выбран")
     ext = Path(file.filename).suffix.lower()
@@ -1676,7 +1676,7 @@ async def upload_product_image(
 
 @app.delete("/api/products/{product_id}/image")
 async def delete_product_image(product_id: int, x_pin: str | None = Header(default=None, alias="X-Pin")):
-    check_pin(x_pin, min_role="warehouse")
+    check_pin(x_pin)
     with db() as conn:
         if not conn.execute("SELECT id FROM products WHERE id = ?", (product_id,)).fetchone():
             raise HTTPException(status_code=404, detail="Товар не найден")

@@ -70,13 +70,60 @@ async function apiUpload(path, file) {
     pin = "";
     localStorage.removeItem(PIN_KEY);
     showLogin();
-    throw new Error("Неверный PIN");
+    throw new Error("Неверный PIN — войдите снова");
+  }
+  if (res.status === 403) {
+    throw new Error("Недостаточно прав для загрузки фото");
   }
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    throw new Error(typeof err.detail === "string" ? err.detail : `Ошибка ${res.status}`);
+    throw new Error(typeof err.detail === "string" ? err.detail : `Ошибка загрузки ${res.status}`);
   }
   return res.json();
+}
+
+function setImageUploadBusy(busy) {
+  const label = document.getElementById("pf-image-upload-label");
+  const text = document.getElementById("pf-upload-text");
+  const hint = document.getElementById("pf-image-hint");
+  if (!label) return;
+  label.classList.toggle("disabled", busy);
+  if (text) text.textContent = busy ? "Загрузка…" : "Загрузить фото";
+  if (hint && !busy) hint.textContent = "JPG, PNG, WEBP до 5 МБ · можно перетащить на превью";
+}
+
+async function handleProductImageFile(file) {
+  if (!file) return;
+  if (!file.type.startsWith("image/")) {
+    toast("Выберите файл изображения", "error");
+    return;
+  }
+  if (file.size > 5 * 1024 * 1024) {
+    toast("Файл больше 5 МБ", "error");
+    return;
+  }
+  clearProductImagePending();
+  pendingProductImage = file;
+  pendingProductImageUrl = URL.createObjectURL(file);
+  setProductImagePreview();
+
+  const id = document.getElementById("pf-id")?.value;
+  if (id) {
+    setImageUploadBusy(true);
+    try {
+      const updated = await apiUpload(`/api/products/${id}/image`, file);
+      pendingProductImage = null;
+      URL.revokeObjectURL(pendingProductImageUrl);
+      pendingProductImageUrl = null;
+      setProductImagePreview(updated);
+      toast("Фото загружено");
+      if (currentPage === "catalog") loadCatalog();
+    } catch (err) {
+      toast(err.message, "error");
+    } finally {
+      setImageUploadBusy(false);
+    }
+  }
 }
 
 function clearProductImagePending() {
@@ -1467,29 +1514,42 @@ function bindProducts() {
     clearProductImagePending();
     document.getElementById("product-modal").close();
   };
-  document.getElementById("product-form").onsubmit = saveProduct;
+  document.getElementById("product-form").addEventListener("submit", saveProduct);
   document.getElementById("pf-image-file")?.addEventListener("change", (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    clearProductImagePending();
-    pendingProductImage = file;
-    pendingProductImageUrl = URL.createObjectURL(file);
-    setProductImagePreview();
+    handleProductImageFile(e.target.files?.[0]);
     e.target.value = "";
   });
-  document.getElementById("pf-image-remove")?.addEventListener("click", async () => {
+  const preview = document.getElementById("pf-image-preview");
+  preview?.addEventListener("dragover", (e) => { e.preventDefault(); preview.classList.add("drag-over"); });
+  preview?.addEventListener("dragleave", () => preview.classList.remove("drag-over"));
+  preview?.addEventListener("drop", (e) => {
+    e.preventDefault();
+    preview.classList.remove("drag-over");
+    handleProductImageFile(e.dataTransfer?.files?.[0]);
+  });
+  document.getElementById("pf-image-remove")?.addEventListener("click", async (e) => {
+    e.preventDefault();
     const id = document.getElementById("pf-id").value;
+    if (id && !confirm("Удалить фото товара?")) return;
     clearProductImagePending();
     if (id) {
       try {
         await api(`/api/products/${id}/image`, { method: "DELETE" });
         toast("Фото удалено");
+        if (currentPage === "catalog") loadCatalog();
       } catch (err) { toast(err.message, "error"); return; }
     }
     setProductImagePreview({ category: document.getElementById("pf-category").value });
   });
   document.getElementById("pf-category")?.addEventListener("change", () => {
-    if (!pendingProductImageUrl && !document.getElementById("pf-id").value) setProductImagePreview();
+    const id = document.getElementById("pf-id").value;
+    if (!pendingProductImageUrl && !id) setProductImagePreview({ category: document.getElementById("pf-category").value });
+    else if (!pendingProductImageUrl && id) {
+      const box = document.getElementById("pf-image-preview");
+      if (box && !box.querySelector("img")) {
+        box.className = `pf-image-preview ${productPhClass({ category: document.getElementById("pf-category").value })}`;
+      }
+    }
   });
   ["pf-purchase", "pf-sale", "pf-ownership"].forEach((id) => {
     document.getElementById(id)?.addEventListener("input", updateMarginHint);
@@ -1517,11 +1577,17 @@ function setProductFormMode(isEdit, p = null) {
   const minEditRow = document.getElementById("pf-min-stock-edit-row");
   const whRow = document.getElementById("pf-warehouse-row");
   const stockHint = document.getElementById("pf-stock-hint");
+  const stockInput = document.getElementById("pf-stock");
+  const minStockInput = document.getElementById("pf-min-stock");
+  const minStockEdit = document.getElementById("pf-min-stock-edit");
   if (isEdit) {
     stockRow.classList.add("hidden");
     minEditRow.classList.remove("hidden");
     whRow.classList.add("hidden");
     stockHint.classList.remove("hidden");
+    stockInput.disabled = true;
+    minStockInput.disabled = true;
+    minStockEdit.disabled = false;
     document.getElementById("pf-min-stock-edit").value = p?.min_stock ?? 2;
     const parts = Object.entries(p?.stock_by_warehouse || {})
       .map(([wid, qty]) => {
@@ -1534,6 +1600,9 @@ function setProductFormMode(isEdit, p = null) {
     minEditRow.classList.add("hidden");
     whRow.classList.remove("hidden");
     stockHint.classList.add("hidden");
+    stockInput.disabled = false;
+    minStockInput.disabled = false;
+    minStockEdit.disabled = true;
     fillWarehouseSelect(document.getElementById("pf-warehouse"), defaultWarehouseId());
   }
 }
@@ -1623,6 +1692,7 @@ async function loadConsProducts() {
 
 window.openProductModal = (ownership) => {
   clearProductImagePending();
+  setImageUploadBusy(false);
   document.getElementById("product-modal-title").textContent = ownership === "consignment" ? "Товар под реализацию" : "Собственный товар";
   document.getElementById("pf-id").value = "";
   document.getElementById("pf-ownership").value = ownership;
@@ -1636,31 +1706,40 @@ window.openProductModal = (ownership) => {
   setProductFormMode(false);
   setProductImagePreview({ category: "accessory" });
   updateMarginHint();
+  document.getElementById("product-save-btn").disabled = false;
+  document.getElementById("product-save-btn").textContent = "Сохранить";
   document.getElementById("product-modal").showModal();
 };
 
 window.editProduct = async (id) => {
-  clearProductImagePending();
-  const p = await api(`/api/products/${id}`);
-  if (!p) return;
-  document.getElementById("product-modal-title").textContent = "Карточка товара";
-  document.getElementById("pf-id").value = p.id;
-  document.getElementById("pf-ownership").value = p.ownership_type;
-  document.getElementById("pf-supplier-row").classList.toggle("hidden", p.ownership_type !== "consignment");
-  document.getElementById("pf-name").value = p.name;
-  document.getElementById("pf-category").value = p.category;
-  document.getElementById("pf-brand").value = p.brand;
-  document.getElementById("pf-supplier").value = p.supplier_name;
-  document.getElementById("pf-sku").value = p.sku;
-  document.getElementById("pf-barcode").value = p.barcode;
-  document.getElementById("pf-purchase").value = p.purchase_price;
-  document.getElementById("pf-sale").value = p.sale_price;
-  document.getElementById("pf-min-stock").value = p.min_stock;
-  fillProductCardFields(p);
-  setProductFormMode(true, p);
-  setProductImagePreview(p);
-  updateMarginHint();
-  document.getElementById("product-modal").showModal();
+  try {
+    clearProductImagePending();
+    setImageUploadBusy(false);
+    const p = await api(`/api/products/${id}`);
+    if (!p) return;
+    document.getElementById("product-modal-title").textContent = "Карточка товара";
+    document.getElementById("pf-id").value = p.id;
+    document.getElementById("pf-ownership").value = p.ownership_type;
+    document.getElementById("pf-supplier-row").classList.toggle("hidden", p.ownership_type !== "consignment");
+    document.getElementById("pf-name").value = p.name;
+    document.getElementById("pf-category").value = p.category;
+    document.getElementById("pf-brand").value = p.brand || "";
+    document.getElementById("pf-supplier").value = p.supplier_name || "";
+    document.getElementById("pf-sku").value = p.sku || "";
+    document.getElementById("pf-barcode").value = p.barcode || "";
+    document.getElementById("pf-purchase").value = p.purchase_price;
+    document.getElementById("pf-sale").value = p.sale_price;
+    document.getElementById("pf-min-stock").value = p.min_stock;
+    fillProductCardFields(p);
+    setProductFormMode(true, p);
+    setProductImagePreview(p);
+    updateMarginHint();
+    document.getElementById("product-save-btn").disabled = false;
+    document.getElementById("product-save-btn").textContent = "Сохранить";
+    document.getElementById("product-modal").showModal();
+  } catch (err) {
+    toast(err.message || "Не удалось открыть товар", "error");
+  }
 };
 
 window.deleteProduct = async (id) => {
@@ -1677,44 +1756,75 @@ window.deleteProduct = async (id) => {
 
 async function saveProduct(e) {
   e.preventDefault();
+  e.stopPropagation();
+  const saveBtn = document.getElementById("product-save-btn");
   const id = document.getElementById("pf-id").value;
+  const name = document.getElementById("pf-name").value.trim();
+  const ownership = document.getElementById("pf-ownership").value;
+  const supplier = document.getElementById("pf-supplier").value.trim();
+  const purchase = +document.getElementById("pf-purchase").value;
+  const sale = +document.getElementById("pf-sale").value;
+
+  if (!name) { toast("Укажите название товара", "error"); document.getElementById("pf-name").focus(); return; }
+  if (ownership === "consignment" && !supplier) {
+    toast("Укажите поставщика для товара под реализацию", "error");
+    return;
+  }
+  if (Number.isNaN(purchase) || purchase < 0) { toast("Некорректная закупочная цена", "error"); return; }
+  if (Number.isNaN(sale) || sale < 0) { toast("Некорректная цена продажи", "error"); return; }
+
   const body = {
-    name: document.getElementById("pf-name").value,
+    name,
     category: document.getElementById("pf-category").value,
-    ownership_type: document.getElementById("pf-ownership").value,
-    supplier_name: document.getElementById("pf-supplier").value,
+    ownership_type: ownership,
+    supplier_name: supplier,
     brand: document.getElementById("pf-brand").value,
     sku: document.getElementById("pf-sku").value,
     barcode: document.getElementById("pf-barcode").value,
-    purchase_price: +document.getElementById("pf-purchase").value,
-    sale_price: +document.getElementById("pf-sale").value,
+    purchase_price: purchase,
+    sale_price: sale,
     min_stock: id
       ? +document.getElementById("pf-min-stock-edit").value
       : +document.getElementById("pf-min-stock").value,
     ...productCardBody(),
   };
   if (!id) {
-    body.stock = +document.getElementById("pf-stock").value;
+    body.stock = +document.getElementById("pf-stock").value || 0;
     body.warehouse_id = +document.getElementById("pf-warehouse").value;
+    if (!body.warehouse_id) { toast("Выберите склад", "error"); return; }
   }
+
+  saveBtn.disabled = true;
+  saveBtn.textContent = "Сохранение…";
   try {
     let productId = id;
-    if (id) await api(`/api/products/${id}`, { method: "PUT", body: JSON.stringify(body) });
-    else {
+    if (id) {
+      await api(`/api/products/${id}`, { method: "PUT", body: JSON.stringify(body) });
+    } else {
       const created = await api("/api/products", { method: "POST", body: JSON.stringify(body) });
       productId = created.id;
+      document.getElementById("pf-id").value = productId;
     }
     if (pendingProductImage && productId) {
-      await apiUpload(`/api/products/${productId}/image`, pendingProductImage);
+      setImageUploadBusy(true);
+      const updated = await apiUpload(`/api/products/${productId}/image`, pendingProductImage);
+      setProductImagePreview(updated);
+      setImageUploadBusy(false);
     }
     clearProductImagePending();
     document.getElementById("product-modal").close();
-    toast("Сохранено");
+    toast(id ? "Товар обновлён" : "Товар создан");
     loadOwnProducts();
     loadConsProducts();
     if (currentPage === "catalog") loadCatalog();
     if (currentPage === "pos") loadProducts();
-  } catch (err) { toast(err.message, "error"); }
+  } catch (err) {
+    toast(err.message || "Ошибка сохранения", "error");
+  } finally {
+    saveBtn.disabled = false;
+    saveBtn.textContent = "Сохранить";
+    setImageUploadBusy(false);
+  }
 }
 
 /* ── Suppliers ── */
