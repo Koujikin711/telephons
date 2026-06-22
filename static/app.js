@@ -228,30 +228,54 @@ async function loadWarehouses() {
 }
 
 async function init() {
-  const cfg = await fetch("/api/config").then((r) => r.json());
-  authRequired = cfg.auth_required;
-  document.getElementById("store-name").textContent = cfg.store_name || "TeleStore";
-  if (authRequired && !pin) { showLogin(); return; }
-  try { await refreshSession(); }
-  catch { if (authRequired) return; }
-  if (!authRequired) allowedPages = null;
-  showApp();
-  startClock();
-  bindNav();
-  bindPos();
-  bindSales();
-  bindProducts();
-  bindCatalog();
-  bindWarehouses();
-  bindTradeIn();
-  bindSuppliers();
-  bindReports();
-  bindAnalytics();
-  bindShifts();
-  bindImei();
-  bindUsers();
-  await loadWarehouses();
-  navigate(firstAllowedPage());
+  try {
+    const res = await fetch("/api/config");
+    if (!res.ok) throw new Error("config");
+    const cfg = await res.json();
+    authRequired = cfg.auth_required;
+    document.getElementById("store-name").textContent = cfg.store_name || "TeleStore";
+
+    if (authRequired && !pin) {
+      showLogin();
+      return;
+    }
+
+    try {
+      await refreshSession();
+    } catch {
+      if (authRequired) {
+        showLogin();
+        return;
+      }
+    }
+
+    if (!authRequired) allowedPages = null;
+    showApp();
+    startClock();
+    bindNav();
+    bindPos();
+    bindSales();
+    bindProducts();
+    bindCatalog();
+    bindWarehouses();
+    bindTradeIn();
+    bindSuppliers();
+    bindReports();
+    bindAnalytics();
+    bindShifts();
+    bindImei();
+    bindUsers();
+    await loadWarehouses();
+    navigate(firstAllowedPage());
+  } catch (e) {
+    console.error("init failed", e);
+    showLogin();
+    const errEl = document.getElementById("pin-error");
+    if (errEl) {
+      errEl.textContent = "Не удалось подключиться к серверу. Обновите страницу.";
+      errEl.classList.remove("hidden");
+    }
+  }
 }
 
 document.getElementById("pin-submit").addEventListener("click", async () => {
@@ -1642,7 +1666,6 @@ async function loadReport() {
   if (from) url += `&date_from=${from}`;
   if (to) url += `&date_to=${to}`;
 
-  const combinedEl = document.getElementById("report-combined");
   if (reportScope === "all" && !from && !to) {
     const combined = await api(`/api/reports/combined?period=${period}`);
     document.getElementById("report-content").innerHTML = renderReportBlock(combined.all, "Общий финансовый отчёт");
