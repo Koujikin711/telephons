@@ -38,6 +38,9 @@
         <button class="nav-item" data-page="pos">
           <span class="nav-icon">⊞</span> Касса
         </button>
+        <button class="nav-item" data-page="shifts">
+          <span class="nav-icon">◷</span> Смена
+        </button>
         <button class="nav-item" data-page="sales">
           <span class="nav-icon">☰</span> Продажи
         </button>
@@ -60,12 +63,19 @@
         <button class="nav-item" data-page="trade-in">
           <span class="nav-icon">⇋</span> Обмен
         </button>
+        <button class="nav-item" data-page="imei">
+          <span class="nav-icon">#</span> IMEI / Серийники
+        </button>
         <div class="nav-group-label">Финансы</div>
         <button class="nav-item" data-page="reports">
           <span class="nav-icon">₽</span> Фин. отчёты
         </button>
         <button class="nav-item" data-page="analytics">
           <span class="nav-icon">↗</span> Аналитика
+        </button>
+        <div class="nav-group-label">Админ</div>
+        <button class="nav-item" data-page="users">
+          <span class="nav-icon">👤</span> Пользователи
         </button>
       </nav>
       <div class="sidebar-footer">
@@ -137,6 +147,7 @@
                 <button class="pay-btn" data-pay="transfer">Перевод</button>
               </div>
               <button id="checkout-btn" class="btn btn-success btn-block" disabled>Провести оплату</button>
+              <p id="pos-shift-hint" class="hint hidden"></p>
               <button id="clear-cart-btn" class="btn btn-ghost btn-block">Очистить</button>
             </div>
           </div>
@@ -279,6 +290,7 @@
               <form id="trade-in-form" class="form-stack card-body">
                 <label>Склад выдачи<select id="ti-given-warehouse" class="select" required></select></label>
                 <label>Выдаваемый товар<select id="ti-given-product" class="select" required><option value="">— выберите склад —</option></select></label>
+                <label id="ti-given-unit-row" class="hidden">IMEI выдаваемого<select id="ti-given-unit" class="select"><option value="">— выберите IMEI —</option></select></label>
                 <p id="ti-given-price" class="hint hidden"></p>
                 <hr class="form-divider">
                 <h4 class="sub-heading">Принимаемое устройство</h4>
@@ -300,6 +312,10 @@
                   <option value="used" selected>Б/у</option>
                   <option value="refurbished">Восстановленный</option>
                 </select></label>
+                <div class="form-row">
+                  <label>IMEI принятого<input id="ti-received-imei" class="input" placeholder="15 цифр"></label>
+                  <label>Серийный №<input id="ti-received-serial" class="input"></label>
+                </div>
                 <label>Доп. характеристики<textarea id="ti-received-specs" class="input textarea" rows="2"></textarea></label>
                 <div class="form-row">
                   <label>Закупка принятого, ₽<input type="number" id="ti-received-purchase" class="input" min="0" value="0"></label>
@@ -337,6 +353,89 @@
               <div class="table-wrap"><table class="data-table">
                 <thead><tr><th>Дата</th><th>Выдано</th><th>Принято</th><th>Зачёт</th><th>Доплата</th><th>Склады</th></tr></thead>
                 <tbody id="ti-history-tbody"></tbody>
+              </table></div>
+            </div>
+          </div>
+        </section>
+
+        <!-- SHIFTS -->
+        <section id="page-shifts" class="page">
+          <div class="grid-2">
+            <div class="card" id="shift-open-card">
+              <div class="card-header"><h3>Текущая смена</h3></div>
+              <div class="card-body" id="shift-current"></div>
+            </div>
+            <div class="card" id="shift-close-card">
+              <div class="card-header"><h3>Закрытие смены</h3></div>
+              <form id="shift-close-form" class="form-stack card-body">
+                <div id="shift-summary"></div>
+                <label>Наличные в кассе, ₽<input type="number" id="shift-actual-cash" class="input" min="0" step="1" required></label>
+                <label>Карта (сверка), ₽<input type="number" id="shift-actual-card" class="input" min="0" step="1" required></label>
+                <label>Комментарий<input id="shift-close-notes" class="input"></label>
+                <button type="submit" class="btn btn-primary" id="shift-close-btn" disabled>Закрыть смену</button>
+              </form>
+            </div>
+          </div>
+          <div class="card" style="margin-top:1rem">
+            <div class="card-header"><h3>История смен</h3></div>
+            <div class="table-wrap"><table class="data-table">
+              <thead><tr><th>№</th><th>Кассир</th><th>Открыта</th><th>Закрыта</th><th>Продаж</th><th>Выручка</th><th>Разница нал.</th></tr></thead>
+              <tbody id="shifts-history-tbody"></tbody>
+            </table></div>
+          </div>
+        </section>
+
+        <!-- IMEI -->
+        <section id="page-imei" class="page">
+          <div class="grid-2">
+            <div class="card">
+              <div class="card-header"><h3>Регистрация IMEI</h3></div>
+              <form id="imei-form" class="form-stack card-body">
+                <label>Товар<select id="imei-product" class="select" required></select></label>
+                <label>Склад<select id="imei-warehouse" class="select" required></select></label>
+                <label>IMEI<input id="imei-value" class="input" placeholder="15 цифр"></label>
+                <label>Серийный номер<input id="imei-serial" class="input"></label>
+                <label>Примечание<input id="imei-notes" class="input"></label>
+                <button type="submit" class="btn btn-primary">Добавить на склад</button>
+              </form>
+            </div>
+            <div class="card">
+              <div class="card-header"><h3>Поиск</h3></div>
+              <div class="card-body form-stack">
+                <input type="search" id="imei-search" class="input" placeholder="IMEI, серийник, название…">
+                <select id="imei-filter-wh" class="select"><option value="">Все склады</option></select>
+              </div>
+            </div>
+          </div>
+          <div class="card" style="margin-top:1rem">
+            <div class="table-wrap"><table class="data-table">
+              <thead><tr><th>IMEI</th><th>Серийник</th><th>Товар</th><th>Склад</th><th>Статус</th><th></th></tr></thead>
+              <tbody id="imei-tbody"></tbody>
+            </table></div>
+          </div>
+        </section>
+
+        <!-- USERS -->
+        <section id="page-users" class="page">
+          <div class="grid-2">
+            <div class="card">
+              <div class="card-header"><h3>Новый сотрудник</h3></div>
+              <form id="user-form" class="form-stack card-body">
+                <label>Имя<input id="user-name" class="input" required></label>
+                <label>PIN (4–12 цифр)<input type="password" id="user-pin" class="input" minlength="4" maxlength="12" required></label>
+                <label>Роль<select id="user-role" class="select">
+                  <option value="cashier">Кассир</option>
+                  <option value="warehouse">Кладовщик</option>
+                  <option value="owner">Владелец</option>
+                </select></label>
+                <button type="submit" class="btn btn-primary">Добавить</button>
+              </form>
+            </div>
+            <div class="card">
+              <div class="card-header"><h3>Сотрудники</h3></div>
+              <div class="table-wrap"><table class="data-table">
+                <thead><tr><th>Имя</th><th>Роль</th><th>PIN</th><th>Статус</th><th></th></tr></thead>
+                <tbody id="users-tbody"></tbody>
               </table></div>
             </div>
           </div>
@@ -522,6 +621,33 @@
     <div class="modal-actions">
       <button class="btn btn-ghost" id="sale-detail-close">Закрыть</button>
     </div>
+  </dialog>
+
+  <dialog id="imei-picker-modal" class="modal">
+    <h3 id="imei-picker-title">Выбор IMEI</h3>
+    <div id="imei-picker-list" class="imei-picker-list"></div>
+    <div class="modal-actions">
+      <button type="button" class="btn btn-ghost" id="imei-picker-cancel">Отмена</button>
+    </div>
+  </dialog>
+
+  <dialog id="user-edit-modal" class="modal">
+    <form id="user-edit-form" method="dialog">
+      <h3>Редактирование</h3>
+      <input type="hidden" id="ue-id">
+      <label>Имя<input id="ue-name" class="input" required></label>
+      <label>Новый PIN<input type="password" id="ue-pin" class="input" minlength="4" maxlength="12" placeholder="Оставьте пустым"></label>
+      <label>Роль<select id="ue-role" class="select">
+        <option value="cashier">Кассир</option>
+        <option value="warehouse">Кладовщик</option>
+        <option value="owner">Владелец</option>
+      </select></label>
+      <label class="check"><input type="checkbox" id="ue-active" checked> Активен</label>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-ghost" id="user-edit-cancel">Отмена</button>
+        <button type="submit" class="btn btn-primary">Сохранить</button>
+      </div>
+    </form>
   </dialog>
 
   <div id="toast" class="toast hidden"></div>

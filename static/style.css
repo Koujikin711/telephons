@@ -56,6 +56,17 @@ body { font-family: 'Inter', system-ui, sans-serif; background: var(--bg); color
 .main-area { margin-left: var(--sidebar-w); flex: 1; display: flex; flex-direction: column; min-width: 0; }
 .topbar { background: var(--surface); border-bottom: 1px solid var(--border); padding: .9rem 1.5rem; display: flex; align-items: center; justify-content: space-between; position: sticky; top: 0; z-index: 100; }
 .topbar h2 { font-size: 1.15rem; font-weight: 600; }
+.topbar-actions { display: flex; align-items: center; gap: .75rem; flex-wrap: wrap; }
+.topbar-user { font-size: .85rem; color: var(--text-secondary); }
+.badge { font-size: .72rem; padding: .25rem .55rem; border-radius: 999px; font-weight: 600; }
+.badge-ok { background: #d1fae5; color: #065f46; }
+.badge-warn { background: #fef3c7; color: #92400e; }
+.ci-imei { font-size: .7rem; color: var(--muted); margin-top: .15rem; }
+.ci-qty-static { font-weight: 600; min-width: 1.5rem; text-align: center; }
+.imei-picker-list { display: flex; flex-direction: column; gap: .5rem; max-height: 320px; overflow: auto; margin: 1rem 0; }
+.imei-pick-btn { display: flex; flex-direction: column; align-items: flex-start; gap: .15rem; padding: .75rem 1rem; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); cursor: pointer; text-align: left; }
+.imei-pick-btn:hover { border-color: var(--primary); background: #eff6ff; }
+.imei-pick-btn span { font-size: .8rem; color: var(--muted); }
 .content { padding: 1.25rem 1.5rem 2rem; }
 .page { display: none; }
 .page.active { display: block; }

@@ -26,7 +26,23 @@ DB_PATH = DATA_DIR / "store.db"
 OwnershipType = Literal["own", "consignment"]
 ReportScope = Literal["all", "own", "consignment"]
 ProductCondition = Literal["new", "used", "refurbished"]
+UserRole = Literal["owner", "warehouse", "cashier"]
 DEFAULT_WAREHOUSE_NAME = "Основной склад"
+
+ROLE_PAGES: dict[str, list[str]] = {
+    "owner": [
+        "dashboard", "pos", "sales", "catalog", "warehouses", "products-own",
+        "products-consignment", "suppliers", "trade-in", "reports", "analytics",
+        "shifts", "users", "imei",
+    ],
+    "warehouse": [
+        "dashboard", "catalog", "warehouses", "products-own", "products-consignment",
+        "trade-in", "imei",
+    ],
+    "cashier": ["dashboard", "pos", "sales", "trade-in", "shifts"],
+}
+
+ROLE_LEVEL = {"cashier": 1, "warehouse": 2, "owner": 3}
 
 
 class Settings(BaseSettings):
@@ -92,6 +108,9 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     _add_column(conn, "sales", "cash_amount", "REAL NOT NULL DEFAULT 0")
     _add_column(conn, "sales", "card_amount", "REAL NOT NULL DEFAULT 0")
     _add_column(conn, "sales", "trade_in_value", "REAL NOT NULL DEFAULT 0")
+    _add_column(conn, "sales", "shift_id", "INTEGER")
+    _add_column(conn, "products", "track_units", "INTEGER NOT NULL DEFAULT 0")
+    conn.execute("UPDATE products SET track_units = 1 WHERE category = 'phone' AND track_units = 0")
     conn.execute(
         """
         UPDATE sale_items
@@ -163,8 +182,78 @@ def migrate_db(conn: sqlite3.Connection) -> None:
             FOREIGN KEY (received_warehouse_id) REFERENCES warehouses(id),
             FOREIGN KEY (sale_id) REFERENCES sales(id)
         );
+
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            pin TEXT NOT NULL UNIQUE,
+            role TEXT NOT NULL DEFAULT 'cashier',
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS product_units (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_id INTEGER NOT NULL,
+            warehouse_id INTEGER NOT NULL,
+            imei TEXT DEFAULT '',
+            serial TEXT DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'in_stock',
+            sale_id INTEGER,
+            notes TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (product_id) REFERENCES products(id),
+            FOREIGN KEY (warehouse_id) REFERENCES warehouses(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS shifts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            user_name TEXT DEFAULT '',
+            opened_at TEXT NOT NULL,
+            closed_at TEXT,
+            opening_cash REAL NOT NULL DEFAULT 0,
+            expected_cash REAL NOT NULL DEFAULT 0,
+            expected_card REAL NOT NULL DEFAULT 0,
+            actual_cash REAL,
+            actual_card REAL,
+            sales_count INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'open',
+            notes TEXT DEFAULT ''
+        );
+
+        CREATE TABLE IF NOT EXISTS sale_item_units (
+            sale_item_id INTEGER NOT NULL,
+            unit_id INTEGER NOT NULL,
+            imei TEXT DEFAULT '',
+            serial TEXT DEFAULT '',
+            PRIMARY KEY (sale_item_id, unit_id),
+            FOREIGN KEY (sale_item_id) REFERENCES sale_items(id) ON DELETE CASCADE,
+            FOREIGN KEY (unit_id) REFERENCES product_units(id)
+        );
         """
     )
+
+    conn.executescript(
+        """
+        CREATE INDEX IF NOT EXISTS idx_units_product ON product_units(product_id);
+        CREATE INDEX IF NOT EXISTS idx_units_warehouse ON product_units(warehouse_id);
+        CREATE INDEX IF NOT EXISTS idx_units_status ON product_units(status);
+        CREATE INDEX IF NOT EXISTS idx_shifts_status ON shifts(status);
+        """
+    )
+
+    if conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
+        now = utc_now()
+        owner_pin = settings.store_pin or "1234"
+        conn.executemany(
+            "INSERT INTO users (name, pin, role, is_active, created_at) VALUES (?, ?, ?, 1, ?)",
+            [
+                ("Владелец", owner_pin, "owner", now),
+                ("Кассир", "1111", "cashier", now),
+                ("Кладовщик", "2222", "warehouse", now),
+            ],
+        )
 
     default_wh = conn.execute(
         "SELECT id FROM warehouses WHERE is_default = 1 LIMIT 1"
@@ -322,9 +411,109 @@ def init_db() -> None:
                     )
 
 
-def check_pin(pin: str | None) -> None:
-    if settings.store_pin and pin != settings.store_pin:
-        raise HTTPException(status_code=401, detail="Неверный PIN")
+def resolve_user(conn: sqlite3.Connection, pin: str | None) -> dict[str, Any] | None:
+    if not pin:
+        user_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        if user_count == 0 and not settings.store_pin:
+            return {"id": 0, "name": "Система", "role": "owner", "pin": ""}
+        return None
+    row = conn.execute(
+        "SELECT * FROM users WHERE pin = ? AND is_active = 1", (pin,)
+    ).fetchone()
+    if row:
+        return row_to_dict(row)
+    if settings.store_pin and pin == settings.store_pin:
+        return {"id": 0, "name": "Владелец", "role": "owner", "pin": pin}
+    return None
+
+
+def check_pin(pin: str | None, *, min_role: str | None = None) -> dict[str, Any]:
+    with db() as conn:
+        user = resolve_user(conn, pin)
+        if not user:
+            raise HTTPException(status_code=401, detail="Неверный PIN")
+        if min_role and ROLE_LEVEL.get(user["role"], 0) < ROLE_LEVEL.get(min_role, 99):
+            raise HTTPException(status_code=403, detail="Недостаточно прав")
+        return user
+
+
+def get_open_shift(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM shifts WHERE status = 'open' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+
+
+def shift_sales_totals(conn: sqlite3.Connection, shift_id: int) -> dict[str, float | int]:
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS cnt,
+               COALESCE(SUM(cash_amount), 0) AS cash,
+               COALESCE(SUM(card_amount), 0) AS card,
+               COALESCE(SUM(total), 0) AS total
+        FROM sales
+        WHERE shift_id = ? AND status = 'completed'
+        """,
+        (shift_id,),
+    ).fetchone()
+    return {
+        "sales_count": row["cnt"],
+        "expected_cash": float(row["cash"]),
+        "expected_card": float(row["card"]),
+        "total_revenue": float(row["total"]),
+    }
+
+
+def pick_units(
+    conn: sqlite3.Connection,
+    product_id: int,
+    warehouse_id: int,
+    quantity: int,
+    unit_ids: list[int] | None,
+) -> list[sqlite3.Row]:
+    if unit_ids:
+        if len(unit_ids) != quantity:
+            raise HTTPException(status_code=400, detail="Количество IMEI должно совпадать с количеством товара")
+        placeholders = ",".join("?" * len(unit_ids))
+        rows = conn.execute(
+            f"""
+            SELECT * FROM product_units
+            WHERE id IN ({placeholders}) AND product_id = ? AND warehouse_id = ?
+              AND status = 'in_stock'
+            """,
+            (*unit_ids, product_id, warehouse_id),
+        ).fetchall()
+        if len(rows) != quantity:
+            raise HTTPException(status_code=400, detail="Указаны недоступные IMEI/серийники")
+        return rows
+    rows = conn.execute(
+        """
+        SELECT * FROM product_units
+        WHERE product_id = ? AND warehouse_id = ? AND status = 'in_stock'
+        ORDER BY id LIMIT ?
+        """,
+        (product_id, warehouse_id, quantity),
+    ).fetchall()
+    if len(rows) < quantity:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Не хватает IMEI на складе: нужно {quantity}, доступно {len(rows)}",
+        )
+    return rows
+
+
+def mark_units_sold(conn: sqlite3.Connection, units: list[sqlite3.Row], sale_id: int) -> None:
+    for u in units:
+        conn.execute(
+            "UPDATE product_units SET status = 'sold', sale_id = ? WHERE id = ?",
+            (sale_id, u["id"]),
+        )
+
+
+def restore_units_for_sale(conn: sqlite3.Connection, sale_id: int) -> None:
+    conn.execute(
+        "UPDATE product_units SET status = 'in_stock', sale_id = NULL WHERE sale_id = ?",
+        (sale_id,),
+    )
 
 
 def get_default_warehouse_id(conn: sqlite3.Connection) -> int:
@@ -453,7 +642,31 @@ def enrich_product(conn: sqlite3.Connection, product: sqlite3.Row) -> dict[str, 
     stock_by_warehouse = {str(r["warehouse_id"]): r["quantity"] for r in rows}
     data["stock_by_warehouse"] = stock_by_warehouse
     data["stock"] = int(sum(stock_by_warehouse.values()))
+    if int(product["track_units"] or 0):
+        unit_rows = conn.execute(
+            """
+            SELECT warehouse_id, COUNT(*) AS cnt FROM product_units
+            WHERE product_id = ? AND status = 'in_stock'
+            GROUP BY warehouse_id
+            """,
+            (product["id"],),
+        ).fetchall()
+        units_by_warehouse = {str(r["warehouse_id"]): int(r["cnt"]) for r in unit_rows}
+        data["units_by_warehouse"] = units_by_warehouse
+        data["units_available"] = int(sum(units_by_warehouse.values()))
     return data
+
+
+def enrich_sale_items(conn: sqlite3.Connection, items: list[sqlite3.Row]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for item in items:
+        d = row_to_dict(item) or {}
+        units = conn.execute(
+            "SELECT * FROM sale_item_units WHERE sale_item_id = ?", (item["id"],)
+        ).fetchall()
+        d["units"] = [row_to_dict(u) for u in units]
+        result.append(d)
+    return result
 
 
 def period_start(period: str) -> str:
@@ -536,6 +749,7 @@ class ProductIn(BaseModel):
     specs_extra: str = ""
     condition: ProductCondition = "new"
     warehouse_id: int | None = None
+    track_units: int | None = None
 
 
 class ProductUpdate(BaseModel):
@@ -560,11 +774,13 @@ class ProductUpdate(BaseModel):
     specs_extra: str | None = None
     condition: ProductCondition | None = None
     warehouse_id: int | None = None
+    track_units: int | None = Field(default=None, ge=0, le=1)
 
 
 class CartItem(BaseModel):
     product_id: int
     quantity: int = Field(ge=1)
+    unit_ids: list[int] = Field(default_factory=list)
 
 
 class SaleIn(BaseModel):
@@ -573,6 +789,38 @@ class SaleIn(BaseModel):
     payment_method: str = "cash"
     notes: str = ""
     warehouse_id: int | None = None
+    shift_id: int | None = None
+
+
+class UnitIn(BaseModel):
+    product_id: int
+    warehouse_id: int
+    imei: str = ""
+    serial: str = ""
+    notes: str = ""
+
+
+class UserIn(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    pin: str = Field(min_length=4, max_length=12)
+    role: UserRole = "cashier"
+
+
+class UserUpdate(BaseModel):
+    name: str | None = None
+    pin: str | None = Field(default=None, min_length=4, max_length=12)
+    role: UserRole | None = None
+    is_active: int | None = Field(default=None, ge=0, le=1)
+
+
+class ShiftOpenIn(BaseModel):
+    opening_cash: float = Field(ge=0, default=0)
+
+
+class ShiftCloseIn(BaseModel):
+    actual_cash: float = Field(ge=0)
+    actual_card: float = Field(ge=0)
+    notes: str = ""
 
 
 class SupplierPaymentIn(BaseModel):
@@ -628,6 +876,9 @@ class TradeInIn(BaseModel):
     cash_amount: float = Field(ge=0, default=0)
     card_amount: float = Field(ge=0, default=0)
     received_warehouse_id: int | None = None
+    given_unit_id: int | None = None
+    received_imei: str = ""
+    received_serial: str = ""
     notes: str = ""
 
 
@@ -654,15 +905,268 @@ async def health():
 
 @app.get("/api/config")
 async def config():
-    return {"auth_required": bool(settings.store_pin), "store_name": settings.store_name}
+    with db() as conn:
+        user_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    return {
+        "auth_required": user_count > 0 or bool(settings.store_pin),
+        "store_name": settings.store_name,
+        "role_pages": ROLE_PAGES,
+    }
 
 
 @app.post("/api/auth/check")
 async def auth_check(body: dict):
     pin = body.get("pin", "")
-    if settings.store_pin and pin != settings.store_pin:
-        raise HTTPException(status_code=401, detail="Неверный PIN")
+    with db() as conn:
+        user = resolve_user(conn, pin)
+        if not user:
+            raise HTTPException(status_code=401, detail="Неверный PIN")
+        shift = get_open_shift(conn)
+        return {
+            "ok": True,
+            "user": {"id": user["id"], "name": user["name"], "role": user["role"]},
+            "pages": ROLE_PAGES.get(user["role"], []),
+            "open_shift": row_to_dict(shift) if shift else None,
+        }
+
+
+# --- Users (owner) ---
+
+
+@app.get("/api/users")
+async def list_users(x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin, min_role="owner")
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT id, name, role, is_active, created_at FROM users ORDER BY role, name"
+        ).fetchall()
+    return [row_to_dict(r) for r in rows]
+
+
+@app.post("/api/users")
+async def create_user(body: UserIn, x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin, min_role="owner")
+    with db() as conn:
+        try:
+            cur = conn.execute(
+                "INSERT INTO users (name, pin, role, is_active, created_at) VALUES (?, ?, ?, 1, ?)",
+                (body.name.strip(), body.pin, body.role, utc_now()),
+            )
+            row = conn.execute(
+                "SELECT id, name, role, is_active, created_at FROM users WHERE id = ?",
+                (cur.lastrowid,),
+            ).fetchone()
+        except sqlite3.IntegrityError:
+            raise HTTPException(status_code=400, detail="PIN уже используется")
+    return row_to_dict(row)
+
+
+@app.put("/api/users/{user_id}")
+async def update_user(user_id: int, body: UserUpdate, x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin, min_role="owner")
+    fields = {k: v for k, v in body.model_dump().items() if v is not None}
+    if not fields:
+        raise HTTPException(status_code=400, detail="Нет данных")
+    sets = ", ".join(f"{k} = ?" for k in fields)
+    with db() as conn:
+        try:
+            conn.execute(f"UPDATE users SET {sets} WHERE id = ?", (*fields.values(), user_id))
+        except sqlite3.IntegrityError:
+            raise HTTPException(status_code=400, detail="PIN уже используется")
+        row = conn.execute(
+            "SELECT id, name, role, is_active, created_at FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Пользователь не найден")
+    return row_to_dict(row)
+
+
+# --- Shifts ---
+
+
+@app.get("/api/shifts/current")
+async def current_shift(x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin)
+    with db() as conn:
+        shift = get_open_shift(conn)
+        if not shift:
+            return {"shift": None, "summary": None}
+        summary = shift_sales_totals(conn, shift["id"])
+        return {"shift": row_to_dict(shift), "summary": summary}
+
+
+@app.post("/api/shifts/open")
+async def open_shift(body: ShiftOpenIn, x_pin: str | None = Header(default=None, alias="X-Pin")):
+    user = check_pin(x_pin)
+    with db() as conn:
+        if get_open_shift(conn):
+            raise HTTPException(status_code=400, detail="Смена уже открыта")
+        cur = conn.execute(
+            """
+            INSERT INTO shifts (user_id, user_name, opened_at, opening_cash, status)
+            VALUES (?, ?, ?, ?, 'open')
+            """,
+            (user.get("id") or None, user.get("name", ""), utc_now(), body.opening_cash),
+        )
+        row = conn.execute("SELECT * FROM shifts WHERE id = ?", (cur.lastrowid,)).fetchone()
+    return row_to_dict(row)
+
+
+@app.post("/api/shifts/{shift_id}/close")
+async def close_shift(shift_id: int, body: ShiftCloseIn, x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin)
+    with db() as conn:
+        shift = conn.execute(
+            "SELECT * FROM shifts WHERE id = ? AND status = 'open'", (shift_id,)
+        ).fetchone()
+        if not shift:
+            raise HTTPException(status_code=404, detail="Открытая смена не найдена")
+        totals = shift_sales_totals(conn, shift_id)
+        expected_cash = float(shift["opening_cash"]) + totals["expected_cash"]
+        conn.execute(
+            """
+            UPDATE shifts SET
+                closed_at = ?, status = 'closed',
+                expected_cash = ?, expected_card = ?,
+                actual_cash = ?, actual_card = ?,
+                sales_count = ?, notes = ?
+            WHERE id = ?
+            """,
+            (
+                utc_now(), totals["expected_cash"], totals["expected_card"],
+                body.actual_cash, body.actual_card, totals["sales_count"],
+                body.notes, shift_id,
+            ),
+        )
+        row = conn.execute("SELECT * FROM shifts WHERE id = ?", (shift_id,)).fetchone()
+    result = row_to_dict(row)
+    result["expected_cash_in_drawer"] = expected_cash
+    result["cash_difference"] = body.actual_cash - expected_cash
+    result["card_difference"] = body.actual_card - totals["expected_card"]
+    return result
+
+
+@app.get("/api/shifts")
+async def list_shifts(limit: int = Query(default=30, ge=1, le=200), x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin, min_role="owner")
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM shifts ORDER BY opened_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+    return [row_to_dict(r) for r in rows]
+
+
+# --- Product units (IMEI) ---
+
+
+@app.get("/api/units")
+async def list_units(
+    product_id: int | None = None,
+    warehouse_id: int | None = None,
+    status: str = "in_stock",
+    q: str = "",
+    x_pin: str | None = Header(default=None, alias="X-Pin"),
+):
+    check_pin(x_pin)
+    sql = """
+        SELECT u.*, p.name AS product_name, p.model, w.name AS warehouse_name
+        FROM product_units u
+        JOIN products p ON p.id = u.product_id
+        JOIN warehouses w ON w.id = u.warehouse_id
+        WHERE 1=1
+    """
+    params: list[Any] = []
+    if product_id:
+        sql += " AND u.product_id = ?"
+        params.append(product_id)
+    if warehouse_id:
+        sql += " AND u.warehouse_id = ?"
+        params.append(warehouse_id)
+    if status:
+        sql += " AND u.status = ?"
+        params.append(status)
+    if q:
+        like = f"%{q}%"
+        sql += " AND (u.imei LIKE ? OR u.serial LIKE ? OR p.name LIKE ?)"
+        params.extend([like, like, like])
+    sql += " ORDER BY u.created_at DESC LIMIT 500"
+    with db() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return [row_to_dict(r) for r in rows]
+
+
+@app.post("/api/units")
+async def create_unit(body: UnitIn, x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin, min_role="warehouse")
+    if not body.imei.strip() and not body.serial.strip():
+        raise HTTPException(status_code=400, detail="Укажите IMEI или серийный номер")
+    with db() as conn:
+        product = conn.execute("SELECT * FROM products WHERE id = ?", (body.product_id,)).fetchone()
+        if not product:
+            raise HTTPException(status_code=404, detail="Товар не найден")
+        wh = resolve_warehouse_id(conn, body.warehouse_id)
+        imei = body.imei.strip()
+        serial = body.serial.strip()
+        if imei:
+            dup = conn.execute(
+                "SELECT id FROM product_units WHERE imei = ? AND status != 'sold'", (imei,)
+            ).fetchone()
+            if dup:
+                raise HTTPException(status_code=400, detail="IMEI уже в системе")
+        cur = conn.execute(
+            """
+            INSERT INTO product_units
+            (product_id, warehouse_id, imei, serial, status, notes, created_at)
+            VALUES (?, ?, ?, ?, 'in_stock', ?, ?)
+            """,
+            (body.product_id, wh, imei, serial, body.notes, utc_now()),
+        )
+        adjust_warehouse_stock(
+            conn, wh, body.product_id, 1, "inbound",
+            notes=f"IMEI: {imei or serial}",
+        )
+        conn.execute("UPDATE products SET track_units = 1 WHERE id = ?", (body.product_id,))
+        row = conn.execute(
+            """
+            SELECT u.*, p.name AS product_name, w.name AS warehouse_name
+            FROM product_units u
+            JOIN products p ON p.id = u.product_id
+            JOIN warehouses w ON w.id = u.warehouse_id
+            WHERE u.id = ?
+            """,
+            (cur.lastrowid,),
+        ).fetchone()
+    return row_to_dict(row)
+
+
+@app.delete("/api/units/{unit_id}")
+async def delete_unit(unit_id: int, x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin, min_role="warehouse")
+    with db() as conn:
+        unit = conn.execute(
+            "SELECT * FROM product_units WHERE id = ? AND status = 'in_stock'", (unit_id,)
+        ).fetchone()
+        if not unit:
+            raise HTTPException(status_code=404, detail="Единица не найдена или уже продана")
+        conn.execute("DELETE FROM product_units WHERE id = ?", (unit_id,))
+        adjust_warehouse_stock(
+            conn, unit["warehouse_id"], unit["product_id"], -1,
+            "outbound", notes=f"Удаление IMEI #{unit_id}",
+        )
     return {"ok": True}
+
+
+@app.get("/api/products/{product_id}/units")
+async def product_units(
+    product_id: int,
+    warehouse_id: int | None = None,
+    status: str = "in_stock",
+    x_pin: str | None = Header(default=None, alias="X-Pin"),
+):
+    check_pin(x_pin)
+    return await list_units(
+        product_id=product_id, warehouse_id=warehouse_id, status=status, q="", x_pin=x_pin
+    )
 
 
 # --- Warehouses ---
@@ -720,7 +1224,7 @@ async def update_warehouse(
 
 @app.delete("/api/warehouses/{warehouse_id}")
 async def delete_warehouse(warehouse_id: int, x_pin: str | None = Header(default=None, alias="X-Pin")):
-    check_pin(x_pin)
+    check_pin(x_pin, min_role="owner")
     with db() as conn:
         wh = conn.execute("SELECT * FROM warehouses WHERE id = ?", (warehouse_id,)).fetchone()
         if not wh:
@@ -1047,21 +1551,22 @@ async def create_product(body: ProductIn, x_pin: str | None = Header(default=Non
         raise HTTPException(status_code=400, detail="Укажите поставщика для товара под реализацию")
     with db() as conn:
         wh_id = resolve_warehouse_id(conn, body.warehouse_id)
+        track = body.track_units if body.track_units is not None else (1 if body.category == "phone" else 0)
         cur = conn.execute(
             """
             INSERT INTO products
             (name, category, ownership_type, supplier_name, brand, sku, barcode,
              purchase_price, sale_price, stock, min_stock, created_at,
-             model, color, size, memory, ram, customs_cleared, customs_price, specs_extra, condition)
+             model, color, size, memory, ram, customs_cleared, customs_price, specs_extra, condition, track_units)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 body.name, body.category, body.ownership_type, body.supplier_name.strip(),
                 body.brand, body.sku, body.barcode, body.purchase_price, body.sale_price,
                 body.min_stock, utc_now(),
                 body.model, body.color, body.size, body.memory, body.ram,
-                body.customs_cleared, body.customs_price, body.specs_extra, body.condition,
+                body.customs_cleared, body.customs_price, body.specs_extra, body.condition, track,
             ),
         )
         product_id = cur.lastrowid
@@ -1113,7 +1618,7 @@ async def update_product(product_id: int, body: ProductUpdate, x_pin: str | None
 
 @app.delete("/api/products/{product_id}")
 async def delete_product(product_id: int, x_pin: str | None = Header(default=None, alias="X-Pin")):
-    check_pin(x_pin)
+    check_pin(x_pin, min_role="owner")
     with db() as conn:
         cur = conn.execute("DELETE FROM products WHERE id = ?", (product_id,))
         if cur.rowcount == 0:
@@ -1132,40 +1637,59 @@ async def create_sale(body: SaleIn, x_pin: str | None = Header(default=None, ali
 
     with db() as conn:
         warehouse_id = resolve_warehouse_id(conn, body.warehouse_id)
+        shift = get_open_shift(conn)
+        shift_id = body.shift_id or (shift["id"] if shift else None)
+        if shift_id is None:
+            raise HTTPException(status_code=400, detail="Сначала откройте смену (раздел «Смена»)")
+
         subtotal = 0.0
         lines: list[dict[str, Any]] = []
         for item in body.items:
             product = conn.execute("SELECT * FROM products WHERE id = ?", (item.product_id,)).fetchone()
             if not product:
                 raise HTTPException(status_code=404, detail=f"Товар #{item.product_id} не найден")
-            wh_stock = get_warehouse_stock(conn, warehouse_id, item.product_id)
-            if wh_stock < item.quantity:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Недостаточно «{product['name']}» на складе: доступно {wh_stock}",
-                )
+            if int(product["track_units"] or 0):
+                avail = conn.execute(
+                    """
+                    SELECT COUNT(*) FROM product_units
+                    WHERE product_id = ? AND warehouse_id = ? AND status = 'in_stock'
+                    """,
+                    (item.product_id, warehouse_id),
+                ).fetchone()[0]
+                if avail < item.quantity:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"«{product['name']}»: нужны IMEI — доступно {avail} из {item.quantity}",
+                    )
+            else:
+                wh_stock = get_warehouse_stock(conn, warehouse_id, item.product_id)
+                if wh_stock < item.quantity:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Недостаточно «{product['name']}» на складе: доступно {wh_stock}",
+                    )
             calc = calc_line(product, item.quantity)
             subtotal += calc["subtotal"]
-            lines.append({"product": product, "qty": item.quantity, **calc})
+            lines.append({"product": product, "qty": item.quantity, "unit_ids": item.unit_ids, **calc})
 
         total = max(0.0, subtotal - body.discount)
         now = utc_now()
         cash_amount = total if body.payment_method == "cash" else 0.0
-        card_amount = total if body.payment_method == "card" else 0.0
+        card_amount = total if body.payment_method in ("card", "transfer") else 0.0
         cur = conn.execute(
             """
             INSERT INTO sales
             (total, discount, payment_method, status, notes, created_at,
-             warehouse_id, cash_amount, card_amount, trade_in_value)
-            VALUES (?, ?, ?, 'completed', ?, ?, ?, ?, ?, 0)
+             warehouse_id, cash_amount, card_amount, trade_in_value, shift_id)
+            VALUES (?, ?, ?, 'completed', ?, ?, ?, ?, ?, 0, ?)
             """,
             (total, body.discount, body.payment_method, body.notes, now,
-             warehouse_id, cash_amount, card_amount),
+             warehouse_id, cash_amount, card_amount, shift_id),
         )
         sale_id = cur.lastrowid
         for line in lines:
             p = line["product"]
-            conn.execute(
+            cur_item = conn.execute(
                 """
                 INSERT INTO sale_items
                 (sale_id, product_id, product_name, ownership_type, supplier_name, quantity,
@@ -1178,6 +1702,18 @@ async def create_sale(body: SaleIn, x_pin: str | None = Header(default=None, ali
                     line["supplier_due"], line["shop_profit"], line["subtotal"],
                 ),
             )
+            sale_item_id = cur_item.lastrowid
+            if int(p["track_units"] or 0):
+                units = pick_units(conn, p["id"], warehouse_id, line["qty"], line["unit_ids"] or None)
+                for u in units:
+                    conn.execute(
+                        """
+                        INSERT INTO sale_item_units (sale_item_id, unit_id, imei, serial)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (sale_item_id, u["id"], u["imei"] or "", u["serial"] or ""),
+                    )
+                mark_units_sold(conn, units, sale_id)
             adjust_warehouse_stock(
                 conn, warehouse_id, p["id"], -line["qty"],
                 "sale", reference_id=sale_id, notes=f"Продажа #{sale_id}",
@@ -1185,9 +1721,8 @@ async def create_sale(body: SaleIn, x_pin: str | None = Header(default=None, ali
 
         sale = conn.execute("SELECT * FROM sales WHERE id = ?", (sale_id,)).fetchone()
         items = conn.execute("SELECT * FROM sale_items WHERE sale_id = ?", (sale_id,)).fetchall()
-
-    result = row_to_dict(sale)
-    result["items"] = [row_to_dict(i) for i in items]
+        result = row_to_dict(sale)
+        result["items"] = enrich_sale_items(conn, items)
     return result
 
 
@@ -1230,19 +1765,20 @@ async def get_sale(sale_id: int, x_pin: str | None = Header(default=None, alias=
         if not sale:
             raise HTTPException(status_code=404, detail="Продажа не найдена")
         items = conn.execute("SELECT * FROM sale_items WHERE sale_id = ?", (sale_id,)).fetchall()
-    result = row_to_dict(sale)
-    result["items"] = [row_to_dict(i) for i in items]
+        result = row_to_dict(sale)
+        result["items"] = enrich_sale_items(conn, items)
     return result
 
 
 @app.post("/api/sales/{sale_id}/void")
 async def void_sale(sale_id: int, x_pin: str | None = Header(default=None, alias="X-Pin")):
-    check_pin(x_pin)
+    check_pin(x_pin, min_role="owner")
     with db() as conn:
         sale = conn.execute("SELECT * FROM sales WHERE id = ? AND status = 'completed'", (sale_id,)).fetchone()
         if not sale:
             raise HTTPException(status_code=404, detail="Продажа не найдена")
         warehouse_id = sale["warehouse_id"] or get_default_warehouse_id(conn)
+        restore_units_for_sale(conn, sale_id)
         for item in conn.execute("SELECT * FROM sale_items WHERE sale_id = ?", (sale_id,)).fetchall():
             if item["product_id"]:
                 adjust_warehouse_stock(
@@ -1313,20 +1849,24 @@ async def create_trade_in(body: TradeInIn, x_pin: str | None = Header(default=No
                 detail=f"Сумма оплаты ({paid:.2f}) не совпадает с ценой товара ({total:.2f})",
             )
 
+        shift = get_open_shift(conn)
+        if not shift:
+            raise HTTPException(status_code=400, detail="Сначала откройте смену")
+
         now = utc_now()
         cur = conn.execute(
             """
             INSERT INTO sales
             (total, discount, payment_method, status, notes, created_at,
-             warehouse_id, cash_amount, card_amount, trade_in_value)
-            VALUES (?, 0, 'trade_in', 'completed', ?, ?, ?, ?, ?, ?)
+             warehouse_id, cash_amount, card_amount, trade_in_value, shift_id)
+            VALUES (?, 0, 'trade_in', 'completed', ?, ?, ?, ?, ?, ?, ?)
             """,
             (total, body.notes or "Обмен (trade-in)", now,
-             given_wh, body.cash_amount, body.card_amount, body.received_value),
+             given_wh, body.cash_amount, body.card_amount, body.received_value, shift["id"]),
         )
         sale_id = cur.lastrowid
 
-        conn.execute(
+        cur_item = conn.execute(
             """
             INSERT INTO sale_items
             (sale_id, product_id, product_name, ownership_type, supplier_name, quantity,
@@ -1340,6 +1880,18 @@ async def create_trade_in(body: TradeInIn, x_pin: str | None = Header(default=No
                 calc["supplier_due"], calc["shop_profit"], calc["subtotal"],
             ),
         )
+        sale_item_id = cur_item.lastrowid
+        if int(given_product["track_units"] or 0):
+            units = pick_units(
+                conn, given_product["id"], given_wh, 1,
+                [body.given_unit_id] if body.given_unit_id else None,
+            )
+            for u in units:
+                conn.execute(
+                    "INSERT INTO sale_item_units (sale_item_id, unit_id, imei, serial) VALUES (?, ?, ?, ?)",
+                    (sale_item_id, u["id"], u["imei"] or "", u["serial"] or ""),
+                )
+            mark_units_sold(conn, units, sale_id)
 
         adjust_warehouse_stock(
             conn, given_wh, body.given_product_id, -1,
@@ -1351,9 +1903,9 @@ async def create_trade_in(body: TradeInIn, x_pin: str | None = Header(default=No
             INSERT INTO products
             (name, category, ownership_type, supplier_name, brand, sku, barcode,
              purchase_price, sale_price, stock, min_stock, created_at,
-             model, color, size, memory, ram, customs_cleared, customs_price, specs_extra, condition)
+             model, color, size, memory, ram, customs_cleared, customs_price, specs_extra, condition, track_units)
             VALUES (?, 'phone', 'own', '', ?, '', '', ?, ?, 0, 1, ?,
-                    ?, ?, ?, ?, ?, 0, 0, ?, ?)
+                    ?, ?, ?, ?, ?, 0, 0, ?, ?, 1)
             """,
             (
                 body.received_name, body.received_brand, body.received_purchase_price,
@@ -1365,6 +1917,18 @@ async def create_trade_in(body: TradeInIn, x_pin: str | None = Header(default=No
         )
         received_product_id = recv_cur.lastrowid
 
+        if body.received_imei.strip() or body.received_serial.strip():
+            conn.execute(
+                """
+                INSERT INTO product_units
+                (product_id, warehouse_id, imei, serial, status, notes, created_at)
+                VALUES (?, ?, ?, ?, 'in_stock', 'Trade-in', ?)
+                """,
+                (
+                    received_product_id, received_wh,
+                    body.received_imei.strip(), body.received_serial.strip(), now,
+                ),
+            )
         adjust_warehouse_stock(
             conn, received_wh, received_product_id, 1,
             "trade_in_received", reference_id=sale_id,
@@ -1637,7 +2201,7 @@ async def finance_report(
     date_to: str = "",
     x_pin: str | None = Header(default=None, alias="X-Pin"),
 ):
-    check_pin(x_pin)
+    check_pin(x_pin, min_role="owner")
     with db() as conn:
         report = _finance_report(conn, period, scope, date_from, date_to)
         if scope in ("all", "consignment"):
@@ -1676,7 +2240,7 @@ async def combined_report(
     date_to: str = "",
     x_pin: str | None = Header(default=None, alias="X-Pin"),
 ):
-    check_pin(x_pin)
+    check_pin(x_pin, min_role="owner")
     with db() as conn:
         return {
             "all": _finance_report(conn, period, "all", date_from, date_to),
@@ -1691,7 +2255,7 @@ async def analytics_summary(
     scope: ReportScope = "all",
     x_pin: str | None = Header(default=None, alias="X-Pin"),
 ):
-    check_pin(x_pin)
+    check_pin(x_pin, min_role="owner")
     with db() as conn:
         report = _finance_report(conn, period, scope, "", "")
         low_sql = "SELECT COUNT(*) FROM products WHERE stock <= min_stock"
@@ -1739,7 +2303,7 @@ async def analytics_top(
     limit: int = Query(default=10, ge=1, le=50),
     x_pin: str | None = Header(default=None, alias="X-Pin"),
 ):
-    check_pin(x_pin)
+    check_pin(x_pin, min_role="owner")
     since_clause, params = ("", []) if period == "all" else ("AND s.created_at >= ?", [period_start(period)])
     own_clause, own_params = ownership_filter_sql(scope)
     params = params + own_params + [limit]
@@ -1768,7 +2332,7 @@ async def analytics_daily(
     scope: ReportScope = "all",
     x_pin: str | None = Header(default=None, alias="X-Pin"),
 ):
-    check_pin(x_pin)
+    check_pin(x_pin, min_role="owner")
     since = (datetime.now() - timedelta(days=days - 1)).strftime("%Y-%m-%d")
     own_clause, own_params = ownership_filter_sql(scope)
     with db() as conn:
