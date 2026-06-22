@@ -15,6 +15,10 @@ let currentUser = null;
 let allowedPages = null;
 let openShift = null;
 let imeiPickerResolve = null;
+let catalogProducts = [];
+let catalogDetailId = null;
+let pendingProductImage = null;
+let pendingProductImageUrl = null;
 
 const ROLE_LABELS = { owner: "Владелец", warehouse: "Кладовщик", cashier: "Кассир" };
 
@@ -27,6 +31,85 @@ const scopeLabel = (s) => ({ all: "Общий", own: "Собственные", c
 const conditionLabel = (c) => ({ new: "Новый", used: "Б/у", refurbished: "Восстановленный" }[c] || c);
 const esc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 const dash = (s) => s ? esc(s) : "—";
+
+function productPhClass(p) {
+  return (p?.category || "phone") === "phone" ? "ph-phone" : "ph-accessory";
+}
+function productPhIcon(p) {
+  return (p?.category || "phone") === "phone" ? "📱" : "🎧";
+}
+function renderProductVisual(p, size = "") {
+  const cls = `${productPhClass(p)} ${size}`.trim();
+  if (p?.image_url) {
+    return `<div class="product-visual ${cls}"><img src="${esc(p.image_url)}" alt="${esc(p.name)}" loading="lazy"></div>`;
+  }
+  return `<div class="product-visual ${cls}"><span class="product-visual-icon">${productPhIcon(p)}</span></div>`;
+}
+function productSpecChips(p) {
+  return [p.model, p.color, p.memory, p.ram, p.size].filter(Boolean).slice(0, 4)
+    .map((s) => `<span class="spec-chip">${esc(s)}</span>`).join("");
+}
+function stockBadgeClass(p) {
+  if (p.stock <= 0) return "out";
+  if (p.stock <= p.min_stock) return "low";
+  return "";
+}
+function stockBadgeText(p) {
+  if (p.stock <= 0) return "Нет в наличии";
+  if (p.track_units && p.units_available != null) return `${p.units_available} IMEI`;
+  return `${p.stock} шт.`;
+}
+
+async function apiUpload(path, file) {
+  const headers = {};
+  if (pin) headers["X-Pin"] = pin;
+  const fd = new FormData();
+  fd.append("file", file);
+  const res = await fetch(path, { method: "POST", headers, body: fd });
+  if (res.status === 401) {
+    pin = "";
+    localStorage.removeItem(PIN_KEY);
+    showLogin();
+    throw new Error("Неверный PIN");
+  }
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(typeof err.detail === "string" ? err.detail : `Ошибка ${res.status}`);
+  }
+  return res.json();
+}
+
+function clearProductImagePending() {
+  pendingProductImage = null;
+  if (pendingProductImageUrl) {
+    URL.revokeObjectURL(pendingProductImageUrl);
+    pendingProductImageUrl = null;
+  }
+}
+
+function setProductImagePreview(p = null) {
+  const box = document.getElementById("pf-image-preview");
+  if (!box) return;
+  const cat = p?.category || document.getElementById("pf-category")?.value || "phone";
+  const fake = { category: cat, name: p?.name || "", image_url: p?.image_url || "" };
+  box.className = `pf-image-preview ${productPhClass(fake)}`;
+  if (pendingProductImageUrl) {
+    box.innerHTML = `<img src="${pendingProductImageUrl}" alt="">`;
+  } else if (fake.image_url) {
+    box.innerHTML = `<img src="${esc(fake.image_url)}" alt="">`;
+  } else {
+    box.innerHTML = `<span class="pf-image-placeholder">${productPhIcon(fake)}</span>`;
+  }
+}
+
+function sortCatalogItems(items, sort) {
+  const list = [...items];
+  if (sort === "price_asc") list.sort((a, b) => a.sale_price - b.sale_price);
+  else if (sort === "price_desc") list.sort((a, b) => b.sale_price - a.sale_price);
+  else if (sort === "stock") list.sort((a, b) => b.stock - a.stock);
+  else list.sort((a, b) => a.name.localeCompare(b.name, "ru"));
+  return list;
+}
 
 const PAGE_TITLES = {
   dashboard: "Обзор",
@@ -384,6 +467,7 @@ function renderPosProducts() {
     const meta = [p.model, p.color, p.memory].filter(Boolean).join(" · ");
     const imeiTag = p.track_units ? ' · <span class="tag" style="font-size:.6rem">IMEI</span>' : "";
     return `<div class="product-card ${out ? "out" : ""}" data-id="${p.id}">
+      ${p.image_url ? `<div class="product-card-thumb"><img src="${esc(p.image_url)}" alt="" loading="lazy"></div>` : ""}
       <span class="tag tag-${p.ownership_type === "consignment" ? "cons" : "own"}">${ownLabel(p.ownership_type)}</span>
       <div class="name">${esc(p.name)}</div>
       <div class="meta">${esc(p.brand)} · ${catLabel(p.category)}${meta ? ` · ${esc(meta)}` : ""}${imeiTag}</div>
@@ -634,33 +718,101 @@ window.voidSale = async (id) => {
 
 /* ── Catalog ── */
 function bindCatalog() {
-  document.getElementById("catalog-search").addEventListener("input", debounce(loadCatalog, 300));
-  document.getElementById("catalog-ownership").addEventListener("change", loadCatalog);
+  ["catalog-search", "catalog-category", "catalog-ownership", "catalog-sort"].forEach((id) => {
+    const el = document.getElementById(id);
+    el?.addEventListener(id === "catalog-search" ? "input" : "change", debounce(loadCatalog, 280));
+  });
+  document.getElementById("catalog-detail-close")?.addEventListener("click", () => {
+    document.getElementById("catalog-detail-modal").close();
+  });
+  document.getElementById("catalog-detail-edit")?.addEventListener("click", () => {
+    document.getElementById("catalog-detail-modal").close();
+    if (catalogDetailId) editProduct(catalogDetailId);
+  });
 }
 
 async function loadCatalog() {
-  const q = document.getElementById("catalog-search").value;
-  const own = document.getElementById("catalog-ownership").value;
+  const q = document.getElementById("catalog-search")?.value || "";
+  const cat = document.getElementById("catalog-category")?.value || "";
+  const own = document.getElementById("catalog-ownership")?.value || "";
+  const sort = document.getElementById("catalog-sort")?.value || "name";
   let url = `/api/products?q=${encodeURIComponent(q)}`;
+  if (cat) url += `&category=${cat}`;
   if (own) url += `&ownership_type=${own}`;
-  const items = await api(url);
-  const tb = document.getElementById("catalog-tbody");
-  tb.innerHTML = items.map((p) => `
-    <tr>
-      <td><strong>${esc(p.name)}</strong><br><span style="font-size:.75rem;color:var(--muted)">${esc(p.brand)} · ${esc(p.sku)}</span></td>
-      <td>${dash(p.model)}</td>
-      <td>${dash(p.color)}</td>
-      <td>${dash(p.size)}</td>
-      <td>${dash(p.memory)}</td>
-      <td>${dash(p.ram)}</td>
-      <td>${p.customs_cleared ? `✓ ${fmt(p.customs_price)}` : "—"}</td>
-      <td>${conditionLabel(p.condition)}</td>
-      <td><span class="tag tag-${p.ownership_type === "consignment" ? "cons" : "own"}">${ownLabel(p.ownership_type)}</span></td>
-      <td>${fmt(p.sale_price)}</td>
-      <td class="${p.stock <= p.min_stock ? "stock-low" : ""}">${p.stock}</td>
-      <td><button class="btn btn-ghost btn-sm" onclick="editProduct(${p.id})">Карточка</button></td>
-    </tr>`).join("") || '<tr><td colspan="12" style="text-align:center;color:var(--muted)">Нет товаров</td></tr>';
+  catalogProducts = await api(url);
+  const items = sortCatalogItems(catalogProducts, sort);
+  const grid = document.getElementById("catalog-grid");
+  const empty = document.getElementById("catalog-empty");
+  const stats = document.getElementById("catalog-stats");
+  const phones = items.filter((p) => p.category === "phone").length;
+  const acc = items.filter((p) => p.category === "accessory").length;
+  const inStock = items.filter((p) => p.stock > 0).length;
+  stats.textContent = `${items.length} позиций · ${phones} телефонов · ${acc} аксессуаров · ${inStock} в наличии`;
+
+  if (!items.length) {
+    grid.innerHTML = "";
+    empty.classList.remove("hidden");
+    return;
+  }
+  empty.classList.add("hidden");
+  grid.innerHTML = items.map((p, i) => `
+    <article class="catalog-card" style="animation-delay:${Math.min(i * 0.04, 0.4)}s" onclick="openCatalogDetail(${p.id})">
+      <div style="position:relative">
+        ${renderProductVisual(p)}
+        <div class="catalog-card-badges">
+          <span class="tag tag-${p.ownership_type === "consignment" ? "cons" : "own"}">${ownLabel(p.ownership_type)}</span>
+          <span class="tag tag-${p.category}">${catLabel(p.category)}</span>
+          ${p.track_units ? '<span class="tag tag-phone">IMEI</span>' : ""}
+        </div>
+      </div>
+      <div class="catalog-card-body">
+        <div class="catalog-card-title">${esc(p.name)}</div>
+        <div class="catalog-card-meta">${esc(p.brand || "—")}${p.sku ? ` · ${esc(p.sku)}` : ""}</div>
+        <div class="catalog-card-specs">${productSpecChips(p) || `<span class="spec-chip">${conditionLabel(p.condition)}</span>`}</div>
+        <div class="catalog-card-footer">
+          <div class="catalog-card-price">${fmt(p.sale_price)}</div>
+          <span class="catalog-card-stock ${stockBadgeClass(p)}">${stockBadgeText(p)}</span>
+        </div>
+      </div>
+    </article>`).join("");
 }
+
+window.openCatalogDetail = async (id) => {
+  catalogDetailId = id;
+  let p = catalogProducts.find((x) => x.id === id);
+  if (!p) p = await api(`/api/products/${id}`);
+  const whRows = Object.entries(p.stock_by_warehouse || {})
+    .map(([wid, qty]) => {
+      const w = warehouses.find((x) => x.id === +wid);
+      return `<div class="catalog-detail-spec"><span>Склад</span><strong>${esc(w?.name || `#${wid}`)}: ${qty} шт.</strong></div>`;
+    }).join("");
+  const specs = [
+    ["Модель", p.model], ["Цвет", p.color], ["Память", p.memory], ["RAM", p.ram],
+    ["Размер", p.size], ["Состояние", conditionLabel(p.condition)],
+    ["Артикул", p.sku], ["Штрихкод", p.barcode], ["Бренд", p.brand],
+    ["Закупка", fmt(p.purchase_price)], ["Маржа", fmt(p.sale_price - p.purchase_price)],
+    ["Таможня", p.customs_cleared ? `✓ ${fmt(p.customs_price)}` : "—"],
+  ].filter(([, v]) => v && v !== "—" && v !== "0 ₽")
+    .map(([k, v]) => `<div class="catalog-detail-spec"><span>${k}</span><strong>${typeof v === "string" && v.includes("₽") ? v : esc(String(v))}</strong></div>`)
+    .join("");
+
+  document.getElementById("catalog-detail-content").innerHTML = `
+    <div class="catalog-detail-visual">${renderProductVisual(p, "detail")}</div>
+    <div class="catalog-detail-info">
+      <div style="display:flex;flex-wrap:wrap;gap:.35rem;margin-bottom:.5rem">
+        <span class="tag tag-${p.ownership_type === "consignment" ? "cons" : "own"}">${ownLabel(p.ownership_type)}</span>
+        <span class="tag tag-${p.category}">${catLabel(p.category)}</span>
+        ${p.track_units ? '<span class="tag tag-phone">Учёт IMEI</span>' : ""}
+      </div>
+      <h3>${esc(p.name)}</h3>
+      <div class="catalog-detail-brand">${esc(p.brand || "")}${p.supplier_name ? ` · ${esc(p.supplier_name)}` : ""}</div>
+      <div class="catalog-detail-price">${fmt(p.sale_price)}</div>
+      <span class="catalog-card-stock ${stockBadgeClass(p)}">${stockBadgeText(p)}</span>
+      <div class="catalog-detail-specs">${specs}${whRows}</div>
+      ${p.specs_extra ? `<div class="catalog-detail-extra">${esc(p.specs_extra)}</div>` : ""}
+    </div>`;
+  document.getElementById("catalog-detail-modal").showModal();
+};
 
 /* ── Warehouses ── */
 function bindWarehouses() {
@@ -1311,8 +1463,34 @@ function bindProducts() {
   document.getElementById("own-low-stock").addEventListener("change", loadOwnProducts);
   document.getElementById("cons-search").addEventListener("input", debounce(loadConsProducts, 300));
   document.getElementById("cons-supplier-filter").addEventListener("change", loadConsProducts);
-  document.getElementById("product-cancel").onclick = () => document.getElementById("product-modal").close();
+  document.getElementById("product-cancel").onclick = () => {
+    clearProductImagePending();
+    document.getElementById("product-modal").close();
+  };
   document.getElementById("product-form").onsubmit = saveProduct;
+  document.getElementById("pf-image-file")?.addEventListener("change", (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    clearProductImagePending();
+    pendingProductImage = file;
+    pendingProductImageUrl = URL.createObjectURL(file);
+    setProductImagePreview();
+    e.target.value = "";
+  });
+  document.getElementById("pf-image-remove")?.addEventListener("click", async () => {
+    const id = document.getElementById("pf-id").value;
+    clearProductImagePending();
+    if (id) {
+      try {
+        await api(`/api/products/${id}/image`, { method: "DELETE" });
+        toast("Фото удалено");
+      } catch (err) { toast(err.message, "error"); return; }
+    }
+    setProductImagePreview({ category: document.getElementById("pf-category").value });
+  });
+  document.getElementById("pf-category")?.addEventListener("change", () => {
+    if (!pendingProductImageUrl && !document.getElementById("pf-id").value) setProductImagePreview();
+  });
   ["pf-purchase", "pf-sale", "pf-ownership"].forEach((id) => {
     document.getElementById(id)?.addEventListener("input", updateMarginHint);
     document.getElementById(id)?.addEventListener("change", updateMarginHint);
@@ -1444,6 +1622,7 @@ async function loadConsProducts() {
 }
 
 window.openProductModal = (ownership) => {
+  clearProductImagePending();
   document.getElementById("product-modal-title").textContent = ownership === "consignment" ? "Товар под реализацию" : "Собственный товар";
   document.getElementById("pf-id").value = "";
   document.getElementById("pf-ownership").value = ownership;
@@ -1455,13 +1634,14 @@ window.openProductModal = (ownership) => {
   document.getElementById("pf-min-stock").value = "2";
   document.getElementById("pf-category").value = "accessory";
   setProductFormMode(false);
+  setProductImagePreview({ category: "accessory" });
   updateMarginHint();
   document.getElementById("product-modal").showModal();
 };
 
 window.editProduct = async (id) => {
-  const all = await api("/api/products");
-  const p = all.find((x) => x.id === id);
+  clearProductImagePending();
+  const p = await api(`/api/products/${id}`);
   if (!p) return;
   document.getElementById("product-modal-title").textContent = "Карточка товара";
   document.getElementById("pf-id").value = p.id;
@@ -1478,6 +1658,7 @@ window.editProduct = async (id) => {
   document.getElementById("pf-min-stock").value = p.min_stock;
   fillProductCardFields(p);
   setProductFormMode(true, p);
+  setProductImagePreview(p);
   updateMarginHint();
   document.getElementById("product-modal").showModal();
 };
@@ -1517,8 +1698,16 @@ async function saveProduct(e) {
     body.warehouse_id = +document.getElementById("pf-warehouse").value;
   }
   try {
+    let productId = id;
     if (id) await api(`/api/products/${id}`, { method: "PUT", body: JSON.stringify(body) });
-    else await api("/api/products", { method: "POST", body: JSON.stringify(body) });
+    else {
+      const created = await api("/api/products", { method: "POST", body: JSON.stringify(body) });
+      productId = created.id;
+    }
+    if (pendingProductImage && productId) {
+      await apiUpload(`/api/products/${productId}/image`, pendingProductImage);
+    }
+    clearProductImagePending();
     document.getElementById("product-modal").close();
     toast("Сохранено");
     loadOwnProducts();

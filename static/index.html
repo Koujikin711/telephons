@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/style.css?v=2">
+  <link rel="stylesheet" href="/static/style.css?v=3">
 </head>
 <body>
   <div class="mesh-bg" aria-hidden="true"></div>
@@ -183,22 +183,38 @@
 
         <!-- CATALOG -->
         <section id="page-catalog" class="page">
-          <div class="toolbar">
-            <input type="search" id="catalog-search" class="input" placeholder="Поиск по названию, модели, цвету…">
+          <div class="catalog-hero">
+            <div class="catalog-hero-text">
+              <h3>Каталог товаров</h3>
+              <p id="catalog-stats">Загрузка…</p>
+            </div>
+            <button class="btn btn-primary" onclick="openProductModal('own')">+ Добавить товар</button>
+          </div>
+          <div class="catalog-filters">
+            <input type="search" id="catalog-search" class="input catalog-search" placeholder="Поиск: название, модель, цвет, IMEI, артикул…">
+            <select id="catalog-category" class="select">
+              <option value="">Все категории</option>
+              <option value="phone">Телефоны</option>
+              <option value="accessory">Аксессуары</option>
+            </select>
             <select id="catalog-ownership" class="select">
-              <option value="">Все товары</option>
+              <option value="">Все типы</option>
               <option value="own">Собственные</option>
               <option value="consignment">Реализация</option>
             </select>
-            <button class="btn btn-primary" onclick="openProductModal('own')">+ Добавить</button>
+            <select id="catalog-sort" class="select">
+              <option value="name">По названию</option>
+              <option value="price_asc">Цена ↑</option>
+              <option value="price_desc">Цена ↓</option>
+              <option value="stock">По остатку</option>
+            </select>
           </div>
-          <div class="card"><div class="table-wrap"><table class="data-table">
-            <thead><tr>
-              <th>Название</th><th>Модель</th><th>Цвет</th><th>Размер</th><th>Память</th><th>RAM</th>
-              <th>Таможня</th><th>Состояние</th><th>Тип</th><th>Цена</th><th>Остаток</th><th></th>
-            </tr></thead>
-            <tbody id="catalog-tbody"></tbody>
-          </table></div></div>
+          <div id="catalog-grid" class="catalog-grid"></div>
+          <div id="catalog-empty" class="catalog-empty hidden">
+            <div class="catalog-empty-icon">📦</div>
+            <p>Товары не найдены</p>
+            <button class="btn btn-secondary" onclick="openProductModal('own')">Добавить первый товар</button>
+          </div>
         </section>
 
         <!-- WAREHOUSES -->
@@ -517,11 +533,32 @@
     </div>
   </div>
 
+  <dialog id="catalog-detail-modal" class="modal modal-xl">
+    <div id="catalog-detail-content" class="catalog-detail"></div>
+    <div class="modal-actions">
+      <button type="button" class="btn btn-ghost" id="catalog-detail-close">Закрыть</button>
+      <button type="button" class="btn btn-primary" id="catalog-detail-edit">Редактировать</button>
+    </div>
+  </dialog>
+
   <dialog id="product-modal" class="modal modal-lg">
     <form id="product-form" method="dialog">
       <h3 id="product-modal-title">Товар</h3>
       <input type="hidden" id="pf-id">
       <input type="hidden" id="pf-ownership">
+      <div class="pf-image-block">
+        <div id="pf-image-preview" class="pf-image-preview ph-phone">
+          <span class="pf-image-placeholder">📱</span>
+        </div>
+        <div class="pf-image-actions">
+          <label class="btn btn-secondary btn-sm pf-upload-btn">
+            Загрузить фото
+            <input type="file" id="pf-image-file" accept="image/jpeg,image/png,image/webp,image/gif" hidden>
+          </label>
+          <button type="button" class="btn btn-ghost btn-sm" id="pf-image-remove">Удалить</button>
+          <p class="hint">JPG, PNG, WEBP до 5 МБ</p>
+        </div>
+      </div>
       <label>Название<input id="pf-name" class="input" required></label>
       <div class="form-row">
         <label>Категория<select id="pf-category" class="select"><option value="phone">Телефон</option><option value="accessory">Аксессуар</option></select></label>
@@ -661,6 +698,6 @@
   </dialog>
 
   <div id="toast" class="toast"></div>
-  <script src="/static/app.js?v=2"></script>
+  <script src="/static/app.js?v=3"></script>
 </body>
 </html>

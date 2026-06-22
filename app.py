@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, File, Header, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -22,6 +22,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 DATA_DIR = Path("/data") if Path("/data").exists() else Path(__file__).resolve().parent / "data"
 DB_PATH = DATA_DIR / "store.db"
+UPLOADS_DIR = DATA_DIR / "uploads"
+UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+ALLOWED_IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
 
 OwnershipType = Literal["own", "consignment"]
 ReportScope = Literal["all", "own", "consignment"]
@@ -110,6 +114,7 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     _add_column(conn, "sales", "trade_in_value", "REAL NOT NULL DEFAULT 0")
     _add_column(conn, "sales", "shift_id", "INTEGER")
     _add_column(conn, "products", "track_units", "INTEGER NOT NULL DEFAULT 0")
+    _add_column(conn, "products", "image_url", "TEXT DEFAULT ''")
     conn.execute("UPDATE products SET track_units = 1 WHERE category = 'phone' AND track_units = 0")
     conn.execute(
         """
@@ -303,6 +308,7 @@ def migrate_db(conn: sqlite3.Connection) -> None:
 
 def init_db() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
     with db() as conn:
         conn.executescript(
             """
@@ -750,6 +756,7 @@ class ProductIn(BaseModel):
     condition: ProductCondition = "new"
     warehouse_id: int | None = None
     track_units: int | None = None
+    image_url: str = ""
 
 
 class ProductUpdate(BaseModel):
@@ -775,6 +782,7 @@ class ProductUpdate(BaseModel):
     condition: ProductCondition | None = None
     warehouse_id: int | None = None
     track_units: int | None = Field(default=None, ge=0, le=1)
+    image_url: str | None = None
 
 
 class CartItem(BaseModel):
@@ -891,6 +899,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title=settings.store_name, lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+app.mount("/uploads", StaticFiles(directory=UPLOADS_DIR), name="uploads")
 
 
 @app.get("/")
@@ -1557,9 +1566,9 @@ async def create_product(body: ProductIn, x_pin: str | None = Header(default=Non
             INSERT INTO products
             (name, category, ownership_type, supplier_name, brand, sku, barcode,
              purchase_price, sale_price, stock, min_stock, created_at,
-             model, color, size, memory, ram, customs_cleared, customs_price, specs_extra, condition, track_units)
+             model, color, size, memory, ram, customs_cleared, customs_price, specs_extra, condition, track_units, image_url)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 body.name, body.category, body.ownership_type, body.supplier_name.strip(),
@@ -1567,6 +1576,7 @@ async def create_product(body: ProductIn, x_pin: str | None = Header(default=Non
                 body.min_stock, utc_now(),
                 body.model, body.color, body.size, body.memory, body.ram,
                 body.customs_cleared, body.customs_price, body.specs_extra, body.condition, track,
+                body.image_url.strip(),
             ),
         )
         product_id = cur.lastrowid
@@ -1620,10 +1630,69 @@ async def update_product(product_id: int, body: ProductUpdate, x_pin: str | None
 async def delete_product(product_id: int, x_pin: str | None = Header(default=None, alias="X-Pin")):
     check_pin(x_pin, min_role="owner")
     with db() as conn:
+        row = conn.execute("SELECT image_url FROM products WHERE id = ?", (product_id,)).fetchone()
         cur = conn.execute("DELETE FROM products WHERE id = ?", (product_id,))
         if cur.rowcount == 0:
             raise HTTPException(status_code=404, detail="Товар не найден")
+        if row and row["image_url"] and row["image_url"].startswith("/uploads/"):
+            path = UPLOADS_DIR / Path(row["image_url"]).name
+            if path.exists():
+                path.unlink(missing_ok=True)
     return {"ok": True}
+
+
+def _remove_product_images(product_id: int) -> None:
+    for path in UPLOADS_DIR.glob(f"product_{product_id}.*"):
+        path.unlink(missing_ok=True)
+
+
+@app.post("/api/products/{product_id}/image")
+async def upload_product_image(
+    product_id: int,
+    file: UploadFile = File(...),
+    x_pin: str | None = Header(default=None, alias="X-Pin"),
+):
+    check_pin(x_pin, min_role="warehouse")
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Файл не выбран")
+    ext = Path(file.filename).suffix.lower()
+    if ext not in ALLOWED_IMAGE_EXT:
+        raise HTTPException(status_code=400, detail="Допустимы JPG, PNG, WEBP, GIF")
+    data = await file.read()
+    if len(data) > MAX_IMAGE_BYTES:
+        raise HTTPException(status_code=400, detail="Максимальный размер файла — 5 МБ")
+    with db() as conn:
+        if not conn.execute("SELECT id FROM products WHERE id = ?", (product_id,)).fetchone():
+            raise HTTPException(status_code=404, detail="Товар не найден")
+    _remove_product_images(product_id)
+    filename = f"product_{product_id}{ext}"
+    (UPLOADS_DIR / filename).write_bytes(data)
+    image_url = f"/uploads/{filename}"
+    with db() as conn:
+        conn.execute("UPDATE products SET image_url = ? WHERE id = ?", (image_url, product_id))
+        row = conn.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
+        return enrich_product(conn, row)
+
+
+@app.delete("/api/products/{product_id}/image")
+async def delete_product_image(product_id: int, x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin, min_role="warehouse")
+    with db() as conn:
+        if not conn.execute("SELECT id FROM products WHERE id = ?", (product_id,)).fetchone():
+            raise HTTPException(status_code=404, detail="Товар не найден")
+        conn.execute("UPDATE products SET image_url = '' WHERE id = ?", (product_id,))
+    _remove_product_images(product_id)
+    return {"ok": True}
+
+
+@app.get("/api/products/{product_id}")
+async def get_product(product_id: int, x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin)
+    with db() as conn:
+        row = conn.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Товар не найден")
+        return enrich_product(conn, row)
 
 
 # --- Sales ---
