@@ -82,10 +82,44 @@ async function apiUpload(path, file) {
   return res.json();
 }
 
+function el(id) {
+  return document.getElementById(id);
+}
+
+function showModal(id) {
+  const dlg = el(id);
+  if (!dlg) {
+    toast(`Ошибка интерфейса (${id}). Обновите страницу: Ctrl+F5`, "error");
+    return false;
+  }
+  try {
+    if (typeof dlg.showModal === "function") {
+      if (dlg.open) return true;
+      dlg.showModal();
+    } else {
+      dlg.setAttribute("open", "");
+      dlg.style.display = "block";
+    }
+    return true;
+  } catch (err) {
+    console.error("showModal", id, err);
+    toast(err.message || "Не удалось открыть окно", "error");
+    return false;
+  }
+}
+
+function resetProductSaveBtn() {
+  const btn = el("product-save-btn");
+  if (btn) {
+    btn.disabled = false;
+    btn.textContent = "Сохранить";
+  }
+}
+
 function setImageUploadBusy(busy) {
-  const label = document.getElementById("pf-image-upload-label");
-  const text = document.getElementById("pf-upload-text");
-  const hint = document.getElementById("pf-image-hint");
+  const label = el("pf-image-upload-label");
+  const text = el("pf-upload-text");
+  const hint = el("pf-image-hint");
   if (!label) return;
   label.classList.toggle("disabled", busy);
   if (text) text.textContent = busy ? "Загрузка…" : "Загрузить фото";
@@ -338,6 +372,19 @@ function bindNav() {
   });
 }
 
+function bindGlobalActions() {
+  document.body.addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-action]");
+    if (!btn) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const action = btn.dataset.action;
+    if (action === "product-add-own") openProductModal("own");
+    else if (action === "product-add-consignment") openProductModal("consignment");
+    else if (action === "warehouse-add") openWarehouseModal();
+  });
+}
+
 function startClock() {
   const tick = () => {
     document.getElementById("clock").textContent = new Date().toLocaleString("ru-RU", {
@@ -383,6 +430,7 @@ async function init() {
     showApp();
     startClock();
     bindNav();
+    bindGlobalActions();
     bindPos();
     bindSales();
     bindProducts();
@@ -697,12 +745,13 @@ function showReceipt(sale) {
     <div style="text-align:center;color:var(--muted)">${payLabel(sale.payment_method)}</div>`;
   document.getElementById("receipt-modal").showModal();
 }
-document.getElementById("receipt-close").onclick = () => document.getElementById("receipt-modal").close();
-document.getElementById("receipt-print").onclick = () => {
+el("receipt-close")?.addEventListener("click", () => el("receipt-modal")?.close());
+el("receipt-print")?.addEventListener("click", () => {
   const w = window.open("", "_blank");
-  w.document.write(document.getElementById("receipt-content").innerHTML);
+  if (!w) return;
+  w.document.write(el("receipt-content")?.innerHTML || "");
   w.print();
-};
+});
 
 /* ── Sales ── */
 function bindSales() {
@@ -951,13 +1000,20 @@ async function loadWarehouseStock() {
 }
 
 window.openWarehouseModal = (wh = null) => {
-  document.getElementById("warehouse-modal-title").textContent = wh ? "Редактирование склада" : "Новый склад";
-  document.getElementById("wf-id").value = wh ? wh.id : "";
-  document.getElementById("wf-name").value = wh?.name || "";
-  document.getElementById("wf-address").value = wh?.address || "";
-  document.getElementById("wf-notes").value = wh?.notes || "";
-  document.getElementById("wf-default").checked = !!wh?.is_default;
-  document.getElementById("warehouse-modal").showModal();
+  try {
+    if (el("warehouse-modal-title")) {
+      el("warehouse-modal-title").textContent = wh ? "Редактирование склада" : "Новый склад";
+    }
+    if (el("wf-id")) el("wf-id").value = wh ? wh.id : "";
+    if (el("wf-name")) el("wf-name").value = wh?.name || "";
+    if (el("wf-address")) el("wf-address").value = wh?.address || "";
+    if (el("wf-notes")) el("wf-notes").value = wh?.notes || "";
+    if (el("wf-default")) el("wf-default").checked = !!wh?.is_default;
+    showModal("warehouse-modal");
+  } catch (err) {
+    console.error("openWarehouseModal", err);
+    toast(err.message || "Не удалось открыть форму склада", "error");
+  }
 };
 
 window.editWarehouse = (id) => {
@@ -1510,10 +1566,10 @@ function bindProducts() {
   document.getElementById("own-low-stock").addEventListener("change", loadOwnProducts);
   document.getElementById("cons-search").addEventListener("input", debounce(loadConsProducts, 300));
   document.getElementById("cons-supplier-filter").addEventListener("change", loadConsProducts);
-  document.getElementById("product-cancel").onclick = () => {
+  el("product-cancel")?.addEventListener("click", () => {
     clearProductImagePending();
-    document.getElementById("product-modal").close();
-  };
+    el("product-modal")?.close();
+  });
   document.getElementById("product-form").addEventListener("submit", saveProduct);
   document.getElementById("pf-image-file")?.addEventListener("change", (e) => {
     handleProductImageFile(e.target.files?.[0]);
@@ -1573,50 +1629,55 @@ function updateMarginHint() {
 }
 
 function setProductFormMode(isEdit, p = null) {
-  const stockRow = document.getElementById("pf-stock-create-row");
-  const minEditRow = document.getElementById("pf-min-stock-edit-row");
-  const whRow = document.getElementById("pf-warehouse-row");
-  const stockHint = document.getElementById("pf-stock-hint");
-  const stockInput = document.getElementById("pf-stock");
-  const minStockInput = document.getElementById("pf-min-stock");
-  const minStockEdit = document.getElementById("pf-min-stock-edit");
+  const stockRow = el("pf-stock-create-row");
+  const minEditRow = el("pf-min-stock-edit-row");
+  const whRow = el("pf-warehouse-row");
+  const stockHint = el("pf-stock-hint");
+  const stockInput = el("pf-stock");
+  const minStockInput = el("pf-min-stock");
+  const minStockEdit = el("pf-min-stock-edit");
+  if (!stockRow || !minEditRow || !whRow) return;
   if (isEdit) {
     stockRow.classList.add("hidden");
     minEditRow.classList.remove("hidden");
     whRow.classList.add("hidden");
-    stockHint.classList.remove("hidden");
-    stockInput.disabled = true;
-    minStockInput.disabled = true;
-    minStockEdit.disabled = false;
-    document.getElementById("pf-min-stock-edit").value = p?.min_stock ?? 2;
+    stockHint?.classList.remove("hidden");
+    if (stockInput) stockInput.disabled = true;
+    if (minStockInput) minStockInput.disabled = true;
+    if (minStockEdit) minStockEdit.disabled = false;
+    if (minStockEdit) minStockEdit.value = p?.min_stock ?? 2;
     const parts = Object.entries(p?.stock_by_warehouse || {})
       .map(([wid, qty]) => {
         const w = warehouses.find((x) => x.id === +wid);
         return `${w?.name || `Склад #${wid}`}: ${qty}`;
       });
-    stockHint.textContent = parts.length ? `Остатки по складам: ${parts.join(" · ")}` : `Общий остаток: ${p?.stock ?? 0}`;
+    if (stockHint) {
+      stockHint.textContent = parts.length ? `Остатки по складам: ${parts.join(" · ")}` : `Общий остаток: ${p?.stock ?? 0}`;
+    }
   } else {
     stockRow.classList.remove("hidden");
     minEditRow.classList.add("hidden");
     whRow.classList.remove("hidden");
-    stockHint.classList.add("hidden");
-    stockInput.disabled = false;
-    minStockInput.disabled = false;
-    minStockEdit.disabled = true;
-    fillWarehouseSelect(document.getElementById("pf-warehouse"), defaultWarehouseId());
+    stockHint?.classList.add("hidden");
+    if (stockInput) stockInput.disabled = false;
+    if (minStockInput) minStockInput.disabled = false;
+    if (minStockEdit) minStockEdit.disabled = true;
+    fillWarehouseSelect(el("pf-warehouse"), defaultWarehouseId());
   }
 }
 
 function fillProductCardFields(p = {}) {
-  document.getElementById("pf-model").value = p.model || "";
-  document.getElementById("pf-color").value = p.color || "";
-  document.getElementById("pf-size").value = p.size || "";
-  document.getElementById("pf-memory").value = p.memory || "";
-  document.getElementById("pf-ram").value = p.ram || "";
-  document.getElementById("pf-customs-cleared").checked = !!p.customs_cleared;
-  document.getElementById("pf-customs-price").value = p.customs_price ?? 0;
-  document.getElementById("pf-specs-extra").value = p.specs_extra || "";
-  document.getElementById("pf-condition").value = p.condition || "new";
+  const set = (id, val) => { const node = el(id); if (node) node.value = val; };
+  const setCheck = (id, val) => { const node = el(id); if (node) node.checked = val; };
+  set("pf-model", p.model || "");
+  set("pf-color", p.color || "");
+  set("pf-size", p.size || "");
+  set("pf-memory", p.memory || "");
+  set("pf-ram", p.ram || "");
+  setCheck("pf-customs-cleared", !!p.customs_cleared);
+  set("pf-customs-price", p.customs_price ?? 0);
+  set("pf-specs-extra", p.specs_extra || "");
+  set("pf-condition", p.condition || "new");
 }
 
 function productCardBody() {
@@ -1691,24 +1752,31 @@ async function loadConsProducts() {
 }
 
 window.openProductModal = (ownership) => {
-  clearProductImagePending();
-  setImageUploadBusy(false);
-  document.getElementById("product-modal-title").textContent = ownership === "consignment" ? "Товар под реализацию" : "Собственный товар";
-  document.getElementById("pf-id").value = "";
-  document.getElementById("pf-ownership").value = ownership;
-  document.getElementById("pf-supplier-row").classList.toggle("hidden", ownership !== "consignment");
-  ["pf-name","pf-brand","pf-sku","pf-barcode","pf-purchase","pf-sale","pf-stock","pf-supplier"].forEach((id) => {
-    document.getElementById(id).value = id === "pf-stock" ? "0" : "";
-  });
-  fillProductCardFields();
-  document.getElementById("pf-min-stock").value = "2";
-  document.getElementById("pf-category").value = "accessory";
-  setProductFormMode(false);
-  setProductImagePreview({ category: "accessory" });
-  updateMarginHint();
-  document.getElementById("product-save-btn").disabled = false;
-  document.getElementById("product-save-btn").textContent = "Сохранить";
-  document.getElementById("product-modal").showModal();
+  try {
+    clearProductImagePending();
+    setImageUploadBusy(false);
+    const type = ownership === "consignment" ? "consignment" : "own";
+    const title = el("product-modal-title");
+    if (title) title.textContent = type === "consignment" ? "Товар под реализацию" : "Собственный товар";
+    if (el("pf-id")) el("pf-id").value = "";
+    if (el("pf-ownership")) el("pf-ownership").value = type;
+    el("pf-supplier-row")?.classList.toggle("hidden", type !== "consignment");
+    ["pf-name", "pf-brand", "pf-sku", "pf-barcode", "pf-purchase", "pf-sale", "pf-stock", "pf-supplier"].forEach((id) => {
+      const node = el(id);
+      if (node) node.value = id === "pf-stock" ? "0" : "";
+    });
+    fillProductCardFields();
+    if (el("pf-min-stock")) el("pf-min-stock").value = "2";
+    if (el("pf-category")) el("pf-category").value = "accessory";
+    setProductFormMode(false);
+    setProductImagePreview({ category: "accessory" });
+    updateMarginHint();
+    resetProductSaveBtn();
+    if (!showModal("product-modal")) return;
+  } catch (err) {
+    console.error("openProductModal", err);
+    toast(err.message || "Не удалось открыть форму товара", "error");
+  }
 };
 
 window.editProduct = async (id) => {
@@ -1734,10 +1802,10 @@ window.editProduct = async (id) => {
     setProductFormMode(true, p);
     setProductImagePreview(p);
     updateMarginHint();
-    document.getElementById("product-save-btn").disabled = false;
-    document.getElementById("product-save-btn").textContent = "Сохранить";
-    document.getElementById("product-modal").showModal();
+    resetProductSaveBtn();
+    showModal("product-modal");
   } catch (err) {
+    console.error("editProduct", err);
     toast(err.message || "Не удалось открыть товар", "error");
   }
 };
@@ -1757,7 +1825,7 @@ window.deleteProduct = async (id) => {
 async function saveProduct(e) {
   e.preventDefault();
   e.stopPropagation();
-  const saveBtn = document.getElementById("product-save-btn");
+  const saveBtn = el("product-save-btn");
   const id = document.getElementById("pf-id").value;
   const name = document.getElementById("pf-name").value.trim();
   const ownership = document.getElementById("pf-ownership").value;
@@ -1794,8 +1862,10 @@ async function saveProduct(e) {
     if (!body.warehouse_id) { toast("Выберите склад", "error"); return; }
   }
 
-  saveBtn.disabled = true;
-  saveBtn.textContent = "Сохранение…";
+  if (saveBtn) {
+    saveBtn.disabled = true;
+    saveBtn.textContent = "Сохранение…";
+  }
   try {
     let productId = id;
     if (id) {
@@ -1821,8 +1891,7 @@ async function saveProduct(e) {
   } catch (err) {
     toast(err.message || "Ошибка сохранения", "error");
   } finally {
-    saveBtn.disabled = false;
-    saveBtn.textContent = "Сохранить";
+    resetProductSaveBtn();
     setImageUploadBusy(false);
   }
 }
