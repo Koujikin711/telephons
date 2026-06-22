@@ -42,6 +42,12 @@
           <span class="nav-icon">☰</span> Продажи
         </button>
         <div class="nav-group-label">Склад</div>
+        <button class="nav-item" data-page="catalog">
+          <span class="nav-icon">☷</span> Каталог
+        </button>
+        <button class="nav-item" data-page="warehouses">
+          <span class="nav-icon">▦</span> Склады
+        </button>
         <button class="nav-item" data-page="products-own">
           <span class="nav-icon">▣</span> Собственные товары
         </button>
@@ -50,6 +56,9 @@
         </button>
         <button class="nav-item" data-page="suppliers">
           <span class="nav-icon">◎</span> Поставщики
+        </button>
+        <button class="nav-item" data-page="trade-in">
+          <span class="nav-icon">⇋</span> Обмен
         </button>
         <div class="nav-group-label">Финансы</div>
         <button class="nav-item" data-page="reports">
@@ -95,6 +104,7 @@
           <div class="pos-layout">
             <div class="pos-left card">
               <div class="toolbar">
+                <select id="pos-warehouse" class="select" title="Склад отгрузки"></select>
                 <input type="search" id="pos-search" class="input" placeholder="Поиск, штрихкод, бренд…" autofocus>
                 <select id="pos-category" class="select">
                   <option value="">Все категории</option>
@@ -150,6 +160,59 @@
           </table></div></div>
         </section>
 
+        <!-- CATALOG -->
+        <section id="page-catalog" class="page">
+          <div class="toolbar">
+            <input type="search" id="catalog-search" class="input" placeholder="Поиск по названию, модели, цвету…">
+            <select id="catalog-ownership" class="select">
+              <option value="">Все товары</option>
+              <option value="own">Собственные</option>
+              <option value="consignment">Реализация</option>
+            </select>
+            <button class="btn btn-primary" onclick="openProductModal('own')">+ Добавить</button>
+          </div>
+          <div class="card"><div class="table-wrap"><table class="data-table">
+            <thead><tr>
+              <th>Название</th><th>Модель</th><th>Цвет</th><th>Размер</th><th>Память</th><th>RAM</th>
+              <th>Таможня</th><th>Состояние</th><th>Тип</th><th>Цена</th><th>Остаток</th><th></th>
+            </tr></thead>
+            <tbody id="catalog-tbody"></tbody>
+          </table></div></div>
+        </section>
+
+        <!-- WAREHOUSES -->
+        <section id="page-warehouses" class="page">
+          <div class="grid-2 wh-layout">
+            <div class="card">
+              <div class="card-header">
+                <h3>Склады</h3>
+                <button class="btn btn-primary btn-sm" onclick="openWarehouseModal()">+ Добавить</button>
+              </div>
+              <div class="table-wrap"><table class="data-table">
+                <thead><tr><th>Название</th><th>Адрес</th><th></th><th></th></tr></thead>
+                <tbody id="wh-list-tbody"></tbody>
+              </table></div>
+            </div>
+            <div class="card">
+              <div class="card-header">
+                <h3 id="wh-stock-title">Остатки склада</h3>
+                <div class="wh-actions">
+                  <button id="wh-btn-inbound" class="btn btn-secondary btn-sm" disabled>Приход</button>
+                  <button id="wh-btn-outbound" class="btn btn-secondary btn-sm" disabled>Расход</button>
+                  <button id="wh-btn-transfer" class="btn btn-secondary btn-sm" disabled>Перемещение</button>
+                </div>
+              </div>
+              <div class="toolbar wh-toolbar">
+                <button id="wh-show-total" class="btn btn-ghost btn-sm">Сводка по всем складам</button>
+              </div>
+              <div class="table-wrap"><table class="data-table">
+                <thead><tr><th>Товар</th><th>Модель</th><th>Цвет</th><th>Категория</th><th>Кол-во</th></tr></thead>
+                <tbody id="wh-stock-tbody"></tbody>
+              </table></div>
+            </div>
+          </div>
+        </section>
+
         <!-- OWN PRODUCTS -->
         <section id="page-products-own" class="page">
           <div class="toolbar">
@@ -158,7 +221,7 @@
             <button class="btn btn-primary" onclick="openProductModal('own')">+ Добавить</button>
           </div>
           <div class="card"><div class="table-wrap"><table class="data-table">
-            <thead><tr><th>Название</th><th>Категория</th><th>Бренд</th><th>Закупка</th><th>Цена</th><th>Маржа</th><th>Остаток</th><th></th></tr></thead>
+            <thead><tr><th>Название</th><th>Модель</th><th>Цвет</th><th>Память</th><th>Категория</th><th>Бренд</th><th>Закупка</th><th>Цена</th><th>Маржа</th><th>Остаток</th><th></th></tr></thead>
             <tbody id="own-tbody"></tbody>
           </table></div></div>
         </section>
@@ -171,7 +234,7 @@
             <button class="btn btn-primary" onclick="openProductModal('consignment')">+ Добавить</button>
           </div>
           <div class="card"><div class="table-wrap"><table class="data-table">
-            <thead><tr><th>Название</th><th>Поставщик</th><th>Категория</th><th>Доля пост.</th><th>Цена</th><th>Комиссия</th><th>Остаток</th><th></th></tr></thead>
+            <thead><tr><th>Название</th><th>Модель</th><th>Цвет</th><th>Память</th><th>Поставщик</th><th>Категория</th><th>Доля пост.</th><th>Цена</th><th>Комиссия</th><th>Остаток</th><th></th></tr></thead>
             <tbody id="cons-tbody"></tbody>
           </table></div></div>
         </section>
@@ -196,6 +259,63 @@
               </form>
               <h4 class="sub-heading">История выплат</h4>
               <div id="payments-list" class="payments-list"></div>
+            </div>
+          </div>
+        </section>
+
+        <!-- TRADE-IN -->
+        <section id="page-trade-in" class="page">
+          <div class="grid-2">
+            <div class="card">
+              <div class="card-header"><h3>Новый обмен (trade-in)</h3></div>
+              <form id="trade-in-form" class="form-stack card-body">
+                <label>Склад выдачи<select id="ti-given-warehouse" class="select" required></select></label>
+                <label>Выдаваемый товар<select id="ti-given-product" class="select" required><option value="">— выберите склад —</option></select></label>
+                <p id="ti-given-price" class="hint hidden"></p>
+                <hr class="form-divider">
+                <h4 class="sub-heading">Принимаемое устройство</h4>
+                <label>Название<input id="ti-received-name" class="input" required placeholder="iPhone 13 Pro"></label>
+                <div class="form-row">
+                  <label>Бренд<input id="ti-received-brand" class="input"></label>
+                  <label>Модель<input id="ti-received-model" class="input"></label>
+                </div>
+                <div class="form-row">
+                  <label>Цвет<input id="ti-received-color" class="input"></label>
+                  <label>Размер<input id="ti-received-size" class="input"></label>
+                </div>
+                <div class="form-row">
+                  <label>Память<input id="ti-received-memory" class="input" placeholder="128 ГБ"></label>
+                  <label>RAM<input id="ti-received-ram" class="input"></label>
+                </div>
+                <label>Состояние<select id="ti-received-condition" class="select">
+                  <option value="new">Новый</option>
+                  <option value="used" selected>Б/у</option>
+                  <option value="refurbished">Восстановленный</option>
+                </select></label>
+                <label>Доп. характеристики<textarea id="ti-received-specs" class="input textarea" rows="2"></textarea></label>
+                <div class="form-row">
+                  <label>Закупка принятого, ₽<input type="number" id="ti-received-purchase" class="input" min="0" value="0"></label>
+                  <label>Цена продажи принятого, ₽<input type="number" id="ti-received-sale" class="input" min="0" value="0"></label>
+                </div>
+                <label>Склад для принятого<select id="ti-received-warehouse" class="select" required></select></label>
+                <hr class="form-divider">
+                <h4 class="sub-heading">Оплата</h4>
+                <div class="form-row">
+                  <label>Зачёт trade-in, ₽<input type="number" id="ti-received-value" class="input" min="0" value="0" required></label>
+                  <label>Наличные доплата, ₽<input type="number" id="ti-cash" class="input" min="0" value="0"></label>
+                </div>
+                <label>Карта доплата, ₽<input type="number" id="ti-card" class="input" min="0" value="0"></label>
+                <p id="ti-pay-summary" class="hint"></p>
+                <label>Комментарий<input id="ti-notes" class="input"></label>
+                <button type="submit" class="btn btn-primary" id="ti-submit" disabled>Провести обмен</button>
+              </form>
+            </div>
+            <div class="card">
+              <div class="card-header"><h3>История обменов</h3></div>
+              <div class="table-wrap"><table class="data-table">
+                <thead><tr><th>Дата</th><th>Выдано</th><th>Принято</th><th>Зачёт</th><th>Доплата</th><th>Склады</th></tr></thead>
+                <tbody id="ti-history-tbody"></tbody>
+              </table></div>
             </div>
           </div>
         </section>
@@ -265,7 +385,7 @@
     </div>
   </div>
 
-  <dialog id="product-modal" class="modal">
+  <dialog id="product-modal" class="modal modal-lg">
     <form id="product-form" method="dialog">
       <h3 id="product-modal-title">Товар</h3>
       <input type="hidden" id="pf-id">
@@ -279,6 +399,29 @@
         <label>Поставщик<input id="pf-supplier" class="input" placeholder="ООО / ИП"></label>
       </div>
       <div class="form-row">
+        <label>Модель<input id="pf-model" class="input" placeholder="iPhone 15 Pro"></label>
+        <label>Цвет<input id="pf-color" class="input"></label>
+      </div>
+      <div class="form-row">
+        <label>Размер<input id="pf-size" class="input"></label>
+        <label>Память<input id="pf-memory" class="input" placeholder="256 ГБ"></label>
+      </div>
+      <div class="form-row">
+        <label>RAM<input id="pf-ram" class="input"></label>
+        <label>Состояние<select id="pf-condition" class="select">
+          <option value="new">Новый</option>
+          <option value="used">Б/у</option>
+          <option value="refurbished">Восстановленный</option>
+        </select></label>
+      </div>
+      <div class="form-row">
+        <label class="check" style="align-self:end;padding-bottom:.5rem">
+          <input type="checkbox" id="pf-customs-cleared"> Растаможен
+        </label>
+        <label>Таможенная стоимость, ₽<input type="number" id="pf-customs-price" class="input" min="0" value="0"></label>
+      </div>
+      <label>Доп. характеристики<textarea id="pf-specs-extra" class="input textarea" rows="2"></textarea></label>
+      <div class="form-row">
         <label>Артикул<input id="pf-sku" class="input"></label>
         <label>Штрихкод<input id="pf-barcode" class="input"></label>
       </div>
@@ -286,14 +429,51 @@
         <label id="pf-purchase-label">Закупочная цена, ₽<input type="number" id="pf-purchase" class="input" min="0" required></label>
         <label>Цена продажи, ₽<input type="number" id="pf-sale" class="input" min="0" required></label>
       </div>
-      <div class="form-row">
+      <div id="pf-stock-create-row" class="form-row">
         <label>Остаток<input type="number" id="pf-stock" class="input" min="0" required></label>
         <label>Мин. остаток<input type="number" id="pf-min-stock" class="input" min="0" value="2"></label>
       </div>
+      <div id="pf-min-stock-edit-row" class="hidden">
+        <label>Мин. остаток<input type="number" id="pf-min-stock-edit" class="input" min="0" value="2"></label>
+      </div>
+      <div id="pf-warehouse-row" class="form-row">
+        <label>Склад (начальный остаток)<select id="pf-warehouse" class="select"></select></label>
+      </div>
+      <p id="pf-stock-hint" class="hint hidden"></p>
       <p id="pf-margin-hint" class="hint"></p>
       <div class="modal-actions">
         <button type="button" class="btn btn-ghost" id="product-cancel">Отмена</button>
         <button type="submit" class="btn btn-primary">Сохранить</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="warehouse-modal" class="modal">
+    <form id="warehouse-form" method="dialog">
+      <h3 id="warehouse-modal-title">Склад</h3>
+      <input type="hidden" id="wf-id">
+      <label>Название<input id="wf-name" class="input" required></label>
+      <label>Адрес<input id="wf-address" class="input"></label>
+      <label>Примечание<input id="wf-notes" class="input"></label>
+      <label class="check"><input type="checkbox" id="wf-default"> Склад по умолчанию</label>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-ghost" id="warehouse-cancel">Отмена</button>
+        <button type="submit" class="btn btn-primary">Сохранить</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="stock-move-modal" class="modal">
+    <form id="stock-move-form" method="dialog">
+      <h3 id="stock-move-title">Движение</h3>
+      <input type="hidden" id="sm-type">
+      <label id="sm-product-label">Товар<select id="sm-product" class="select" required></select></label>
+      <label id="sm-qty-label">Количество<input type="number" id="sm-qty" class="input" min="1" value="1" required></label>
+      <label id="sm-to-label" class="hidden">Склад назначения<select id="sm-to-warehouse" class="select"></select></label>
+      <label>Комментарий<input id="sm-notes" class="input"></label>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-ghost" id="stock-move-cancel">Отмена</button>
+        <button type="submit" class="btn btn-primary">Провести</button>
       </div>
     </form>
   </dialog>

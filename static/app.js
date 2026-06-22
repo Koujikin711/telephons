@@ -1,31 +1,59 @@
 const PIN_KEY = "telephons_pin";
 let pin = localStorage.getItem(PIN_KEY) || "";
 let products = [];
+let warehouses = [];
 let cart = [];
 let paymentMethod = "cash";
 let authRequired = false;
 let currentPage = "dashboard";
 let reportScope = "all";
 let analyticsScope = "all";
+let selectedWarehouseId = null;
+let whStockViewTotal = false;
+let tiGivenProducts = [];
 
 const fmt = (n) => new Intl.NumberFormat("ru-RU", { style: "currency", currency: "RUB", maximumFractionDigits: 0 }).format(n);
 const pct = (a, b) => b ? Math.round((a / b) * 100) : 0;
 const catLabel = (c) => ({ phone: "Телефон", accessory: "Аксессуар" }[c] || c);
 const ownLabel = (o) => ({ own: "Собственный", consignment: "Реализация" }[o] || o);
-const payLabel = (p) => ({ cash: "Наличные", card: "Карта", transfer: "Перевод" }[p] || p);
+const payLabel = (p) => ({ cash: "Наличные", card: "Карта", transfer: "Перевод", trade_in: "Обмен" }[p] || p);
 const scopeLabel = (s) => ({ all: "Общий", own: "Собственные", consignment: "Реализация" }[s] || s);
+const conditionLabel = (c) => ({ new: "Новый", used: "Б/у", refurbished: "Восстановленный" }[c] || c);
 const esc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+const dash = (s) => s ? esc(s) : "—";
 
 const PAGE_TITLES = {
   dashboard: "Обзор",
   pos: "Касса",
   sales: "Продажи",
+  catalog: "Каталог",
+  warehouses: "Склады",
   "products-own": "Собственные товары",
   "products-consignment": "Товары под реализацию",
   suppliers: "Поставщики",
+  "trade-in": "Обмен",
   reports: "Финансовые отчёты",
   analytics: "Аналитика",
 };
+
+function defaultWarehouseId() {
+  const d = warehouses.find((w) => w.is_default);
+  return d ? d.id : warehouses[0]?.id ?? null;
+}
+
+function whStock(p, whId) {
+  if (!whId || !p.stock_by_warehouse) return p.stock ?? 0;
+  return +(p.stock_by_warehouse[String(whId)] ?? p.stock_by_warehouse[whId] ?? 0);
+}
+
+function fillWarehouseSelect(el, selectedId, { empty = false, emptyLabel = "— выберите —" } = {}) {
+  if (!el) return;
+  const cur = selectedId ?? el.value;
+  el.innerHTML = (empty ? `<option value="">${emptyLabel}</option>` : "") +
+    warehouses.map((w) => `<option value="${w.id}">${esc(w.name)}${w.is_default ? " ★" : ""}</option>`).join("");
+  if (cur) el.value = String(cur);
+  else if (!empty && defaultWarehouseId()) el.value = String(defaultWarehouseId());
+}
 
 async function api(path, opts = {}) {
   const headers = { "Content-Type": "application/json", ...(opts.headers || {}) };
@@ -75,11 +103,14 @@ function navigate(page) {
   document.getElementById("page-title").textContent = PAGE_TITLES[page] || page;
   const loaders = {
     dashboard: loadDashboard,
-    pos: loadProducts,
+    pos: loadPos,
     sales: loadSales,
+    catalog: loadCatalog,
+    warehouses: loadWarehousesPage,
     "products-own": loadOwnProducts,
     "products-consignment": loadConsProducts,
     suppliers: loadSuppliers,
+    "trade-in": loadTradeInPage,
     reports: loadReport,
     analytics: loadAnalytics,
   };
@@ -102,6 +133,15 @@ function startClock() {
   setInterval(tick, 30000);
 }
 
+async function loadWarehouses() {
+  warehouses = await api("/api/warehouses");
+  fillWarehouseSelect(document.getElementById("pos-warehouse"), defaultWarehouseId());
+  fillWarehouseSelect(document.getElementById("pf-warehouse"), defaultWarehouseId());
+  fillWarehouseSelect(document.getElementById("ti-given-warehouse"), defaultWarehouseId());
+  fillWarehouseSelect(document.getElementById("ti-received-warehouse"), defaultWarehouseId());
+  fillWarehouseSelect(document.getElementById("sm-to-warehouse"), null, { empty: true });
+}
+
 async function init() {
   const cfg = await fetch("/api/config").then((r) => r.json());
   authRequired = cfg.auth_required;
@@ -117,9 +157,13 @@ async function init() {
   bindPos();
   bindSales();
   bindProducts();
+  bindCatalog();
+  bindWarehouses();
+  bindTradeIn();
   bindSuppliers();
   bindReports();
   bindAnalytics();
+  await loadWarehouses();
   navigate("dashboard");
 }
 
@@ -172,13 +216,18 @@ async function loadDashboard() {
 
 /* ── POS ── */
 function bindPos() {
-  ["pos-search", "pos-category", "pos-ownership"].forEach((id) => {
-    document.getElementById(id).addEventListener(id === "pos-search" ? "input" : "change", debounce(loadProducts, 250));
+  ["pos-search", "pos-category", "pos-ownership", "pos-warehouse"].forEach((id) => {
+    const el = document.getElementById(id);
+    el?.addEventListener(id === "pos-search" ? "input" : "change", debounce(() => {
+      if (id === "pos-warehouse") cart = [];
+      loadProducts();
+    }, 250));
   });
   document.getElementById("pos-search").addEventListener("keydown", (e) => {
     if (e.key === "Enter") {
       const q = e.target.value.trim();
-      const p = products.find((x) => x.barcode === q && x.stock > 0);
+      const whId = +document.getElementById("pos-warehouse").value;
+      const p = products.find((x) => x.barcode === q && whStock(x, whId) > 0);
       if (p) { addToCart(p.id); e.target.value = ""; loadProducts(); }
     }
   });
@@ -192,29 +241,41 @@ function bindPos() {
   document.getElementById("clear-cart-btn").addEventListener("click", () => { cart = []; renderCart(); });
 }
 
+async function loadPos() {
+  if (!warehouses.length) await loadWarehouses();
+  fillWarehouseSelect(document.getElementById("pos-warehouse"), document.getElementById("pos-warehouse").value || defaultWarehouseId());
+  await loadProducts();
+}
+
 async function loadProducts() {
   const q = document.getElementById("pos-search")?.value || "";
   const cat = document.getElementById("pos-category")?.value || "";
   const own = document.getElementById("pos-ownership")?.value || "";
+  const wh = document.getElementById("pos-warehouse")?.value || "";
   let url = `/api/products?q=${encodeURIComponent(q)}`;
   if (cat) url += `&category=${cat}`;
   if (own) url += `&ownership_type=${own}`;
+  if (wh) url += `&warehouse_id=${wh}`;
   products = await api(url);
   renderPosProducts();
+  renderCart();
 }
 
 function renderPosProducts() {
   const grid = document.getElementById("pos-products");
+  const whId = +document.getElementById("pos-warehouse")?.value;
   if (!products.length) { grid.innerHTML = '<p style="padding:1rem;color:var(--muted)">Товары не найдены</p>'; return; }
   grid.innerHTML = products.map((p) => {
-    const out = p.stock <= 0;
+    const stock = whStock(p, whId);
+    const out = stock <= 0;
     const margin = p.sale_price - p.purchase_price;
+    const meta = [p.model, p.color, p.memory].filter(Boolean).join(" · ");
     return `<div class="product-card ${out ? "out" : ""}" data-id="${p.id}">
       <span class="tag tag-${p.ownership_type === "consignment" ? "cons" : "own"}">${ownLabel(p.ownership_type)}</span>
       <div class="name">${esc(p.name)}</div>
-      <div class="meta">${esc(p.brand)} · ${catLabel(p.category)}</div>
+      <div class="meta">${esc(p.brand)} · ${catLabel(p.category)}${meta ? ` · ${esc(meta)}` : ""}</div>
       <div class="price">${fmt(p.sale_price)}</div>
-      <div class="meta">${out ? "Нет в наличии" : `Ост: ${p.stock} · +${fmt(margin)}`}</div>
+      <div class="meta">${out ? "Нет в наличии" : `Ост: ${stock} · +${fmt(margin)}`}</div>
     </div>`;
   }).join("");
   grid.querySelectorAll(".product-card:not(.out)").forEach((c) => {
@@ -223,16 +284,19 @@ function renderPosProducts() {
 }
 
 function addToCart(id) {
+  const whId = +document.getElementById("pos-warehouse").value;
   const p = products.find((x) => x.id === id);
-  if (!p || p.stock <= 0) return;
+  const stock = whStock(p, whId);
+  if (!p || stock <= 0) return;
   const ex = cart.find((c) => c.product_id === id);
   const qty = ex ? ex.quantity : 0;
-  if (qty >= p.stock) { toast(`Макс. ${p.stock} шт.`, "error"); return; }
+  if (qty >= stock) { toast(`Макс. ${stock} шт.`, "error"); return; }
   if (ex) ex.quantity++; else cart.push({ product_id: id, quantity: 1, product: p });
   renderCart();
 }
 
 function renderCart() {
+  const whId = +document.getElementById("pos-warehouse")?.value;
   const box = document.getElementById("cart-items");
   const empty = document.getElementById("cart-empty");
   const count = cart.reduce((s, c) => s + c.quantity, 0);
@@ -264,23 +328,26 @@ function renderCart() {
 }
 
 window.changeQty = (id, d) => {
+  const whId = +document.getElementById("pos-warehouse").value;
   const item = cart.find((c) => c.product_id === id);
   if (!item) return;
   item.quantity += d;
   const p = products.find((x) => x.id === id);
+  const stock = whStock(p, whId);
   if (item.quantity <= 0) cart = cart.filter((c) => c.product_id !== id);
-  else if (p && item.quantity > p.stock) { item.quantity = p.stock; toast(`Макс. ${p.stock}`, "error"); }
+  else if (p && item.quantity > stock) { item.quantity = stock; toast(`Макс. ${stock}`, "error"); }
   renderCart();
 };
 
 async function checkout() {
   const discount = +document.getElementById("cart-discount").value || 0;
+  const warehouse_id = +document.getElementById("pos-warehouse").value;
   try {
     const sale = await api("/api/sales", {
       method: "POST",
       body: JSON.stringify({
         items: cart.map((c) => ({ product_id: c.product_id, quantity: c.quantity })),
-        discount, payment_method: paymentMethod,
+        discount, payment_method: paymentMethod, warehouse_id,
       }),
     });
     cart = [];
@@ -344,7 +411,6 @@ async function loadSales() {
 
 window.showSale = async (id) => {
   const sale = await api(`/api/sales/${id}`);
-  const types = [...new Set(sale.items.map((i) => i.ownership_type))];
   document.getElementById("sale-detail-content").innerHTML = `
     <h3>Продажа #${sale.id}</h3>
     <p style="color:var(--muted);margin:.5rem 0 1rem">${sale.created_at} · ${payLabel(sale.payment_method)}</p>
@@ -368,6 +434,331 @@ window.voidSale = async (id) => {
     loadSales();
   } catch (e) { toast(e.message, "error"); }
 };
+
+/* ── Catalog ── */
+function bindCatalog() {
+  document.getElementById("catalog-search").addEventListener("input", debounce(loadCatalog, 300));
+  document.getElementById("catalog-ownership").addEventListener("change", loadCatalog);
+}
+
+async function loadCatalog() {
+  const q = document.getElementById("catalog-search").value;
+  const own = document.getElementById("catalog-ownership").value;
+  let url = `/api/products?q=${encodeURIComponent(q)}`;
+  if (own) url += `&ownership_type=${own}`;
+  const items = await api(url);
+  const tb = document.getElementById("catalog-tbody");
+  tb.innerHTML = items.map((p) => `
+    <tr>
+      <td><strong>${esc(p.name)}</strong><br><span style="font-size:.75rem;color:var(--muted)">${esc(p.brand)} · ${esc(p.sku)}</span></td>
+      <td>${dash(p.model)}</td>
+      <td>${dash(p.color)}</td>
+      <td>${dash(p.size)}</td>
+      <td>${dash(p.memory)}</td>
+      <td>${dash(p.ram)}</td>
+      <td>${p.customs_cleared ? `✓ ${fmt(p.customs_price)}` : "—"}</td>
+      <td>${conditionLabel(p.condition)}</td>
+      <td><span class="tag tag-${p.ownership_type === "consignment" ? "cons" : "own"}">${ownLabel(p.ownership_type)}</span></td>
+      <td>${fmt(p.sale_price)}</td>
+      <td class="${p.stock <= p.min_stock ? "stock-low" : ""}">${p.stock}</td>
+      <td><button class="btn btn-ghost btn-sm" onclick="editProduct(${p.id})">Карточка</button></td>
+    </tr>`).join("") || '<tr><td colspan="12" style="text-align:center;color:var(--muted)">Нет товаров</td></tr>';
+}
+
+/* ── Warehouses ── */
+function bindWarehouses() {
+  document.getElementById("warehouse-cancel").onclick = () => document.getElementById("warehouse-modal").close();
+  document.getElementById("warehouse-form").onsubmit = saveWarehouse;
+  document.getElementById("stock-move-cancel").onclick = () => document.getElementById("stock-move-modal").close();
+  document.getElementById("stock-move-form").onsubmit = submitStockMove;
+  document.getElementById("wh-btn-inbound").onclick = () => openStockMoveModal("inbound");
+  document.getElementById("wh-btn-outbound").onclick = () => openStockMoveModal("outbound");
+  document.getElementById("wh-btn-transfer").onclick = () => openStockMoveModal("transfer");
+  document.getElementById("wh-show-total").onclick = () => {
+    whStockViewTotal = !whStockViewTotal;
+    document.getElementById("wh-show-total").textContent = whStockViewTotal
+      ? "Показать выбранный склад" : "Сводка по всем складам";
+    loadWarehouseStock();
+  };
+}
+
+async function loadWarehousesPage() {
+  if (!warehouses.length) await loadWarehouses();
+  renderWarehouseList();
+  if (!selectedWarehouseId) selectedWarehouseId = defaultWarehouseId();
+  await loadWarehouseStock();
+}
+
+function renderWarehouseList() {
+  const tb = document.getElementById("wh-list-tbody");
+  tb.innerHTML = warehouses.map((w) => `
+    <tr class="wh-row${w.id === selectedWarehouseId ? " wh-row-active" : ""}" data-id="${w.id}">
+      <td><strong>${esc(w.name)}</strong>${w.is_default ? ' <span class="tag tag-own" style="font-size:.6rem">по умолч.</span>' : ""}</td>
+      <td>${dash(w.address)}</td>
+      <td><button class="btn btn-ghost btn-sm" onclick="selectWarehouse(${w.id})">Остатки</button></td>
+      <td>
+        <button class="btn btn-ghost btn-sm" onclick="editWarehouse(${w.id})">✎</button>
+        <button class="btn btn-danger" onclick="deleteWarehouse(${w.id})">✕</button>
+      </td>
+    </tr>`).join("") || '<tr><td colspan="4" style="text-align:center;color:var(--muted)">Нет складов</td></tr>';
+}
+
+window.selectWarehouse = (id) => {
+  selectedWarehouseId = id;
+  whStockViewTotal = false;
+  document.getElementById("wh-show-total").textContent = "Сводка по всем складам";
+  renderWarehouseList();
+  loadWarehouseStock();
+};
+
+async function loadWarehouseStock() {
+  const tb = document.getElementById("wh-stock-tbody");
+  const title = document.getElementById("wh-stock-title");
+  const hasWh = selectedWarehouseId && !whStockViewTotal;
+  document.getElementById("wh-btn-inbound").disabled = !hasWh;
+  document.getElementById("wh-btn-outbound").disabled = !hasWh;
+  document.getElementById("wh-btn-transfer").disabled = !hasWh;
+
+  if (whStockViewTotal) {
+    title.textContent = "Сводка по всем складам";
+    const items = await api("/api/stock/total");
+    tb.innerHTML = items.map((p) => `
+      <tr>
+        <td><strong>${esc(p.name)}</strong></td>
+        <td>${dash(p.model)}</td>
+        <td>${dash(p.color)}</td>
+        <td><span class="tag tag-${p.category}">${catLabel(p.category)}</span></td>
+        <td><strong>${p.stock}</strong></td>
+      </tr>`).join("") || '<tr><td colspan="5" style="text-align:center;color:var(--muted)">Нет остатков</td></tr>';
+    return;
+  }
+
+  const wh = warehouses.find((w) => w.id === selectedWarehouseId);
+  title.textContent = wh ? `Остатки: ${wh.name}` : "Остатки склада";
+  if (!selectedWarehouseId) {
+    tb.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--muted)">Выберите склад</td></tr>';
+    return;
+  }
+  const items = await api(`/api/warehouses/${selectedWarehouseId}/stock`);
+  tb.innerHTML = items.map((p) => `
+    <tr>
+      <td><strong>${esc(p.name)}</strong></td>
+      <td>${dash(p.model)}</td>
+      <td>${dash(p.color)}</td>
+      <td><span class="tag tag-${p.category}">${catLabel(p.category)}</span></td>
+      <td><strong>${p.warehouse_quantity}</strong></td>
+    </tr>`).join("") || '<tr><td colspan="5" style="text-align:center;color:var(--muted)">Нет остатков</td></tr>';
+}
+
+window.openWarehouseModal = (wh = null) => {
+  document.getElementById("warehouse-modal-title").textContent = wh ? "Редактирование склада" : "Новый склад";
+  document.getElementById("wf-id").value = wh ? wh.id : "";
+  document.getElementById("wf-name").value = wh?.name || "";
+  document.getElementById("wf-address").value = wh?.address || "";
+  document.getElementById("wf-notes").value = wh?.notes || "";
+  document.getElementById("wf-default").checked = !!wh?.is_default;
+  document.getElementById("warehouse-modal").showModal();
+};
+
+window.editWarehouse = (id) => {
+  const wh = warehouses.find((w) => w.id === id);
+  if (wh) openWarehouseModal(wh);
+};
+
+async function saveWarehouse(e) {
+  e.preventDefault();
+  const id = document.getElementById("wf-id").value;
+  const body = {
+    name: document.getElementById("wf-name").value.trim(),
+    address: document.getElementById("wf-address").value,
+    notes: document.getElementById("wf-notes").value,
+    is_default: document.getElementById("wf-default").checked,
+  };
+  try {
+    if (id) await api(`/api/warehouses/${id}`, { method: "PUT", body: JSON.stringify(body) });
+    else await api("/api/warehouses", { method: "POST", body: JSON.stringify(body) });
+    document.getElementById("warehouse-modal").close();
+    toast("Сохранено");
+    await loadWarehouses();
+    if (currentPage === "warehouses") loadWarehousesPage();
+  } catch (err) { toast(err.message, "error"); }
+}
+
+window.deleteWarehouse = async (id) => {
+  if (!confirm("Удалить склад?")) return;
+  try {
+    await api(`/api/warehouses/${id}`, { method: "DELETE" });
+    toast("Удалено");
+    if (selectedWarehouseId === id) selectedWarehouseId = null;
+    await loadWarehouses();
+    loadWarehousesPage();
+  } catch (e) { toast(e.message, "error"); }
+};
+
+async function openStockMoveModal(type) {
+  if (!selectedWarehouseId) return;
+  document.getElementById("sm-type").value = type;
+  const titles = { inbound: "Приход на склад", outbound: "Расход со склада", transfer: "Перемещение" };
+  document.getElementById("stock-move-title").textContent = titles[type];
+  document.getElementById("sm-to-label").classList.toggle("hidden", type !== "transfer");
+  fillWarehouseSelect(document.getElementById("sm-to-warehouse"), null, { empty: true, emptyLabel: "— склад назначения —" });
+
+  let productOptions;
+  if (type === "inbound") {
+    const all = await api("/api/products");
+    productOptions = all.map((p) => `<option value="${p.id}">${esc(p.name)} (${esc(p.sku)})</option>`).join("");
+  } else {
+    const stock = await api(`/api/warehouses/${selectedWarehouseId}/stock`);
+    productOptions = stock.map((p) =>
+      `<option value="${p.id}">${esc(p.name)} — ост: ${p.warehouse_quantity}</option>`
+    ).join("");
+  }
+  document.getElementById("sm-product").innerHTML = productOptions || '<option value="">Нет товаров</option>';
+  document.getElementById("sm-qty").value = "1";
+  document.getElementById("sm-notes").value = "";
+  document.getElementById("stock-move-modal").showModal();
+}
+
+async function submitStockMove(e) {
+  e.preventDefault();
+  const type = document.getElementById("sm-type").value;
+  const product_id = +document.getElementById("sm-product").value;
+  const quantity = +document.getElementById("sm-qty").value;
+  const notes = document.getElementById("sm-notes").value;
+  if (!product_id) { toast("Выберите товар", "error"); return; }
+  try {
+    if (type === "transfer") {
+      const to = +document.getElementById("sm-to-warehouse").value;
+      if (!to) { toast("Выберите склад назначения", "error"); return; }
+      await api("/api/stock/transfer", {
+        method: "POST",
+        body: JSON.stringify({ product_id, from_warehouse_id: selectedWarehouseId, to_warehouse_id: to, quantity, notes }),
+      });
+    } else {
+      await api(`/api/stock/${type}`, {
+        method: "POST",
+        body: JSON.stringify({ warehouse_id: selectedWarehouseId, product_id, quantity, notes }),
+      });
+    }
+    document.getElementById("stock-move-modal").close();
+    toast("Проведено");
+    loadWarehouseStock();
+    if (currentPage === "pos") loadProducts();
+  } catch (err) { toast(err.message, "error"); }
+}
+
+/* ── Trade-in ── */
+function bindTradeIn() {
+  document.getElementById("ti-given-warehouse").addEventListener("change", loadTiGivenProducts);
+  document.getElementById("ti-given-product").addEventListener("change", updateTiSummary);
+  ["ti-received-value", "ti-cash", "ti-card"].forEach((id) => {
+    document.getElementById(id).addEventListener("input", updateTiSummary);
+  });
+  document.getElementById("trade-in-form").onsubmit = submitTradeIn;
+}
+
+async function loadTradeInPage() {
+  if (!warehouses.length) await loadWarehouses();
+  fillWarehouseSelect(document.getElementById("ti-given-warehouse"), document.getElementById("ti-given-warehouse").value || defaultWarehouseId());
+  fillWarehouseSelect(document.getElementById("ti-received-warehouse"), document.getElementById("ti-received-warehouse").value || defaultWarehouseId());
+  await loadTiGivenProducts();
+  await loadTiHistory();
+}
+
+async function loadTiGivenProducts() {
+  const whId = document.getElementById("ti-given-warehouse").value;
+  const sel = document.getElementById("ti-given-product");
+  if (!whId) {
+    sel.innerHTML = '<option value="">— выберите склад —</option>';
+    tiGivenProducts = [];
+    updateTiSummary();
+    return;
+  }
+  tiGivenProducts = await api(`/api/warehouses/${whId}/stock`);
+  sel.innerHTML = tiGivenProducts.map((p) =>
+    `<option value="${p.id}">${esc(p.name)} — ${fmt(p.sale_price)} (ост: ${p.warehouse_quantity})</option>`
+  ).join("") || '<option value="">Нет товаров на складе</option>';
+  updateTiSummary();
+}
+
+function updateTiSummary() {
+  const productId = +document.getElementById("ti-given-product").value;
+  const p = tiGivenProducts.find((x) => x.id === productId);
+  const priceEl = document.getElementById("ti-given-price");
+  const summaryEl = document.getElementById("ti-pay-summary");
+  const submitBtn = document.getElementById("ti-submit");
+
+  if (!p) {
+    priceEl.classList.add("hidden");
+    summaryEl.textContent = "";
+    submitBtn.disabled = true;
+    return;
+  }
+
+  const total = p.sale_price;
+  const received = +document.getElementById("ti-received-value").value || 0;
+  const cash = +document.getElementById("ti-cash").value || 0;
+  const card = +document.getElementById("ti-card").value || 0;
+  const paid = received + cash + card;
+  const diff = Math.abs(paid - total);
+
+  priceEl.textContent = `Цена выдаваемого товара: ${fmt(total)}`;
+  priceEl.classList.remove("hidden");
+  summaryEl.textContent = `Итого оплата: ${fmt(paid)} из ${fmt(total)}${diff > 0.01 ? ` (разница ${fmt(diff)})` : " ✓"}`;
+  summaryEl.style.color = diff > 0.01 ? "var(--danger)" : "var(--success)";
+  submitBtn.disabled = diff > 0.01 || !productId;
+}
+
+async function submitTradeIn(e) {
+  e.preventDefault();
+  const productId = +document.getElementById("ti-given-product").value;
+  const p = tiGivenProducts.find((x) => x.id === productId);
+  if (!p) return;
+
+  const body = {
+    given_product_id: productId,
+    given_warehouse_id: +document.getElementById("ti-given-warehouse").value,
+    received_name: document.getElementById("ti-received-name").value.trim(),
+    received_brand: document.getElementById("ti-received-brand").value,
+    received_model: document.getElementById("ti-received-model").value,
+    received_color: document.getElementById("ti-received-color").value,
+    received_size: document.getElementById("ti-received-size").value,
+    received_memory: document.getElementById("ti-received-memory").value,
+    received_ram: document.getElementById("ti-received-ram").value,
+    received_specs_extra: document.getElementById("ti-received-specs").value,
+    received_condition: document.getElementById("ti-received-condition").value,
+    received_purchase_price: +document.getElementById("ti-received-purchase").value || 0,
+    received_sale_price: +document.getElementById("ti-received-sale").value || 0,
+    received_value: +document.getElementById("ti-received-value").value || 0,
+    cash_amount: +document.getElementById("ti-cash").value || 0,
+    card_amount: +document.getElementById("ti-card").value || 0,
+    received_warehouse_id: +document.getElementById("ti-received-warehouse").value,
+    notes: document.getElementById("ti-notes").value,
+  };
+
+  try {
+    await api("/api/trade-ins", { method: "POST", body: JSON.stringify(body) });
+    toast("Обмен проведён");
+    document.getElementById("trade-in-form").reset();
+    document.getElementById("ti-received-condition").value = "used";
+    await loadTiGivenProducts();
+    await loadTiHistory();
+  } catch (err) { toast(err.message, "error"); }
+}
+
+async function loadTiHistory() {
+  const data = await api("/api/trade-ins?limit=50");
+  const tb = document.getElementById("ti-history-tbody");
+  tb.innerHTML = data.items.map((t) => `
+    <tr>
+      <td>${t.created_at}</td>
+      <td>${esc(t.given_product_name)}</td>
+      <td>${esc(t.received_name)}<br><span style="font-size:.75rem;color:var(--muted)">${dash(t.received_model)} ${dash(t.received_color)}</span></td>
+      <td>${fmt(t.received_value)}</td>
+      <td>${fmt(t.cash_amount + t.card_amount)}</td>
+      <td style="font-size:.75rem">${esc(t.given_warehouse_name)} → ${esc(t.received_warehouse_name)}</td>
+    </tr>`).join("") || '<tr><td colspan="6" style="text-align:center;color:var(--muted)">Нет обменов</td></tr>';
+}
 
 /* ── Products ── */
 function bindProducts() {
@@ -398,6 +789,58 @@ function updateMarginHint() {
   }
 }
 
+function setProductFormMode(isEdit, p = null) {
+  const stockRow = document.getElementById("pf-stock-create-row");
+  const minEditRow = document.getElementById("pf-min-stock-edit-row");
+  const whRow = document.getElementById("pf-warehouse-row");
+  const stockHint = document.getElementById("pf-stock-hint");
+  if (isEdit) {
+    stockRow.classList.add("hidden");
+    minEditRow.classList.remove("hidden");
+    whRow.classList.add("hidden");
+    stockHint.classList.remove("hidden");
+    document.getElementById("pf-min-stock-edit").value = p?.min_stock ?? 2;
+    const parts = Object.entries(p?.stock_by_warehouse || {})
+      .map(([wid, qty]) => {
+        const w = warehouses.find((x) => x.id === +wid);
+        return `${w?.name || `Склад #${wid}`}: ${qty}`;
+      });
+    stockHint.textContent = parts.length ? `Остатки по складам: ${parts.join(" · ")}` : `Общий остаток: ${p?.stock ?? 0}`;
+  } else {
+    stockRow.classList.remove("hidden");
+    minEditRow.classList.add("hidden");
+    whRow.classList.remove("hidden");
+    stockHint.classList.add("hidden");
+    fillWarehouseSelect(document.getElementById("pf-warehouse"), defaultWarehouseId());
+  }
+}
+
+function fillProductCardFields(p = {}) {
+  document.getElementById("pf-model").value = p.model || "";
+  document.getElementById("pf-color").value = p.color || "";
+  document.getElementById("pf-size").value = p.size || "";
+  document.getElementById("pf-memory").value = p.memory || "";
+  document.getElementById("pf-ram").value = p.ram || "";
+  document.getElementById("pf-customs-cleared").checked = !!p.customs_cleared;
+  document.getElementById("pf-customs-price").value = p.customs_price ?? 0;
+  document.getElementById("pf-specs-extra").value = p.specs_extra || "";
+  document.getElementById("pf-condition").value = p.condition || "new";
+}
+
+function productCardBody() {
+  return {
+    model: document.getElementById("pf-model").value,
+    color: document.getElementById("pf-color").value,
+    size: document.getElementById("pf-size").value,
+    memory: document.getElementById("pf-memory").value,
+    ram: document.getElementById("pf-ram").value,
+    customs_cleared: document.getElementById("pf-customs-cleared").checked ? 1 : 0,
+    customs_price: +document.getElementById("pf-customs-price").value || 0,
+    specs_extra: document.getElementById("pf-specs-extra").value,
+    condition: document.getElementById("pf-condition").value,
+  };
+}
+
 async function loadOwnProducts() {
   const q = document.getElementById("own-search").value;
   const low = document.getElementById("own-low-stock").checked;
@@ -408,6 +851,9 @@ async function loadOwnProducts() {
     const margin = p.sale_price - p.purchase_price;
     return `<tr>
       <td><strong>${esc(p.name)}</strong><br><span style="font-size:.75rem;color:var(--muted)">${esc(p.sku)}</span></td>
+      <td>${dash(p.model)}</td>
+      <td>${dash(p.color)}</td>
+      <td>${dash(p.memory)}</td>
       <td><span class="tag tag-${p.category}">${catLabel(p.category)}</span></td>
       <td>${esc(p.brand)}</td>
       <td>${fmt(p.purchase_price)}</td>
@@ -418,7 +864,7 @@ async function loadOwnProducts() {
         <button class="btn btn-ghost btn-sm" onclick="editProduct(${p.id})">✎</button>
         <button class="btn btn-danger" onclick="deleteProduct(${p.id})">✕</button>
       </td></tr>`;
-  }).join("") || '<tr><td colspan="8" style="text-align:center;color:var(--muted)">Нет товаров</td></tr>';
+  }).join("") || '<tr><td colspan="11" style="text-align:center;color:var(--muted)">Нет товаров</td></tr>';
 }
 
 async function loadConsProducts() {
@@ -436,6 +882,9 @@ async function loadConsProducts() {
     const comm = p.sale_price - p.purchase_price;
     return `<tr>
       <td><strong>${esc(p.name)}</strong></td>
+      <td>${dash(p.model)}</td>
+      <td>${dash(p.color)}</td>
+      <td>${dash(p.memory)}</td>
       <td>${esc(p.supplier_name)}</td>
       <td><span class="tag tag-${p.category}">${catLabel(p.category)}</span></td>
       <td>${fmt(p.purchase_price)}</td>
@@ -446,7 +895,7 @@ async function loadConsProducts() {
         <button class="btn btn-ghost btn-sm" onclick="editProduct(${p.id})">✎</button>
         <button class="btn btn-danger" onclick="deleteProduct(${p.id})">✕</button>
       </td></tr>`;
-  }).join("") || '<tr><td colspan="8" style="text-align:center;color:var(--muted)">Нет товаров</td></tr>';
+  }).join("") || '<tr><td colspan="11" style="text-align:center;color:var(--muted)">Нет товаров</td></tr>';
 }
 
 window.openProductModal = (ownership) => {
@@ -457,8 +906,10 @@ window.openProductModal = (ownership) => {
   ["pf-name","pf-brand","pf-sku","pf-barcode","pf-purchase","pf-sale","pf-stock","pf-supplier"].forEach((id) => {
     document.getElementById(id).value = id === "pf-stock" ? "0" : "";
   });
+  fillProductCardFields();
   document.getElementById("pf-min-stock").value = "2";
   document.getElementById("pf-category").value = "accessory";
+  setProductFormMode(false);
   updateMarginHint();
   document.getElementById("product-modal").showModal();
 };
@@ -467,7 +918,7 @@ window.editProduct = async (id) => {
   const all = await api("/api/products");
   const p = all.find((x) => x.id === id);
   if (!p) return;
-  document.getElementById("product-modal-title").textContent = "Редактирование";
+  document.getElementById("product-modal-title").textContent = "Карточка товара";
   document.getElementById("pf-id").value = p.id;
   document.getElementById("pf-ownership").value = p.ownership_type;
   document.getElementById("pf-supplier-row").classList.toggle("hidden", p.ownership_type !== "consignment");
@@ -479,8 +930,9 @@ window.editProduct = async (id) => {
   document.getElementById("pf-barcode").value = p.barcode;
   document.getElementById("pf-purchase").value = p.purchase_price;
   document.getElementById("pf-sale").value = p.sale_price;
-  document.getElementById("pf-stock").value = p.stock;
   document.getElementById("pf-min-stock").value = p.min_stock;
+  fillProductCardFields(p);
+  setProductFormMode(true, p);
   updateMarginHint();
   document.getElementById("product-modal").showModal();
 };
@@ -492,6 +944,7 @@ window.deleteProduct = async (id) => {
     toast("Удалено");
     loadOwnProducts();
     loadConsProducts();
+    if (currentPage === "catalog") loadCatalog();
     if (currentPage === "pos") loadProducts();
   } catch (e) { toast(e.message, "error"); }
 };
@@ -509,9 +962,15 @@ async function saveProduct(e) {
     barcode: document.getElementById("pf-barcode").value,
     purchase_price: +document.getElementById("pf-purchase").value,
     sale_price: +document.getElementById("pf-sale").value,
-    stock: +document.getElementById("pf-stock").value,
-    min_stock: +document.getElementById("pf-min-stock").value,
+    min_stock: id
+      ? +document.getElementById("pf-min-stock-edit").value
+      : +document.getElementById("pf-min-stock").value,
+    ...productCardBody(),
   };
+  if (!id) {
+    body.stock = +document.getElementById("pf-stock").value;
+    body.warehouse_id = +document.getElementById("pf-warehouse").value;
+  }
   try {
     if (id) await api(`/api/products/${id}`, { method: "PUT", body: JSON.stringify(body) });
     else await api("/api/products", { method: "POST", body: JSON.stringify(body) });
@@ -519,6 +978,7 @@ async function saveProduct(e) {
     toast("Сохранено");
     loadOwnProducts();
     loadConsProducts();
+    if (currentPage === "catalog") loadCatalog();
     if (currentPage === "pos") loadProducts();
   } catch (err) { toast(err.message, "error"); }
 }
