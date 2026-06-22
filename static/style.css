@@ -1341,6 +1341,11 @@ body {
   background: rgba(99, 102, 241, 0.08);
   color: var(--text-secondary);
 }
+.spec-chip-color {
+  background: rgba(139, 92, 246, 0.14);
+  color: #5b21b6;
+  border: 1px solid rgba(139, 92, 246, 0.25);
+}
 .catalog-card-footer {
   display: flex;
   align-items: flex-end;
