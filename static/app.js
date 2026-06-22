@@ -1614,11 +1614,15 @@ function bindProducts() {
 }
 
 function updateMarginHint() {
-  const own = document.getElementById("pf-ownership").value;
-  const purchase = +document.getElementById("pf-purchase").value || 0;
-  const sale = +document.getElementById("pf-sale").value || 0;
-  const hint = document.getElementById("pf-margin-hint");
-  const pl = document.getElementById("pf-purchase-label");
+  const ownEl = el("pf-ownership");
+  const purchaseEl = el("pf-purchase");
+  const saleEl = el("pf-sale");
+  const hint = el("pf-margin-hint");
+  const pl = el("pf-purchase-label");
+  if (!ownEl || !purchaseEl || !saleEl || !hint || !pl) return;
+  const own = ownEl.value;
+  const purchase = +purchaseEl.value || 0;
+  const sale = +saleEl.value || 0;
   if (own === "consignment") {
     pl.textContent = "Сумма поставщику за ед., ₽";
     hint.textContent = `Комиссия магазина: ${fmt(sale - purchase)} (${pct(sale - purchase, sale)}%) · Поставщику: ${fmt(purchase)}`;
@@ -1681,16 +1685,18 @@ function fillProductCardFields(p = {}) {
 }
 
 function productCardBody() {
+  const v = (id) => el(id)?.value ?? "";
+  const n = (id) => +el(id)?.value || 0;
   return {
-    model: document.getElementById("pf-model").value,
-    color: document.getElementById("pf-color").value,
-    size: document.getElementById("pf-size").value,
-    memory: document.getElementById("pf-memory").value,
-    ram: document.getElementById("pf-ram").value,
-    customs_cleared: document.getElementById("pf-customs-cleared").checked ? 1 : 0,
-    customs_price: +document.getElementById("pf-customs-price").value || 0,
-    specs_extra: document.getElementById("pf-specs-extra").value,
-    condition: document.getElementById("pf-condition").value,
+    model: v("pf-model"),
+    color: v("pf-color"),
+    size: v("pf-size"),
+    memory: v("pf-memory"),
+    ram: v("pf-ram"),
+    customs_cleared: el("pf-customs-cleared")?.checked ? 1 : 0,
+    customs_price: n("pf-customs-price"),
+    specs_extra: v("pf-specs-extra"),
+    condition: v("pf-condition") || "new",
   };
 }
 
@@ -1753,6 +1759,10 @@ async function loadConsProducts() {
 
 window.openProductModal = (ownership) => {
   try {
+    if (!el("product-modal")) {
+      toast("Форма товара не загружена. Нажмите Ctrl+Shift+R для обновления страницы.", "error");
+      return;
+    }
     clearProductImagePending();
     setImageUploadBusy(false);
     const type = ownership === "consignment" ? "consignment" : "own";
