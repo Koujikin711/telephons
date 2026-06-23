@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sqlite3
@@ -114,6 +115,18 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     _add_column(conn, "sales", "card_amount", "REAL NOT NULL DEFAULT 0")
     _add_column(conn, "sales", "trade_in_value", "REAL NOT NULL DEFAULT 0")
     _add_column(conn, "sales", "shift_id", "INTEGER")
+    _add_column(conn, "sales", "user_id", "INTEGER")
+    _add_column(conn, "sales", "user_name", "TEXT DEFAULT ''")
+    _add_column(conn, "shifts", "expected_payments_json", "TEXT DEFAULT ''")
+    _add_column(conn, "shifts", "actual_payments_json", "TEXT DEFAULT ''")
+    conn.execute(
+        """
+        UPDATE sales SET
+            user_id = (SELECT user_id FROM shifts WHERE shifts.id = sales.shift_id),
+            user_name = COALESCE((SELECT user_name FROM shifts WHERE shifts.id = sales.shift_id), '')
+        WHERE user_id IS NULL AND shift_id IS NOT NULL
+        """
+    )
     _add_column(conn, "products", "track_units", "INTEGER NOT NULL DEFAULT 0")
     _add_column(conn, "products", "image_url", "TEXT DEFAULT ''")
     conn.execute("UPDATE products SET track_units = 1 WHERE category = 'phone' AND track_units = 0")
@@ -666,6 +679,30 @@ def enrich_sale(conn: sqlite3.Connection, sale: sqlite3.Row) -> dict[str, Any]:
     return data
 
 
+def payments_for_sales(conn: sqlite3.Connection, sale_ids: list[int]) -> dict[int, list[dict[str, Any]]]:
+    if not sale_ids:
+        return {}
+    placeholders = ",".join("?" * len(sale_ids))
+    rows = conn.execute(
+        f"""
+        SELECT sp.sale_id, sp.method_code, sp.amount, pm.name
+        FROM sale_payments sp
+        LEFT JOIN payment_methods pm ON pm.code = sp.method_code
+        WHERE sp.sale_id IN ({placeholders})
+        ORDER BY sp.sale_id, pm.sort_order, sp.method_code
+        """,
+        sale_ids,
+    ).fetchall()
+    out: dict[int, list[dict[str, Any]]] = {}
+    for r in rows:
+        out.setdefault(r["sale_id"], []).append({
+            "method_code": r["method_code"],
+            "name": r["name"] or r["method_code"],
+            "amount": float(r["amount"]),
+        })
+    return out
+
+
 def _report_period_clause(
     period: str, date_from: str, date_to: str, column: str = "s.created_at"
 ) -> tuple[str, list[Any], str]:
@@ -711,23 +748,48 @@ def get_open_shift(conn: sqlite3.Connection) -> sqlite3.Row | None:
     ).fetchone()
 
 
-def shift_sales_totals(conn: sqlite3.Connection, shift_id: int) -> dict[str, float | int]:
+def shift_payment_breakdown(conn: sqlite3.Connection, shift_id: int) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT sp.method_code, pm.name, pm.method_type, COALESCE(SUM(sp.amount), 0) AS amount
+        FROM sale_payments sp
+        JOIN sales s ON s.id = sp.sale_id
+        LEFT JOIN payment_methods pm ON pm.code = sp.method_code
+        WHERE s.shift_id = ? AND s.status = 'completed'
+        GROUP BY sp.method_code
+        ORDER BY pm.sort_order, sp.method_code
+        """,
+        (shift_id,),
+    ).fetchall()
+    return [
+        {
+            "method_code": r["method_code"],
+            "name": r["name"] or r["method_code"],
+            "method_type": r["method_type"] or "card",
+            "amount": float(r["amount"]),
+        }
+        for r in rows
+    ]
+
+
+def shift_sales_totals(conn: sqlite3.Connection, shift_id: int) -> dict[str, Any]:
     row = conn.execute(
         """
-        SELECT COUNT(*) AS cnt,
-               COALESCE(SUM(cash_amount), 0) AS cash,
-               COALESCE(SUM(card_amount), 0) AS card,
-               COALESCE(SUM(total), 0) AS total
+        SELECT COUNT(*) AS cnt, COALESCE(SUM(total), 0) AS total
         FROM sales
         WHERE shift_id = ? AND status = 'completed'
         """,
         (shift_id,),
     ).fetchone()
+    by_payment = shift_payment_breakdown(conn, shift_id)
+    expected_cash = sum(p["amount"] for p in by_payment if p["method_type"] == "cash")
+    expected_card = sum(p["amount"] for p in by_payment if p["method_type"] != "cash")
     return {
         "sales_count": row["cnt"],
-        "expected_cash": float(row["cash"]),
-        "expected_card": float(row["card"]),
+        "expected_cash": expected_cash,
+        "expected_card": expected_card,
         "total_revenue": float(row["total"]),
+        "by_payment": by_payment,
     }
 
 
@@ -1128,9 +1190,15 @@ class ShiftOpenIn(BaseModel):
     opening_cash: float = Field(ge=0, default=0)
 
 
+class ShiftPaymentActual(BaseModel):
+    method_code: str
+    amount: float = Field(ge=0)
+
+
 class ShiftCloseIn(BaseModel):
     actual_cash: float = Field(ge=0)
-    actual_card: float = Field(ge=0)
+    actual_card: float = Field(ge=0, default=0)
+    actual_payments: list[ShiftPaymentActual] = Field(default_factory=list)
     notes: str = ""
 
 
@@ -1473,27 +1541,52 @@ async def close_shift(shift_id: int, body: ShiftCloseIn, x_pin: str | None = Hea
         if not shift:
             raise HTTPException(status_code=404, detail="Открытая смена не найдена")
         totals = shift_sales_totals(conn, shift_id)
-        expected_cash = float(shift["opening_cash"]) + totals["expected_cash"]
+        expected_cash_in_drawer = float(shift["opening_cash"]) + totals["expected_cash"]
+        actual_by_method = {p.method_code: p.amount for p in body.actual_payments}
+        actual_non_cash = sum(
+            actual_by_method.get(p["method_code"], 0.0)
+            for p in totals["by_payment"]
+            if p["method_type"] != "cash"
+        )
+        actual_card = actual_non_cash if body.actual_payments else body.actual_card
+        payment_diffs = []
+        for p in totals["by_payment"]:
+            if p["method_type"] == "cash":
+                continue
+            actual = actual_by_method.get(p["method_code"], 0.0)
+            payment_diffs.append({
+                "method_code": p["method_code"],
+                "name": p["name"],
+                "expected": p["amount"],
+                "actual": actual,
+                "difference": actual - p["amount"],
+            })
         conn.execute(
             """
             UPDATE shifts SET
                 closed_at = ?, status = 'closed',
                 expected_cash = ?, expected_card = ?,
                 actual_cash = ?, actual_card = ?,
-                sales_count = ?, notes = ?
+                sales_count = ?, notes = ?,
+                expected_payments_json = ?, actual_payments_json = ?
             WHERE id = ?
             """,
             (
                 utc_now(), totals["expected_cash"], totals["expected_card"],
-                body.actual_cash, body.actual_card, totals["sales_count"],
-                body.notes, shift_id,
+                body.actual_cash, actual_card, totals["sales_count"],
+                body.notes,
+                json.dumps(totals["by_payment"], ensure_ascii=False),
+                json.dumps([p.model_dump() for p in body.actual_payments], ensure_ascii=False) if body.actual_payments else "",
+                shift_id,
             ),
         )
         row = conn.execute("SELECT * FROM shifts WHERE id = ?", (shift_id,)).fetchone()
     result = row_to_dict(row)
-    result["expected_cash_in_drawer"] = expected_cash
-    result["cash_difference"] = body.actual_cash - expected_cash
-    result["card_difference"] = body.actual_card - totals["expected_card"]
+    result["expected_cash_in_drawer"] = expected_cash_in_drawer
+    result["cash_difference"] = body.actual_cash - expected_cash_in_drawer
+    result["card_difference"] = actual_card - totals["expected_card"]
+    result["payment_differences"] = payment_diffs
+    result["by_payment"] = totals["by_payment"]
     return result
 
 
@@ -2228,11 +2321,12 @@ async def create_sale(body: SaleIn, x_pin: str | None = Header(default=None, ali
             """
             INSERT INTO sales
             (total, discount, payment_method, status, notes, created_at,
-             warehouse_id, cash_amount, card_amount, trade_in_value, shift_id)
-            VALUES (?, ?, ?, 'completed', ?, ?, ?, ?, ?, 0, ?)
+             warehouse_id, cash_amount, card_amount, trade_in_value, shift_id, user_id, user_name)
+            VALUES (?, ?, ?, 'completed', ?, ?, ?, ?, ?, 0, ?, ?, ?)
             """,
             (total, body.discount, payment_method, body.notes, now,
-             warehouse_id, cash_amount, card_amount, shift_id),
+             warehouse_id, cash_amount, card_amount, shift_id,
+             user.get("id") if user else None, user.get("name", "") if user else ""),
         )
         sale_id = cur.lastrowid
         insert_sale_payments(conn, sale_id, pay_payload)
@@ -2279,6 +2373,7 @@ async def list_sales(
     date_from: str = "",
     date_to: str = "",
     ownership_type: str = "",
+    user_id: int | None = None,
     x_pin: str | None = Header(default=None, alias="X-Pin"),
 ):
     check_pin(x_pin)
@@ -2292,6 +2387,9 @@ async def list_sales(
     else:
         sql = "SELECT * FROM sales WHERE status = 'completed'"
         params = []
+    if user_id is not None:
+        sql += " AND s.user_id = ?" if ownership_type else " AND user_id = ?"
+        params.append(user_id)
     df, dp = date_filter_sql(date_from, date_to, "s.created_at" if ownership_type else "created_at")
     sql += df.replace("s.created_at", "created_at") if not ownership_type else df
     params.extend(dp)
@@ -2300,7 +2398,14 @@ async def list_sales(
     with db() as conn:
         sales = conn.execute(sql, params).fetchall()
         total_count = conn.execute("SELECT COUNT(*) FROM sales WHERE status = 'completed'").fetchone()[0]
-    return {"items": [row_to_dict(s) for s in sales], "total": total_count}
+        sale_ids = [s["id"] for s in sales]
+        pay_map = payments_for_sales(conn, sale_ids)
+    items = []
+    for s in sales:
+        d = row_to_dict(s)
+        d["payments"] = pay_map.get(s["id"], [])
+        items.append(d)
+    return {"items": items, "total": total_count}
 
 
 @app.get("/api/sales/{sale_id}")
@@ -2671,6 +2776,77 @@ def _report_balance(conn: sqlite3.Connection) -> dict[str, Any]:
     }
 
 
+def _report_by_cashier(
+    conn: sqlite3.Connection, period: str, date_from: str, date_to: str
+) -> dict[str, Any]:
+    clause, params, label = _report_period_clause(period, date_from, date_to, "s.created_at")
+    rows = conn.execute(
+        f"""
+        SELECT
+            COALESCE(NULLIF(s.user_name, ''), sh.user_name, '—') AS cashier_name,
+            COALESCE(s.user_id, sh.user_id, 0) AS user_id,
+            COUNT(*) AS sales_count,
+            COALESCE(SUM(s.total), 0) AS revenue
+        FROM sales s
+        LEFT JOIN shifts sh ON sh.id = s.shift_id
+        WHERE s.status = 'completed' {clause}
+        GROUP BY COALESCE(s.user_id, sh.user_id),
+                 COALESCE(NULLIF(s.user_name, ''), sh.user_name, '—')
+        ORDER BY revenue DESC
+        """,
+        params,
+    ).fetchall()
+    profit_rows = conn.execute(
+        f"""
+        SELECT COALESCE(s.user_id, sh.user_id, 0) AS user_id,
+               COALESCE(SUM(si.shop_profit), 0) AS profit
+        FROM sales s
+        JOIN sale_items si ON si.sale_id = s.id
+        LEFT JOIN shifts sh ON sh.id = s.shift_id
+        WHERE s.status = 'completed' {clause}
+        GROUP BY COALESCE(s.user_id, sh.user_id, 0)
+        """,
+        params,
+    ).fetchall()
+    profit_map = {r["user_id"]: float(r["profit"]) for r in profit_rows}
+    pay_rows = conn.execute(
+        f"""
+        SELECT
+            COALESCE(s.user_id, sh.user_id, 0) AS user_id,
+            sp.method_code,
+            pm.name,
+            COALESCE(SUM(sp.amount), 0) AS amount
+        FROM sale_payments sp
+        JOIN sales s ON s.id = sp.sale_id
+        LEFT JOIN shifts sh ON sh.id = s.shift_id
+        LEFT JOIN payment_methods pm ON pm.code = sp.method_code
+        WHERE s.status = 'completed' {clause}
+        GROUP BY COALESCE(s.user_id, sh.user_id, 0), sp.method_code
+        ORDER BY amount DESC
+        """,
+        params,
+    ).fetchall()
+    pay_by_user: dict[int, list[dict[str, Any]]] = {}
+    for r in pay_rows:
+        pay_by_user.setdefault(r["user_id"], []).append({
+            "method_code": r["method_code"],
+            "name": r["name"] or r["method_code"],
+            "amount": float(r["amount"]),
+        })
+    cashiers = []
+    for r in rows:
+        uid = r["user_id"] or 0
+        cashiers.append({
+            "user_id": uid,
+            "cashier_name": r["cashier_name"],
+            "sales_count": r["sales_count"],
+            "revenue": float(r["revenue"]),
+            "profit": profit_map.get(uid, 0.0),
+            "by_payment": pay_by_user.get(uid, []),
+        })
+    return {"period_label": label, "cashiers": cashiers}
+
+
 @app.get("/api/reports/opiu")
 async def report_opiu(
     period: str = Query(default="month", pattern="^(day|week|month|quarter|year|all)$"),
@@ -2700,6 +2876,18 @@ async def report_balance(x_pin: str | None = Header(default=None, alias="X-Pin")
     check_pin(x_pin, min_role="owner")
     with db() as conn:
         return _report_balance(conn)
+
+
+@app.get("/api/reports/cashiers")
+async def report_cashiers(
+    period: str = Query(default="month", pattern="^(day|week|month|quarter|year|all)$"),
+    date_from: str = "",
+    date_to: str = "",
+    x_pin: str | None = Header(default=None, alias="X-Pin"),
+):
+    check_pin(x_pin, min_role="owner")
+    with db() as conn:
+        return _report_by_cashier(conn, period, date_from, date_to)
 
 
 def _finance_report(conn: sqlite3.Connection, period: str, scope: str, date_from: str, date_to: str) -> dict[str, Any]:

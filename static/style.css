@@ -1529,3 +1529,10 @@ body {
 .split-pay-row { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; font-size: 0.85rem; }
 .split-pay-row .input { width: 100px; text-align: right; }
 .split-pay-summary { display: flex; justify-content: space-between; font-size: 0.82rem; margin-bottom: 0.5rem; color: var(--muted); }
+
+.receipt .receipt-meta { text-align: center; color: var(--muted); font-size: 0.85rem; }
+.receipt .receipt-line { display: flex; justify-content: space-between; gap: 0.5rem; margin: 0.35rem 0; font-size: 0.9rem; }
+.receipt .receipt-total { text-align: right; font-weight: 700; font-size: 1.1rem; margin: 0.75rem 0; }
+.receipt .receipt-payments { margin-top: 0.5rem; border-top: 1px dashed var(--border); padding-top: 0.5rem; }
+.receipt .receipt-pay-row { display: flex; justify-content: space-between; margin: 0.2rem 0; font-size: 0.9rem; }
+.shift-actual-pay { margin-bottom: 0.5rem; }

@@ -37,6 +37,39 @@ const pct = (a, b) => b ? Math.round((a / b) * 100) : 0;
 const catLabel = (c) => ({ phone: "Телефон", accessory: "Аксессуар" }[c] || c);
 const ownLabel = (o) => ({ own: "Собственный", consignment: "Реализация" }[o] || o);
 const payLabel = (p) => storeConfig.payment_methods?.find((m) => m.code === p)?.name || ({ cash: "Наличные", card: "Карта", transfer: "Перевод", trade_in: "Обмен", split: "Смешанная" }[p] || p);
+
+function formatPaySummary(sale) {
+  if (sale.payments?.length) {
+    if (sale.payments.length === 1) return payLabel(sale.payments[0].method_code);
+    return sale.payments.map((p) => `${payLabel(p.method_code)} ${fmt(p.amount)}`).join(" · ");
+  }
+  return payLabel(sale.payment_method);
+}
+
+function renderReceiptHtml(sale) {
+  const cashier = sale.user_name ? `<div class="receipt-meta">Кассир: ${esc(sale.user_name)}</div>` : "";
+  const payBlock = sale.payments?.length
+    ? `<div class="receipt-payments">${sale.payments.map((p) =>
+        `<div class="receipt-pay-row"><span>${payLabel(p.method_code)}</span><strong>${fmt(p.amount)}</strong></div>`
+      ).join("")}</div>`
+    : `<div class="receipt-payments"><div class="receipt-pay-row"><span>${payLabel(sale.payment_method)}</span><strong>${fmt(sale.total)}</strong></div></div>`;
+  return `
+    <div class="rt">TeleStore ERP</div>
+    <div class="receipt-meta">Чек №${sale.id}</div>
+    <div class="receipt-meta">${sale.created_at}</div>
+    ${cashier}
+    <hr>
+    ${sale.items.map((i) => {
+      const imei = i.units?.length ? ` [${i.units.map((u) => u.imei || u.serial).filter(Boolean).join(", ")}]` : "";
+      return `<div class="receipt-line">${esc(i.product_name)} ×${i.quantity}${esc(imei)}<span>${fmt(i.subtotal)}</span></div>`;
+    }).join("")}
+    <hr>
+    ${sale.discount > 0 ? `<div class="receipt-line">Скидка<span>−${fmt(sale.discount)}</span></div>` : ""}
+    <div class="receipt-total">ИТОГО: ${fmt(sale.total)}</div>
+    ${payBlock}`;
+}
+
+let lastSaleDetail = null;
 const scopeLabel = (s) => ({ all: "Общий", own: "Собственные", consignment: "Реализация", trade_ins: "Обмены" }[s] || s);
 const conditionLabel = (c) => ({ new: "Новый", used: "Б/у", refurbished: "Восстановленный" }[c] || c);
 const esc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -778,27 +811,30 @@ async function checkout() {
   } catch (e) { toast(e.message, "error"); }
 }
 
+function printReceiptHtml(html) {
+  const w = window.open("", "_blank");
+  if (!w) return;
+  w.document.write(`<html><head><title>Чек</title><style>
+    body{font-family:Arial,sans-serif;max-width:320px;margin:24px auto;font-size:14px}
+    .rt{text-align:center;font-weight:700;font-size:1.1rem;margin-bottom:.5rem}
+    .receipt-meta{text-align:center;color:#555;font-size:.85rem}
+    .receipt-line{display:flex;justify-content:space-between;gap:8px;margin:.35rem 0}
+    .receipt-total{text-align:right;font-weight:700;font-size:1.1rem;margin:.75rem 0}
+    .receipt-payments{margin-top:.5rem;border-top:1px dashed #ccc;padding-top:.5rem}
+    .receipt-pay-row{display:flex;justify-content:space-between;margin:.2rem 0}
+    hr{border:none;border-top:1px solid #ddd;margin:.75rem 0}
+  </style></head><body>${html}</body></html>`);
+  w.document.close();
+  w.print();
+}
+
 function showReceipt(sale) {
-  document.getElementById("receipt-content").innerHTML = `
-    <div class="rt">TeleStore ERP</div>
-    <div style="text-align:center">Чек №${sale.id} · ${sale.created_at}</div>
-    <hr>
-    ${sale.items.map((i) => {
-      const imei = i.units?.length ? ` [${i.units.map((u) => u.imei || u.serial).filter(Boolean).join(", ")}]` : "";
-      return `<div>${esc(i.product_name)} ×${i.quantity}${esc(imei)} — ${fmt(i.subtotal)}</div>`;
-    }).join("")}
-    <hr>
-    ${sale.discount > 0 ? `<div>Скидка: −${fmt(sale.discount)}</div>` : ""}
-    <div style="text-align:right;font-weight:700;font-size:1.1rem">ИТОГО: ${fmt(sale.total)}</div>
-    ${(sale.payments?.length ? sale.payments.map((p) => `<div>${payLabel(p.method_code)}: ${fmt(p.amount)}</div>`).join("") : `<div style="text-align:center;color:var(--muted)">${payLabel(sale.payment_method)}</div>`)}`;
+  document.getElementById("receipt-content").innerHTML = renderReceiptHtml(sale);
   document.getElementById("receipt-modal").showModal();
 }
 el("receipt-close")?.addEventListener("click", () => el("receipt-modal")?.close());
 el("receipt-print")?.addEventListener("click", () => {
-  const w = window.open("", "_blank");
-  if (!w) return;
-  w.document.write(el("receipt-content")?.innerHTML || "");
-  w.print();
+  printReceiptHtml(el("receipt-content")?.innerHTML || "");
 });
 
 /* ── Sales ── */
@@ -808,6 +844,9 @@ function bindSales() {
     document.getElementById(id).addEventListener("change", loadSales);
   });
   document.getElementById("sale-detail-close").onclick = () => document.getElementById("sale-detail-modal").close();
+  document.getElementById("sale-detail-print").onclick = () => {
+    if (lastSaleDetail) printReceiptHtml(renderReceiptHtml(lastSaleDetail));
+  };
 }
 
 async function loadSales() {
@@ -825,19 +864,35 @@ async function loadSales() {
     <tr>
       <td><strong>#${s.id}</strong></td>
       <td>${s.created_at}</td>
+      <td>${esc(s.user_name || "—")}</td>
       <td><strong>${fmt(s.total)}</strong></td>
-      <td>${payLabel(s.payment_method)}</td>
-      <td>—</td>
-      <td><button class="btn btn-ghost btn-sm" onclick="showSale(${s.id})">Детали</button></td>
+      <td style="font-size:.85rem">${formatPaySummary(s)}</td>
+      <td>
+        <button class="btn btn-ghost btn-sm" onclick="showSale(${s.id})">Детали</button>
+        <button class="btn btn-ghost btn-sm" onclick="printSaleReceipt(${s.id})">Чек</button>
+      </td>
     </tr>`).join("");
 }
 
+window.printSaleReceipt = async (id) => {
+  try {
+    const sale = await api(`/api/sales/${id}`);
+    printReceiptHtml(renderReceiptHtml(sale));
+  } catch (e) { toast(e.message, "error"); }
+};
+
 window.showSale = async (id) => {
   const sale = await api(`/api/sales/${id}`);
+  lastSaleDetail = sale;
   const isOwner = !currentUser || currentUser.role === "owner";
+  const payHtml = sale.payments?.length
+    ? `<div class="card" style="margin-top:1rem"><div class="card-header"><h3>Оплата</h3></div><div class="card-body">${sale.payments.map((p) =>
+        `<div class="metric-row"><span>${payLabel(p.method_code)}</span><strong>${fmt(p.amount)}</strong></div>`
+      ).join("")}</div></div>`
+    : `<p style="color:var(--muted)">${payLabel(sale.payment_method)} · ${fmt(sale.total)}</p>`;
   document.getElementById("sale-detail-content").innerHTML = `
     <h3>Продажа #${sale.id}</h3>
-    <p style="color:var(--muted);margin:.5rem 0 1rem">${sale.created_at} · ${payLabel(sale.payment_method)}</p>
+    <p style="color:var(--muted);margin:.5rem 0 1rem">${sale.created_at}${sale.user_name ? ` · ${esc(sale.user_name)}` : ""}</p>
     <table class="data-table"><thead><tr><th>Товар</th><th>IMEI</th><th>Тип</th><th>Кол-во</th><th>Сумма</th><th>Прибыль</th></tr></thead>
     <tbody>${sale.items.map((i) => `<tr>
       <td>${esc(i.product_name)}</td>
@@ -846,6 +901,7 @@ window.showSale = async (id) => {
       <td>${i.quantity}</td><td>${fmt(i.subtotal)}</td><td>${fmt(i.shop_profit)}</td>
     </tr>`).join("")}</tbody></table>
     <div style="margin-top:1rem;text-align:right;font-size:1.1rem;font-weight:700">Итого: ${fmt(sale.total)}</div>
+    ${payHtml}
     ${isOwner ? `<button class="btn btn-danger" style="margin-top:1rem" onclick="voidSale(${id})">Отменить продажу</button>` : ""}`;
   document.getElementById("sale-detail-modal").showModal();
 };
@@ -1422,20 +1478,36 @@ function bindShifts() {
   document.getElementById("shift-close-form").onsubmit = async (e) => {
     e.preventDefault();
     if (!openShift) return;
+    const actualPayments = [...document.querySelectorAll("#shift-actual-payments [data-method]")].map((inp) => ({
+      method_code: inp.dataset.method,
+      amount: +inp.value || 0,
+    }));
     try {
       const res = await api(`/api/shifts/${openShift.id}/close`, {
         method: "POST",
         body: JSON.stringify({
           actual_cash: +document.getElementById("shift-actual-cash").value,
-          actual_card: +document.getElementById("shift-actual-card").value,
+          actual_payments: actualPayments,
           notes: document.getElementById("shift-close-notes").value,
         }),
       });
-      toast(`Смена закрыта. Разница нал.: ${fmt(res.cash_difference)}`);
+      let msg = `Смена закрыта. Разница нал.: ${fmt(res.cash_difference)}`;
+      if (res.payment_differences?.length) {
+        const diffs = res.payment_differences.filter((d) => Math.abs(d.difference) > 0.01);
+        if (diffs.length) msg += ` · ${diffs.map((d) => `${d.name}: ${fmt(d.difference)}`).join(", ")}`;
+      }
+      toast(msg);
       await refreshSession();
       loadShiftsPage();
     } catch (err) { toast(err.message, "error"); }
   };
+}
+
+function renderShiftPaymentTable(byPayment, title) {
+  if (!byPayment?.length) return `<p class="hint">${title}: нет продаж</p>`;
+  return `<p class="hint" style="margin-bottom:.5rem">${title}</p>
+    <table class="data-table" style="margin-bottom:.75rem"><thead><tr><th>Способ</th><th>Ожидается</th></tr></thead>
+    <tbody>${byPayment.map((p) => `<tr><td>${esc(p.name)}</td><td>${fmt(p.amount)}</td></tr>`).join("")}</tbody></table>`;
 }
 
 async function loadShiftsPage() {
@@ -1447,17 +1519,26 @@ async function loadShiftsPage() {
   if (openShift) {
     const data = await api("/api/shifts/current");
     const s = data.summary;
+    const sym = storeConfig.currency?.symbol || "смн";
+    document.getElementById("shift-actual-cash-text").textContent = `Наличные в кассе (с разменом), ${sym}`;
     cur.innerHTML = `
       <div class="metric-row"><span>Смена</span><strong>#${openShift.id}</strong></div>
       <div class="metric-row"><span>Кассир</span><strong>${esc(openShift.user_name)}</strong></div>
       <div class="metric-row"><span>Открыта</span><strong>${openShift.opened_at}</strong></div>
       <div class="metric-row"><span>Размен</span><strong>${fmt(openShift.opening_cash)}</strong></div>
       <div class="metric-row"><span>Продаж</span><strong>${s.sales_count}</strong></div>
-      <div class="metric-row"><span>Наличные (продажи)</span><strong>${fmt(s.expected_cash)}</strong></div>
-      <div class="metric-row"><span>Карта</span><strong>${fmt(s.expected_card)}</strong></div>
-      <div class="metric-row"><span>Ожидается в кассе</span><strong>${fmt(+openShift.opening_cash + s.expected_cash)}</strong></div>`;
+      <div class="metric-row"><span>Выручка</span><strong>${fmt(s.total_revenue)}</strong></div>
+      <div class="metric-row"><span>Ожидается в кассе</span><strong>${fmt(+openShift.opening_cash + s.expected_cash)}</strong></div>
+      ${renderShiftPaymentTable(s.by_payment, "Оплаты по способам")}`;
     document.getElementById("shift-summary").innerHTML =
-      `<p class="hint">Ожидаемые наличные: ${fmt(+openShift.opening_cash + s.expected_cash)} · карта: ${fmt(s.expected_card)}</p>`;
+      `<p class="hint">Пересчитайте наличные в ящике и сверьте безнал по каждому способу.</p>`;
+    const nonCash = (s.by_payment || []).filter((p) => p.method_type !== "cash");
+    document.getElementById("shift-actual-payments").innerHTML = nonCash.length
+      ? `<p class="hint" style="margin:.5rem 0">Факт по безналу:</p>${nonCash.map((p) =>
+          `<label>${esc(p.name)} (ожид. ${fmt(p.amount)})<input type="number" class="input shift-actual-pay" data-method="${esc(p.method_code)}" min="0" step="0.01" value="${p.amount}"></label>`
+        ).join("")}`
+      : "";
+    document.getElementById("shift-actual-cash").value = String(+openShift.opening_cash + s.expected_cash);
     closeCard.classList.remove("hidden");
     closeBtn.disabled = false;
   } else {
@@ -2160,7 +2241,7 @@ function bindReports() {
       document.querySelectorAll("#report-type .seg").forEach((x) => x.classList.remove("active"));
       b.classList.add("active");
       reportType = b.dataset.rtype;
-      document.getElementById("report-scope").style.display = reportType === "finance" ? "" : "none";
+      document.getElementById("report-scope").style.display = (reportType === "finance" || reportType === "cashiers") ? "" : "none";
       document.getElementById("report-period").closest(".toolbar") && (document.getElementById("report-period").style.display = reportType === "balance" ? "none" : "");
       loadReport();
     };
@@ -2255,6 +2336,23 @@ async function loadReport() {
       <div class="metric-row"><span>Запасы</span><strong>${fmt(r.assets.inventory)}</strong></div>
       <div class="metric-row"><span>Долг поставщикам</span><strong>${fmt(r.liabilities.supplier_payables)}</strong></div>
       <div class="metric-row"><span>Капитал</span><strong>${fmt(r.equity)}</strong></div>`;
+    return;
+  }
+  if (reportType === "cashiers") {
+    const r = await api(q("/api/reports/cashiers"));
+    combinedEl.classList.add("hidden");
+    document.getElementById("report-content").innerHTML = `
+      <div class="report-header"><h3>Отчёт по кассирам</h3><p>${r.period_label || ""}</p></div>
+      <div class="card"><div class="card-body table-wrap"><table class="data-table">
+        <thead><tr><th>Кассир</th><th>Продаж</th><th>Выручка</th><th>Прибыль</th><th>Оплаты</th></tr></thead>
+        <tbody>${(r.cashiers || []).map((c) => `<tr>
+          <td><strong>${esc(c.cashier_name)}</strong></td>
+          <td>${c.sales_count}</td>
+          <td>${fmt(c.revenue)}</td>
+          <td>${fmt(c.profit)}</td>
+          <td style="font-size:.85rem">${(c.by_payment || []).map((p) => `${esc(p.name)} ${fmt(p.amount)}`).join("<br>") || "—"}</td>
+        </tr>`).join("") || '<tr><td colspan="5" style="text-align:center;color:var(--muted)">Нет данных</td></tr>'}
+        </tbody></table></div></div>`;
     return;
   }
 
