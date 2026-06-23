@@ -272,6 +272,11 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     )
     _add_column(conn, "products", "track_units", "INTEGER NOT NULL DEFAULT 0")
     _add_column(conn, "products", "image_url", "TEXT DEFAULT ''")
+    _add_column(conn, "product_units", "customs_cleared", "INTEGER NOT NULL DEFAULT 0")
+    _add_column(conn, "product_units", "customs_price", "REAL NOT NULL DEFAULT 0")
+    _add_column(conn, "sale_item_units", "customs_cleared", "INTEGER NOT NULL DEFAULT 0")
+    _add_column(conn, "sale_item_units", "customs_price", "REAL NOT NULL DEFAULT 0")
+    _add_column(conn, "sale_item_units", "imei_pending", "INTEGER NOT NULL DEFAULT 0")
     conn.execute("UPDATE products SET track_units = 1 WHERE category = 'phone' AND track_units = 0")
     conn.execute(
         """
