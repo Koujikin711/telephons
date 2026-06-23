@@ -982,6 +982,104 @@ def mark_units_sold(conn: sqlite3.Connection, units: list[sqlite3.Row], sale_id:
         )
 
 
+
+
+def unit_has_imei(unit: sqlite3.Row | dict[str, Any]) -> bool:
+    return bool(str(unit["imei"] if isinstance(unit, dict) else unit["imei"] or "").strip())
+
+
+def enrich_unit_row(row: sqlite3.Row) -> dict[str, Any]:
+    d = row_to_dict(row) or {}
+    d["has_imei"] = unit_has_imei(row)
+    return d
+
+
+def resolve_unit_sale(
+    conn: sqlite3.Connection,
+    unit: sqlite3.Row,
+    checkout: Any | None,
+    product: sqlite3.Row,
+) -> dict[str, Any]:
+    serial = unit["serial"] or ""
+    existing = (unit["imei"] or "").strip()
+    default_customs = float(product["customs_price"] or 0)
+
+    if existing:
+        cleared = int(unit["customs_cleared"] or 0)
+        cprice = float(unit["customs_price"] or 0)
+        if checkout and int(checkout.customs_cleared or 0) and not cleared:
+            cleared = 1
+            cprice = float(checkout.customs_price or 0) or default_customs
+        return {
+            "imei": existing,
+            "serial": serial,
+            "customs_cleared": cleared,
+            "customs_price": cprice,
+            "imei_pending": 0,
+        }
+
+    if not checkout:
+        label = serial or f"#{unit['id']}"
+        raise HTTPException(
+            status_code=400,
+            detail=f"Устройство {label}: укажите IMEI или «активировать позже»",
+        )
+
+    if int(checkout.activate_later or 0):
+        if (checkout.imei or "").strip():
+            raise HTTPException(status_code=400, detail="При «активировать позже» поле IMEI должно быть пустым")
+        cleared = int(checkout.customs_cleared or 0)
+        cprice = float(checkout.customs_price or 0) or (default_customs if cleared else 0.0)
+        return {
+            "imei": "",
+            "serial": serial,
+            "customs_cleared": cleared,
+            "customs_price": cprice,
+            "imei_pending": 1,
+        }
+
+    imei = (checkout.imei or "").strip()
+    if not imei:
+        raise HTTPException(
+            status_code=400,
+            detail="Укажите IMEI или отметьте «активировать позже»",
+        )
+    dup = conn.execute(
+        "SELECT id FROM product_units WHERE imei = ? AND id != ?",
+        (imei, unit["id"]),
+    ).fetchone()
+    if dup:
+        raise HTTPException(status_code=400, detail=f"IMEI «{imei}» уже в системе")
+
+    cleared = int(checkout.customs_cleared or 0)
+    cprice = float(checkout.customs_price or 0) or (default_customs if cleared else 0.0)
+    return {
+        "imei": imei,
+        "serial": serial,
+        "customs_cleared": cleared,
+        "customs_price": cprice,
+        "imei_pending": 0,
+    }
+
+
+def mark_unit_sold_full(
+    conn: sqlite3.Connection,
+    unit_id: int,
+    sale_id: int,
+    imei: str,
+    customs_cleared: int,
+    customs_price: float,
+) -> None:
+    conn.execute(
+        """
+        UPDATE product_units
+        SET status = 'sold', sale_id = ?, imei = ?, customs_cleared = ?, customs_price = ?
+        WHERE id = ?
+        """,
+        (sale_id, imei, customs_cleared, customs_price, unit_id),
+    )
+
+
 def restore_units_for_sale(conn: sqlite3.Connection, sale_id: int) -> None:
     conn.execute(
         "UPDATE product_units SET status = 'in_stock', sale_id = NULL WHERE sale_id = ?",
@@ -1252,10 +1350,19 @@ class ProductUpdate(BaseModel):
     image_url: str | None = None
 
 
+class UnitCheckoutIn(BaseModel):
+    unit_id: int
+    imei: str = ""
+    activate_later: int = Field(default=0, ge=0, le=1)
+    customs_cleared: int = Field(default=0, ge=0, le=1)
+    customs_price: float = Field(default=0, ge=0)
+
+
 class CartItem(BaseModel):
     product_id: int
     quantity: int = Field(ge=1)
     unit_ids: list[int] = Field(default_factory=list)
+    units: list[UnitCheckoutIn] = Field(default_factory=list)
 
 
 class PaymentPart(BaseModel):
@@ -1314,6 +1421,18 @@ class UnitIn(BaseModel):
     imei: str = ""
     serial: str = ""
     notes: str = ""
+
+
+class BulkUnitsIn(BaseModel):
+    product_id: int
+    warehouse_id: int
+    quantity: int = Field(ge=1, le=500)
+    serial_prefix: str = Field(default="", max_length=40)
+    notes: str = ""
+
+
+class CompleteImeiIn(BaseModel):
+    imei: str = Field(min_length=5, max_length=20)
 
 
 class UserIn(BaseModel):
@@ -1782,8 +1901,165 @@ async def list_units(
     sql += " ORDER BY u.created_at DESC LIMIT 500"
     with db() as conn:
         rows = conn.execute(sql, params).fetchall()
+    return [enrich_unit_row(r) for r in rows]
+
+
+
+
+@app.post("/api/units/bulk")
+async def bulk_create_units(body: BulkUnitsIn, x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin, min_role="warehouse")
+    prefix = body.serial_prefix.strip() or f"P{body.product_id}"
+    created = []
+    with db() as conn:
+        product = conn.execute("SELECT * FROM products WHERE id = ?", (body.product_id,)).fetchone()
+        if not product:
+            raise HTTPException(status_code=404, detail="Товар не найден")
+        wh = resolve_warehouse_id(conn, body.warehouse_id)
+        existing = conn.execute(
+            "SELECT COUNT(*) FROM product_units WHERE product_id = ? AND warehouse_id = ?",
+            (body.product_id, wh),
+        ).fetchone()[0]
+        now = utc_now()
+        for i in range(body.quantity):
+            serial = f"{prefix}-{(existing + i + 1):03d}"
+            cur = conn.execute(
+                """
+                INSERT INTO product_units
+                (product_id, warehouse_id, imei, serial, status, notes, created_at)
+                VALUES (?, ?, '', ?, 'in_stock', ?, ?)
+                """,
+                (body.product_id, wh, serial, body.notes or "Партия без IMEI", now),
+            )
+            adjust_warehouse_stock(
+                conn, wh, body.product_id, 1, "inbound",
+                notes=f"Партия: {serial}",
+            )
+            row = conn.execute("SELECT * FROM product_units WHERE id = ?", (cur.lastrowid,)).fetchone()
+            created.append(enrich_unit_row(row))
+        conn.execute("UPDATE products SET track_units = 1 WHERE id = ?", (body.product_id,))
+    return {"created": len(created), "units": created}
+
+
+@app.get("/api/units/pending-imei")
+async def units_pending_imei(
+    warehouse_id: int | None = None,
+    x_pin: str | None = Header(default=None, alias="X-Pin"),
+):
+    check_pin(x_pin, min_role="warehouse")
+    with db() as conn:
+        sql = """
+            SELECT u.*, p.name AS product_name, p.model, p.color AS product_color,
+                   w.name AS warehouse_name
+            FROM product_units u
+            JOIN products p ON p.id = u.product_id
+            JOIN warehouses w ON w.id = u.warehouse_id
+            WHERE u.status = 'in_stock' AND TRIM(COALESCE(u.imei, '')) = ''
+        """
+        params: list[Any] = []
+        if warehouse_id:
+            sql += " AND u.warehouse_id = ?"
+            params.append(warehouse_id)
+        sql += " ORDER BY u.created_at DESC LIMIT 500"
+        rows = conn.execute(sql, params).fetchall()
+    return [enrich_unit_row(r) for r in rows]
+
+
+@app.get("/api/reports/imei-pending")
+async def report_imei_pending(x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin, min_role="owner")
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT siu.*, si.product_name, s.id AS sale_id, s.created_at AS sale_date,
+                   s.user_name AS cashier_name
+            FROM sale_item_units siu
+            JOIN sale_items si ON si.id = siu.sale_item_id
+            JOIN sales s ON s.id = si.sale_id
+            WHERE siu.imei_pending = 1 AND s.status = 'completed'
+            ORDER BY s.created_at DESC
+            LIMIT 200
+            """
+        ).fetchall()
     return [row_to_dict(r) for r in rows]
 
+
+@app.post("/api/units/{unit_id}/complete-imei")
+async def complete_unit_imei(
+    unit_id: int, body: CompleteImeiIn, x_pin: str | None = Header(default=None, alias="X-Pin")
+):
+    check_pin(x_pin, min_role="warehouse")
+    imei = body.imei.strip()
+    with db() as conn:
+        unit = conn.execute("SELECT * FROM product_units WHERE id = ?", (unit_id,)).fetchone()
+        if not unit:
+            raise HTTPException(status_code=404, detail="Устройство не найдено")
+        pending = conn.execute(
+            """
+            SELECT siu.* FROM sale_item_units siu
+            WHERE siu.unit_id = ? AND siu.imei_pending = 1
+            ORDER BY siu.sale_item_id DESC LIMIT 1
+            """,
+            (unit_id,),
+        ).fetchone()
+        if not pending and unit_has_imei(unit):
+            raise HTTPException(status_code=400, detail="IMEI уже указан")
+        dup = conn.execute(
+            "SELECT id FROM product_units WHERE imei = ? AND id != ?", (imei, unit_id)
+        ).fetchone()
+        if dup:
+            raise HTTPException(status_code=400, detail="IMEI уже в системе")
+        conn.execute("UPDATE product_units SET imei = ? WHERE id = ?", (imei, unit_id))
+        if pending:
+            conn.execute(
+                """
+                UPDATE sale_item_units SET imei = ?, imei_pending = 0
+                WHERE sale_item_id = ? AND unit_id = ?
+                """,
+                (imei, pending["sale_item_id"], unit_id),
+            )
+        row = conn.execute("SELECT * FROM product_units WHERE id = ?", (unit_id,)).fetchone()
+    return enrich_unit_row(row)
+
+
+@app.get("/api/reports/customs")
+async def report_customs(
+    period: str = Query(default="month", pattern="^(day|week|month|quarter|year|all)$"),
+    date_from: str = "",
+    date_to: str = "",
+    x_pin: str | None = Header(default=None, alias="X-Pin"),
+):
+    check_pin(x_pin, min_role="owner")
+    clause, params, label = _report_period_clause(period, date_from, date_to, "s.created_at")
+    with db() as conn:
+        total = conn.execute(
+            f"""
+            SELECT COALESCE(SUM(siu.customs_price), 0) AS total, COUNT(*) AS cnt
+            FROM sale_item_units siu
+            JOIN sale_items si ON si.id = siu.sale_item_id
+            JOIN sales s ON s.id = si.sale_id
+            WHERE s.status = 'completed' AND siu.customs_cleared = 1 {clause}
+            """,
+            params,
+        ).fetchone()
+        rows = conn.execute(
+            f"""
+            SELECT s.id AS sale_id, s.created_at, si.product_name, siu.imei, siu.serial,
+                   siu.customs_price, s.user_name
+            FROM sale_item_units siu
+            JOIN sale_items si ON si.id = siu.sale_item_id
+            JOIN sales s ON s.id = si.sale_id
+            WHERE s.status = 'completed' AND siu.customs_cleared = 1 {clause}
+            ORDER BY s.created_at DESC LIMIT 100
+            """,
+            params,
+        ).fetchall()
+    return {
+        "period_label": label,
+        "total_customs": float(total["total"]),
+        "units_count": int(total["cnt"]),
+        "items": [row_to_dict(r) for r in rows],
+    }
 
 @app.post("/api/units")
 async def create_unit(body: UnitIn, x_pin: str | None = Header(default=None, alias="X-Pin")):
@@ -2449,7 +2725,7 @@ async def create_sale(body: SaleIn, x_pin: str | None = Header(default=None, ali
                     )
             calc = calc_line(product, item.quantity)
             subtotal += calc["subtotal"]
-            lines.append({"product": product, "qty": item.quantity, "unit_ids": item.unit_ids, **calc})
+            lines.append({"product": product, "qty": item.quantity, "unit_ids": item.unit_ids, "unit_checkouts": {u.unit_id: u for u in item.units}, **calc})
 
         total = max(0.0, subtotal - body.discount)
         now = utc_now()
@@ -2495,16 +2771,26 @@ async def create_sale(body: SaleIn, x_pin: str | None = Header(default=None, ali
             )
             sale_item_id = cur_item.lastrowid
             if int(p["track_units"] or 0):
+                checkout_map = line.get("unit_checkouts") or {}
                 units = pick_units(conn, p["id"], warehouse_id, line["qty"], line["unit_ids"] or None)
                 for u in units:
+                    co = checkout_map.get(u["id"])
+                    resolved = resolve_unit_sale(conn, u, co, p)
                     conn.execute(
                         """
-                        INSERT INTO sale_item_units (sale_item_id, unit_id, imei, serial)
-                        VALUES (?, ?, ?, ?)
+                        INSERT INTO sale_item_units
+                        (sale_item_id, unit_id, imei, serial, customs_cleared, customs_price, imei_pending)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
                         """,
-                        (sale_item_id, u["id"], u["imei"] or "", u["serial"] or ""),
+                        (
+                            sale_item_id, u["id"], resolved["imei"], resolved["serial"],
+                            resolved["customs_cleared"], resolved["customs_price"], resolved["imei_pending"],
+                        ),
                     )
-                mark_units_sold(conn, units, sale_id)
+                    mark_unit_sold_full(
+                        conn, u["id"], sale_id, resolved["imei"],
+                        resolved["customs_cleared"], resolved["customs_price"],
+                    )
             adjust_warehouse_stock(
                 conn, warehouse_id, p["id"], -line["qty"],
                 "sale", reference_id=sale_id, notes=f"Продажа #{sale_id}",

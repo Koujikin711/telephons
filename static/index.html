@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/style.css?v=12">
+  <link rel="stylesheet" href="/static/style.css?v=13">
 </head>
 <body>
   <div class="mesh-bg" aria-hidden="true"></div>
@@ -424,6 +424,14 @@
 
         <!-- IMEI -->
         <section id="page-imei" class="page">
+          <div class="toolbar">
+            <div class="segmented" id="imei-view-tabs">
+              <button class="seg active" data-imei-view="register">Регистрация</button>
+              <button class="seg" data-imei-view="pending-stock">Без IMEI на складе</button>
+              <button class="seg" data-imei-view="pending-sale">Ждут IMEI после продажи</button>
+            </div>
+          </div>
+          <div id="imei-panel-register">
           <div class="grid-2">
             <div class="card">
               <div class="card-header"><h3>Регистрация IMEI</h3></div>
@@ -449,6 +457,31 @@
               <thead><tr><th>IMEI</th><th>Серийник</th><th>Товар</th><th>Цвет</th><th>Склад</th><th>Статус</th><th></th></tr></thead>
               <tbody id="imei-tbody"></tbody>
             </table></div>
+          </div>
+          </div>
+          <div id="imei-panel-pending-stock" class="hidden card" style="margin-top:1rem">
+            <div class="card-header"><h3>На складе без IMEI</h3></div>
+            <div class="table-wrap card-body"><table class="data-table">
+              <thead><tr><th>Серийник</th><th>Товар</th><th>Цвет</th><th>Склад</th><th>Дата</th></tr></thead>
+              <tbody id="imei-pending-stock-tbody"></tbody>
+            </table></div>
+          </div>
+          <div id="imei-panel-pending-sale" class="hidden card" style="margin-top:1rem">
+            <div class="card-header"><h3>Продано — IMEI не внесён</h3></div>
+            <div class="table-wrap card-body"><table class="data-table">
+              <thead><tr><th>Чек</th><th>Дата</th><th>Товар</th><th>Серийник</th><th>IMEI</th><th></th></tr></thead>
+              <tbody id="imei-pending-sale-tbody"></tbody>
+            </table></div>
+          </div>
+          <div class="card" style="margin-top:1rem" id="imei-bulk-card">
+            <div class="card-header"><h3>Партия без IMEI (массовая приёмка)</h3></div>
+            <form id="bulk-units-form" class="form-stack card-body">
+              <label>Товар<select id="bulk-product" class="select" required></select></label>
+              <label>Склад<select id="bulk-warehouse" class="select" required></select></label>
+              <label>Количество<input type="number" id="bulk-qty" class="input" min="1" max="500" value="10" required></label>
+              <label>Префикс серийника<input id="bulk-prefix" class="input" placeholder="15PRO-BLK"></label>
+              <button type="submit" class="btn btn-primary">Создать партию</button>
+            </form>
           </div>
         </section>
 
@@ -593,6 +626,7 @@
               <button class="seg" data-rtype="dds">ДДС</button>
               <button class="seg" data-rtype="balance">Баланс</button>
               <button class="seg" data-rtype="cashiers">Кассиры</button>
+              <button class="seg" data-rtype="customs">Таможня</button>
             </div>
             <div class="segmented" id="report-scope">
               <button class="seg active" data-scope="all">Общий</button>
@@ -795,7 +829,24 @@
     </div>
   </dialog>
 
-  <dialog id="imei-picker-modal" class="modal">
+  
+  <dialog id="unit-activate-modal" class="modal">
+    <form id="unit-activate-form" method="dialog">
+      <h3 id="unit-activate-title">Активация телефона</h3>
+      <p id="unit-activate-sub" class="hint"></p>
+      <label>IMEI<input id="ua-imei" class="input" inputmode="numeric" placeholder="15 цифр" maxlength="20"></label>
+      <label class="check"><input type="checkbox" id="ua-later"> Активировать позже (IMEI внесёте потом)</label>
+      <hr class="form-divider">
+      <label class="check"><input type="checkbox" id="ua-customs"> Растаможен</label>
+      <label>Сумма таможни<input type="number" id="ua-customs-price" class="input" min="0" step="0.01" value="0"></label>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-ghost" id="unit-activate-cancel">Отмена</button>
+        <button type="submit" class="btn btn-primary">В чек</button>
+      </div>
+    </form>
+  </dialog>
+
+<dialog id="imei-picker-modal" class="modal">
     <h3 id="imei-picker-title">Выбор IMEI</h3>
     <div id="imei-picker-list" class="imei-picker-list"></div>
     <div class="modal-actions">
@@ -824,6 +875,6 @@
   </dialog>
 
   <div id="toast" class="toast"></div>
-  <script src="/static/app.js?v=12"></script>
+  <script src="/static/app.js?v=13"></script>
 </body>
 </html>

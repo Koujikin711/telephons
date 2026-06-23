@@ -60,8 +60,12 @@ function renderReceiptHtml(sale) {
     ${cashier}
     <hr>
     ${sale.items.map((i) => {
-      const imei = i.units?.length ? ` [${i.units.map((u) => u.imei || u.serial).filter(Boolean).join(", ")}]` : "";
-      return `<div class="receipt-line">${esc(i.product_name)} ×${i.quantity}${esc(imei)}<span>${fmt(i.subtotal)}</span></div>`;
+      const unitLines = (i.units || []).map((u) => {
+        const id = u.imei || u.serial || (u.imei_pending ? "IMEI позже" : "—");
+        const cust = u.customs_cleared ? ` · таможня ${fmt(u.customs_price)}` : "";
+        return `<div class="receipt-meta" style="text-align:left;font-size:.8rem">↳ ${esc(id)}${cust}</div>`;
+      }).join("");
+      return `<div class="receipt-line">${esc(i.product_name)} ×${i.quantity}<span>${fmt(i.subtotal)}</span></div>${unitLines}`;
     }).join("")}
     <hr>
     ${sale.discount > 0 ? `<div class="receipt-line">Скидка<span>−${fmt(sale.discount)}</span></div>` : ""}
@@ -686,10 +690,19 @@ async function addToCart(id, preselectedUnitId = null) {
     if (preselectedUnitId) {
       const units = await api(`/api/products/${p.id}/units?warehouse_id=${whId}&status=in_stock`);
       const picked = units.find((u) => u.id === preselectedUnitId);
-      if (!picked) { toast("IMEI недоступен", "error"); return; }
+      if (!picked) { toast("Устройство недоступно", "error"); return; }
       const used = cart.flatMap((c) => c.unit_ids || []);
-      if (used.includes(picked.id)) { toast("Этот IMEI уже в чеке", "error"); return; }
-      cart.push({ product_id: id, quantity: 1, product: p, unit_ids: [picked.id], unit_labels: [picked.imei || picked.serial || `#${picked.id}`] });
+      if (used.includes(picked.id)) { toast("Уже в чеке", "error"); return; }
+      let unitMeta = null;
+      if (!picked.has_imei) {
+        unitMeta = await promptUnitActivation(p, picked);
+        if (!unitMeta) return;
+      }
+      cart.push({
+        product_id: id, quantity: 1, product: p, unit_ids: [picked.id],
+        unit_labels: [picked.imei || picked.serial || `#${picked.id}`],
+        unit_metas: unitMeta ? [{ unit_id: picked.id, ...unitMeta }] : [],
+      });
       renderCart();
       return;
     }
@@ -697,7 +710,7 @@ async function addToCart(id, preselectedUnitId = null) {
       if (!picked) return;
       const used = cart.flatMap((c) => c.unit_ids || []);
       if (used.includes(picked.id)) { toast("Этот IMEI уже в чеке", "error"); return; }
-      cart.push({ product_id: id, quantity: 1, product: p, unit_ids: [picked.id], unit_labels: [picked.label] });
+      cart.push({ product_id: id, quantity: 1, product: p, unit_ids: [picked.id], unit_labels: [picked.label], unit_metas: picked.unitMeta ? [{ unit_id: picked.id, ...picked.unitMeta }] : [] });
       renderCart();
     });
     return;
@@ -709,26 +722,91 @@ async function addToCart(id, preselectedUnitId = null) {
   renderCart();
 }
 
+let unitActivateResolve = null;
+
+async function promptUnitActivation(product, unit) {
+  const defaultCustoms = product.customs_price || 0;
+  return new Promise((resolve) => {
+    unitActivateResolve = resolve;
+    document.getElementById("unit-activate-title").textContent = product.name;
+    document.getElementById("unit-activate-sub").textContent =
+      `Серийник: ${unit.serial || "#" + unit.id}${unit.has_imei ? " · IMEI уже есть" : " · IMEI не указан"}`;
+    const imeiInp = document.getElementById("ua-imei");
+    const laterCb = document.getElementById("ua-later");
+    const customsCb = document.getElementById("ua-customs");
+    const customsPrice = document.getElementById("ua-customs-price");
+    imeiInp.value = unit.imei || "";
+    imeiInp.disabled = !!unit.has_imei;
+    laterCb.checked = false;
+    laterCb.disabled = !!unit.has_imei;
+    customsCb.checked = !!product.customs_cleared;
+    customsPrice.value = defaultCustoms || 0;
+    laterCb.onchange = () => {
+      imeiInp.disabled = laterCb.checked || !!unit.has_imei;
+      if (laterCb.checked) imeiInp.value = "";
+    };
+    document.getElementById("unit-activate-modal").showModal();
+  });
+}
+
+document.getElementById("unit-activate-cancel")?.addEventListener("click", () => {
+  document.getElementById("unit-activate-modal").close();
+  unitActivateResolve?.(null);
+  unitActivateResolve = null;
+});
+
+document.getElementById("unit-activate-form")?.addEventListener("submit", (e) => {
+  e.preventDefault();
+  const later = document.getElementById("ua-later").checked;
+  const imei = document.getElementById("ua-imei").value.trim();
+  if (!later && !imei) { toast("Введите IMEI или отметьте «активировать позже»", "error"); return; }
+  const meta = {
+    imei: later ? "" : imei,
+    activate_later: later ? 1 : 0,
+    customs_cleared: document.getElementById("ua-customs").checked ? 1 : 0,
+    customs_price: +document.getElementById("ua-customs-price").value || 0,
+  };
+  document.getElementById("unit-activate-modal").close();
+  unitActivateResolve?.(meta);
+  unitActivateResolve = null;
+});
+
 async function pickImeiForProduct(product, whId) {
   const units = await api(`/api/products/${product.id}/units?warehouse_id=${whId}&status=in_stock`);
   const used = new Set(cart.flatMap((c) => c.unit_ids || []));
   const available = units.filter((u) => !used.has(u.id));
-  if (!available.length) { toast("Нет доступных IMEI", "error"); return null; }
-  const toPick = (u) => ({ id: u.id, label: u.imei || u.serial || `#${u.id}` });
-  if (available.length === 1) return toPick(available[0]);
+  if (!available.length) { toast("Нет доступных устройств", "error"); return null; }
+  const pickOne = async (u) => {
+    const label = u.imei || u.serial || `#${u.id}`;
+    let unitMeta = null;
+    if (!u.has_imei && !u.imei) {
+      unitMeta = await promptUnitActivation(product, u);
+      if (!unitMeta) return null;
+    } else if (!u.customs_cleared && product.category === "phone") {
+      unitMeta = await promptUnitActivation(product, u);
+      if (!unitMeta) return null;
+    }
+    return { id: u.id, label, unitMeta };
+  };
+  if (available.length === 1) return pickOne(available[0]);
   return new Promise((resolve) => {
-    imeiPickerResolve = resolve;
-    document.getElementById("imei-picker-title").textContent = `IMEI: ${product.name}`;
+    imeiPickerResolve = async (picked) => {
+      if (!picked) { resolve(null); return; }
+      const u = available.find((x) => x.id === picked.id);
+      resolve(u ? pickOne(u) : null);
+    };
+    document.getElementById("imei-picker-title").textContent = `Устройство: ${product.name}`;
     document.getElementById("imei-picker-list").innerHTML = available.map((u) =>
-      `<button type="button" class="imei-pick-btn" data-id="${u.id}" data-label="${esc(u.imei || u.serial || `#${u.id}`)}">
+      `<button type="button" class="imei-pick-btn" data-id="${u.id}">
         <strong>${esc(u.imei || u.serial || `#${u.id}`)}</strong>
+        ${!u.has_imei ? '<span class="tag unit-no-imei-tag">без IMEI</span>' : ""}
         ${u.serial && u.imei ? `<span>${esc(u.serial)}</span>` : ""}
       </button>`
     ).join("");
     document.getElementById("imei-picker-list").querySelectorAll(".imei-pick-btn").forEach((btn) => {
       btn.onclick = () => {
         document.getElementById("imei-picker-modal").close();
-        resolve({ id: +btn.dataset.id, label: btn.dataset.label });
+        imeiPickerResolve({ id: +btn.dataset.id });
         imeiPickerResolve = null;
       };
     });
@@ -767,7 +845,12 @@ function renderCart() {
     const line = c.product.sale_price * c.quantity;
     sub += line;
     const imeiLabel = c.unit_labels?.length
-      ? `<div class="ci-imei">${c.unit_labels.map((l) => esc(l)).join(", ")}</div>`
+      ? `<div class="ci-imei">${c.unit_labels.map((l, i) => {
+          const m = c.unit_metas?.[i];
+          const pending = m?.activate_later ? ' <span class="tag unit-no-imei-tag">IMEI позже</span>' : "";
+          const cust = m?.customs_cleared ? ` · таможня ${fmt(m.customs_price)}` : "";
+          return esc(l) + pending + cust;
+        }).join("<br>")}</div>`
       : "";
     const qtyCtrl = c.unit_ids?.length
       ? `<span class="ci-qty-static">${c.quantity}</span>`
@@ -832,6 +915,13 @@ async function checkout() {
           product_id: c.product_id,
           quantity: c.quantity,
           unit_ids: c.unit_ids || [],
+          units: (c.unit_metas || []).map((m) => ({
+            unit_id: m.unit_id,
+            imei: m.imei || "",
+            activate_later: m.activate_later || 0,
+            customs_cleared: m.customs_cleared || 0,
+            customs_price: m.customs_price || 0,
+          })),
         })),
         discount, payments, warehouse_id,
       }),
@@ -925,17 +1015,22 @@ window.showSale = async (id) => {
         `<div class="metric-row"><span>${payLabel(p.method_code)}</span><strong>${fmt(p.amount)}</strong></div>`
       ).join("")}</div></div>`
     : `<p style="color:var(--muted)">${payLabel(sale.payment_method)} · ${fmt(sale.total)}</p>`;
+  const unitsExtra = sale.items.flatMap((i) => (i.units || []).filter((u) => u.customs_cleared || u.imei_pending)).length
+    ? `<div class="card" style="margin-top:1rem"><div class="card-header"><h3>Устройства</h3></div><div class="card-body">${sale.items.flatMap((i) => (i.units || []).map((u) =>
+        `<div class="metric-row"><span>${esc(u.imei || u.serial || "—")}</span><span>${u.customs_cleared ? `Таможня ${fmt(u.customs_price)}` : ""}${u.imei_pending ? " · IMEI позже" : ""}</span></div>`
+      )).join("")}</div></div>` : "";
   document.getElementById("sale-detail-content").innerHTML = `
     <h3>Продажа #${sale.id}</h3>
     <p style="color:var(--muted);margin:.5rem 0 1rem">${sale.created_at}${sale.user_name ? ` · ${esc(sale.user_name)}` : ""}</p>
     <table class="data-table"><thead><tr><th>Товар</th><th>IMEI</th><th>Тип</th><th>Кол-во</th><th>Сумма</th><th>Прибыль</th></tr></thead>
     <tbody>${sale.items.map((i) => `<tr>
       <td>${esc(i.product_name)}</td>
-      <td style="font-size:.8rem">${i.units?.length ? i.units.map((u) => esc(u.imei || u.serial || "—")).join("<br>") : "—"}</td>
+      <td style="font-size:.8rem">${i.units?.length ? i.units.map((u) => esc(u.imei || u.serial || "—") + (u.imei_pending ? " ⏳" : "")).join("<br>") : "—"}</td>
       <td><span class="tag tag-${i.ownership_type === "consignment" ? "cons" : "own"}">${ownLabel(i.ownership_type)}</span></td>
       <td>${i.quantity}</td><td>${fmt(i.subtotal)}</td><td>${fmt(i.shop_profit)}</td>
     </tr>`).join("")}</tbody></table>
     <div style="margin-top:1rem;text-align:right;font-size:1.1rem;font-weight:700">Итого: ${fmt(sale.total)}</div>
+    ${unitsExtra}
     ${payHtml}
     ${isOwner ? `<button class="btn btn-danger" style="margin-top:1rem" onclick="voidSale(${id})">Отменить продажу</button>` : ""}`;
   document.getElementById("sale-detail-modal").showModal();
@@ -1148,7 +1243,7 @@ async function loadWarehouseStock() {
   tb.innerHTML = items.map((p) => {
     const unitsHtml = p.units?.length
       ? `<details class="units-details"><summary>${p.units.length} шт.</summary><div class="units-list">${p.units.map((u) =>
-          `<div class="unit-chip">${u.imei ? esc(u.imei) : esc(u.serial || "—")}${u.product_color || p.color ? ` · ${esc(u.product_color || p.color)}` : ""}</div>`
+          `<div class="unit-chip ${u.has_imei === false ? "unit-no-imei" : ""}">${u.imei ? esc(u.imei) : esc(u.serial || "—")}${u.product_color || p.color ? ` · ${esc(u.product_color || p.color)}` : ""}</div>`
         ).join("")}</div></details>`
       : "—";
     return `<tr>
@@ -1645,6 +1740,71 @@ function bindImei() {
   document.getElementById("imei-filter-wh").addEventListener("change", loadImeiList);
 }
 
+
+function bindImeiExtras() {
+  document.querySelectorAll("#imei-view-tabs .seg").forEach((b) => {
+    b.onclick = () => {
+      document.querySelectorAll("#imei-view-tabs .seg").forEach((x) => x.classList.remove("active"));
+      b.classList.add("active");
+      const v = b.dataset.imeiView;
+      document.getElementById("imei-panel-register").classList.toggle("hidden", v !== "register");
+      document.getElementById("imei-bulk-card")?.classList.toggle("hidden", v !== "register");
+      document.getElementById("imei-panel-pending-stock").classList.toggle("hidden", v !== "pending-stock");
+      document.getElementById("imei-panel-pending-sale").classList.toggle("hidden", v !== "pending-sale");
+      if (v === "pending-stock") loadImeiPendingStock();
+      if (v === "pending-sale") loadImeiPendingSale();
+    };
+  });
+  document.getElementById("bulk-units-form")?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    try {
+      const res = await api("/api/units/bulk", {
+        method: "POST",
+        body: JSON.stringify({
+          product_id: +document.getElementById("bulk-product").value,
+          warehouse_id: +document.getElementById("bulk-warehouse").value,
+          quantity: +document.getElementById("bulk-qty").value,
+          serial_prefix: document.getElementById("bulk-prefix").value.trim(),
+        }),
+      });
+      toast(`Создано ${res.created} устройств`);
+      loadImeiList();
+      loadImeiPendingStock();
+    } catch (err) { toast(err.message, "error"); }
+  });
+}
+
+async function loadImeiPendingStock() {
+  const wh = document.getElementById("imei-filter-wh")?.value || "";
+  let url = "/api/units/pending-imei";
+  if (wh) url += `?warehouse_id=${wh}`;
+  const rows = await api(url);
+  document.getElementById("imei-pending-stock-tbody").innerHTML = rows.map((u) => `
+    <tr><td><strong>${esc(u.serial || "—")}</strong></td><td>${esc(u.product_name)}</td><td>${dash(u.product_color)}</td>
+    <td>${esc(u.warehouse_name)}</td><td>${u.created_at}</td></tr>`).join("")
+    || '<tr><td colspan="5" style="text-align:center;color:var(--muted)">Все устройства с IMEI</td></tr>';
+}
+
+async function loadImeiPendingSale() {
+  const rows = await api("/api/reports/imei-pending");
+  document.getElementById("imei-pending-sale-tbody").innerHTML = rows.map((r) => `
+    <tr><td>#${r.sale_id}</td><td>${r.sale_date}</td><td>${esc(r.product_name)}</td><td>${esc(r.serial || "—")}</td>
+    <td><input class="input input-sm" id="complete-imei-${r.unit_id}" placeholder="IMEI" style="max-width:140px"></td>
+    <td><button class="btn btn-ghost btn-sm" onclick="completePendingImei(${r.unit_id})">Сохранить</button></td></tr>`).join("")
+    || '<tr><td colspan="6" style="text-align:center;color:var(--muted)">Нет ожидающих</td></tr>';
+}
+
+window.completePendingImei = async (unitId) => {
+  const inp = document.getElementById(`complete-imei-${unitId}`);
+  const imei = inp?.value?.trim();
+  if (!imei) { toast("Введите IMEI", "error"); return; }
+  try {
+    await api(`/api/units/${unitId}/complete-imei`, { method: "POST", body: JSON.stringify({ imei }) });
+    toast("IMEI сохранён");
+    loadImeiPendingSale();
+  } catch (e) { toast(e.message, "error"); }
+};
+
 async function loadImeiPage() {
   if (!warehouses.length) await loadWarehouses();
   fillWarehouseSelect(document.getElementById("imei-warehouse"), defaultWarehouseId());
@@ -1655,6 +1815,13 @@ async function loadImeiPage() {
   document.getElementById("imei-product").innerHTML = phones.map((p) =>
     `<option value="${p.id}">${esc(p.name)}${p.track_units ? " ★" : ""}</option>`
   ).join("");
+  fillWarehouseSelect(document.getElementById("bulk-warehouse"), defaultWarehouseId());
+  const bulkProd = document.getElementById("bulk-product");
+  if (bulkProd) {
+    const prods = await api("/api/products?category=phone");
+    bulkProd.innerHTML = prods.map((p) => `<option value="${p.id}">${esc(p.name)} ${p.color ? "· " + esc(p.color) : ""}</option>`).join("");
+  }
+  bindImeiExtras();
   await loadImeiList();
 }
 
@@ -1667,7 +1834,7 @@ async function loadImeiList() {
   const statusLabel = (s) => ({ in_stock: "На складе", sold: "Продан" }[s] || s);
   document.getElementById("imei-tbody").innerHTML = units.map((u) => `
     <tr>
-      <td><strong>${dash(u.imei)}</strong></td>
+      <td><strong>${dash(u.imei)}</strong>${!u.has_imei ? ' <span class="tag unit-no-imei-tag">нет IMEI</span>' : ""}</td>
       <td>${dash(u.serial)}</td>
       <td>${esc(u.product_name)}</td>
       <td>${dash(u.product_color)}</td>
@@ -2379,6 +2546,20 @@ async function loadReport() {
       <div class="metric-row"><span>Запасы</span><strong>${fmt(r.assets.inventory)}</strong></div>
       <div class="metric-row"><span>Долг поставщикам</span><strong>${fmt(r.liabilities.supplier_payables)}</strong></div>
       <div class="metric-row"><span>Капитал</span><strong>${fmt(r.equity)}</strong></div>`;
+    return;
+  }
+  if (reportType === "customs") {
+    const r = await api(q("/api/reports/customs"));
+    combinedEl.classList.add("hidden");
+    document.getElementById("report-content").innerHTML = `
+      <div class="report-header"><h3>Растаможка</h3><p>${r.period_label || ""}</p></div>
+      <div class="report-kpi">
+        <div class="report-box"><div class="lbl">Сумма таможни</div><div class="val">${fmt(r.total_customs)}</div></div>
+        <div class="report-box"><div class="lbl">Устройств</div><div class="val">${r.units_count}</div></div>
+      </div>
+      <div class="card"><div class="card-body table-wrap"><table class="data-table"><thead><tr><th>Чек</th><th>Дата</th><th>Товар</th><th>IMEI</th><th>Сумма</th></tr></thead><tbody>
+        ${(r.items||[]).map(x=>`<tr><td>#${x.sale_id}</td><td>${x.created_at}</td><td>${esc(x.product_name)}</td><td>${esc(x.imei||x.serial||"—")}</td><td>${fmt(x.customs_price)}</td></tr>`).join("")||"<tr><td colspan=5>Нет данных</td></tr>"}
+      </tbody></table></div></div>`;
     return;
   }
   if (reportType === "cashiers") {
