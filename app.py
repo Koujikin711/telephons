@@ -30,23 +30,24 @@ MAX_IMAGE_BYTES = 5 * 1024 * 1024
 OwnershipType = Literal["own", "consignment"]
 ReportScope = Literal["all", "own", "consignment"]
 ProductCondition = Literal["new", "used", "refurbished"]
-UserRole = Literal["owner", "warehouse", "cashier"]
+UserRole = Literal["owner", "warehouse", "cashier", "accessories"]
 DEFAULT_WAREHOUSE_NAME = "Основной склад"
 
 ROLE_PAGES: dict[str, list[str]] = {
     "owner": [
         "dashboard", "pos", "sales", "catalog", "warehouses", "products-own",
         "products-consignment", "suppliers", "trade-in", "reports", "analytics",
-        "shifts", "users", "imei",
+        "shifts", "users", "imei", "settings",
     ],
     "warehouse": [
         "dashboard", "catalog", "warehouses", "products-own", "products-consignment",
         "trade-in", "imei",
     ],
     "cashier": ["dashboard", "pos", "sales", "trade-in", "shifts"],
+    "accessories": ["dashboard", "pos", "sales", "catalog", "products-own"],
 }
 
-ROLE_LEVEL = {"cashier": 1, "warehouse": 2, "owner": 3}
+ROLE_LEVEL = {"cashier": 1, "accessories": 2, "warehouse": 2, "owner": 3}
 
 
 class Settings(BaseSettings):
@@ -123,6 +124,52 @@ def migrate_db(conn: sqlite3.Connection) -> None:
         WHERE shop_profit = 0 AND subtotal != 0
         """
     )
+
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS exchange_rates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            currency_code TEXT NOT NULL,
+            rate REAL NOT NULL,
+            effective_at TEXT NOT NULL,
+            notes TEXT DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS payment_methods (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            method_type TEXT NOT NULL DEFAULT 'card',
+            is_active INTEGER NOT NULL DEFAULT 1,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS sale_payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sale_id INTEGER NOT NULL,
+            method_code TEXT NOT NULL,
+            amount REAL NOT NULL,
+            FOREIGN KEY (sale_id) REFERENCES sales(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS expenses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            category TEXT NOT NULL,
+            amount REAL NOT NULL,
+            description TEXT DEFAULT '',
+            payment_method_code TEXT DEFAULT 'cash',
+            expense_date TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_exchange_rates_cur ON exchange_rates(currency_code, effective_at);
+        CREATE INDEX IF NOT EXISTS idx_sale_payments_sale ON sale_payments(sale_id);
+        """
+    )
+    _seed_finance_defaults(conn)
+    _backfill_sale_payments(conn)
 
     conn.executescript(
         """
@@ -415,6 +462,221 @@ def init_db() -> None:
                         """,
                         (default_wh_id, pid, qty),
                     )
+
+
+def _seed_finance_defaults(conn: sqlite3.Connection) -> None:
+    defaults = {
+        "base_currency": "TJS",
+        "currency_symbol": "смн",
+        "currency_name": "Сомони",
+    }
+    for key, val in defaults.items():
+        if not conn.execute("SELECT 1 FROM app_settings WHERE key = ?", (key,)).fetchone():
+            conn.execute("INSERT INTO app_settings (key, value) VALUES (?, ?)", (key, val))
+
+    if conn.execute("SELECT COUNT(*) FROM payment_methods").fetchone()[0] == 0:
+        now = utc_now()
+        for code, name, mtype, order in [
+            ("cash", "Наличные", "cash", 0),
+            ("card", "Банковская карта", "card", 1),
+            ("ds", "ДС", "mobile", 2),
+            ("alif", "Alif", "mobile", 3),
+            ("eskhata", "Эсхата", "mobile", 4),
+            ("transfer", "Перевод", "transfer", 5),
+        ]:
+            conn.execute(
+                """
+                INSERT INTO payment_methods (code, name, method_type, is_active, sort_order, created_at)
+                VALUES (?, ?, ?, 1, ?, ?)
+                """,
+                (code, name, mtype, order, now),
+            )
+
+    if conn.execute("SELECT COUNT(*) FROM exchange_rates").fetchone()[0] == 0:
+        now = utc_now()
+        conn.execute(
+            """
+            INSERT INTO exchange_rates (currency_code, rate, effective_at, notes, created_at)
+            VALUES ('TJS', 1, ?, 'Базовая валюта', ?)
+            """,
+            (now, now),
+        )
+
+    if not conn.execute("SELECT 1 FROM users WHERE role = 'accessories'").fetchone():
+        conn.execute(
+            "INSERT INTO users (name, pin, role, is_active, created_at) VALUES (?, ?, ?, 1, ?)",
+            ("Ответственный за аксессуары", "3333", "accessories", utc_now()),
+        )
+
+
+def _backfill_sale_payments(conn: sqlite3.Connection) -> None:
+    if conn.execute("SELECT COUNT(*) FROM sale_payments").fetchone()[0] > 0:
+        return
+    sales = conn.execute(
+        "SELECT id, payment_method, total, cash_amount, card_amount FROM sales WHERE status = 'completed'"
+    ).fetchall()
+    for s in sales:
+        if float(s["cash_amount"] or 0) > 0:
+            conn.execute(
+                "INSERT INTO sale_payments (sale_id, method_code, amount) VALUES (?, 'cash', ?)",
+                (s["id"], s["cash_amount"]),
+            )
+        if float(s["card_amount"] or 0) > 0:
+            method = s["payment_method"] if s["payment_method"] in ("card", "transfer", "ds", "alif", "eskhata") else "card"
+            conn.execute(
+                "INSERT INTO sale_payments (sale_id, method_code, amount) VALUES (?, ?, ?)",
+                (s["id"], method, s["card_amount"]),
+            )
+        elif s["payment_method"] not in ("cash", "trade_in") and float(s["total"] or 0) > 0:
+            conn.execute(
+                "INSERT INTO sale_payments (sale_id, method_code, amount) VALUES (?, ?, ?)",
+                (s["id"], s["payment_method"], s["total"]),
+            )
+        elif s["payment_method"] == "cash" and float(s["cash_amount"] or 0) == 0 and float(s["total"] or 0) > 0:
+            conn.execute(
+                "INSERT INTO sale_payments (sale_id, method_code, amount) VALUES (?, 'cash', ?)",
+                (s["id"], s["total"]),
+            )
+
+
+def get_setting(conn: sqlite3.Connection, key: str, default: str = "") -> str:
+    row = conn.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_setting(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        "INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
+
+
+def get_currency_config(conn: sqlite3.Connection) -> dict[str, str]:
+    return {
+        "code": get_setting(conn, "base_currency", "TJS"),
+        "symbol": get_setting(conn, "currency_symbol", "смн"),
+        "name": get_setting(conn, "currency_name", "Сомони"),
+    }
+
+
+def list_payment_methods(conn: sqlite3.Connection, active_only: bool = True) -> list[dict[str, Any]]:
+    sql = "SELECT * FROM payment_methods"
+    if active_only:
+        sql += " WHERE is_active = 1"
+    sql += " ORDER BY sort_order, name"
+    return [row_to_dict(r) for r in conn.execute(sql).fetchall()]
+
+
+def get_payment_method(conn: sqlite3.Connection, code: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM payment_methods WHERE code = ? AND is_active = 1", (code,)
+    ).fetchone()
+
+
+def get_exchange_rate_at(conn: sqlite3.Connection, currency_code: str, at: str | None = None) -> float:
+    code = currency_code.upper()
+    base = get_setting(conn, "base_currency", "TJS").upper()
+    if code == base:
+        return 1.0
+    when = at or utc_now()
+    row = conn.execute(
+        """
+        SELECT rate FROM exchange_rates
+        WHERE currency_code = ? AND effective_at <= ?
+        ORDER BY effective_at DESC LIMIT 1
+        """,
+        (code, when),
+    ).fetchone()
+    return float(row["rate"]) if row else 1.0
+
+
+def sale_payments_for(conn: sqlite3.Connection, sale_id: int) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT sp.*, pm.name AS method_name, pm.method_type
+        FROM sale_payments sp
+        LEFT JOIN payment_methods pm ON pm.code = sp.method_code
+        WHERE sp.sale_id = ?
+        ORDER BY sp.id
+        """,
+        (sale_id,),
+    ).fetchall()
+    return [row_to_dict(r) for r in rows]
+
+
+def validate_sale_payments(
+    conn: sqlite3.Connection,
+    payments: list[dict[str, float | str]],
+    total: float,
+) -> tuple[float, float, str, list[dict[str, float | str]]]:
+    if not payments:
+        raise HTTPException(status_code=400, detail="Укажите способ оплаты")
+    paid = sum(float(p["amount"]) for p in payments)
+    if abs(paid - total) > 0.01:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Сумма оплат ({paid:.2f}) не совпадает с итогом ({total:.2f})",
+        )
+    cash_amount = 0.0
+    card_amount = 0.0
+    codes: list[str] = []
+    normalized: list[dict[str, float | str]] = []
+    for p in payments:
+        code = str(p["method_code"]).strip()
+        amount = float(p["amount"])
+        if amount <= 0:
+            continue
+        pm = get_payment_method(conn, code)
+        if not pm:
+            raise HTTPException(status_code=400, detail=f"Способ оплаты «{code}» не найден")
+        normalized.append({"method_code": code, "amount": amount})
+        codes.append(code)
+        if pm["method_type"] == "cash":
+            cash_amount += amount
+        else:
+            card_amount += amount
+    payment_method = codes[0] if len(codes) == 1 else "split"
+    return cash_amount, card_amount, payment_method, normalized
+
+
+def insert_sale_payments(conn: sqlite3.Connection, sale_id: int, payments: list[dict[str, float | str]]) -> None:
+    for p in payments:
+        conn.execute(
+            "INSERT INTO sale_payments (sale_id, method_code, amount) VALUES (?, ?, ?)",
+            (sale_id, p["method_code"], p["amount"]),
+        )
+
+
+def persist_sale_payments(
+    conn: sqlite3.Connection,
+    sale_id: int,
+    payments: list[dict[str, float | str]],
+    total: float,
+) -> tuple[float, float, str]:
+    cash_amount, card_amount, payment_method, normalized = validate_sale_payments(conn, payments, total)
+    insert_sale_payments(conn, sale_id, normalized)
+    return cash_amount, card_amount, payment_method
+
+
+def enrich_sale(conn: sqlite3.Connection, sale: sqlite3.Row) -> dict[str, Any]:
+    data = row_to_dict(sale) or {}
+    items = conn.execute("SELECT * FROM sale_items WHERE sale_id = ?", (sale["id"],)).fetchall()
+    data["items"] = enrich_sale_items(conn, items)
+    data["payments"] = sale_payments_for(conn, sale["id"])
+    return data
+
+
+def _report_period_clause(
+    period: str, date_from: str, date_to: str, column: str = "s.created_at"
+) -> tuple[str, list[Any], str]:
+    if date_from or date_to:
+        clause, params = date_filter_sql(date_from, date_to, column)
+        label = f"{date_from or '…'} — {date_to or '…'}"
+        return clause, params, label
+    if period == "all":
+        return "", [], "Всё время"
+    labels = {"day": "Сегодня", "week": "Неделя", "month": "Месяц", "quarter": "Квартал", "year": "Год"}
+    return f" AND {column} >= ?", [period_start(period)], labels.get( period, period)
 
 
 def resolve_user(conn: sqlite3.Connection, pin: str | None) -> dict[str, Any] | None:
@@ -791,13 +1053,54 @@ class CartItem(BaseModel):
     unit_ids: list[int] = Field(default_factory=list)
 
 
+class PaymentPart(BaseModel):
+    method_code: str = Field(min_length=1)
+    amount: float = Field(gt=0)
+
+
 class SaleIn(BaseModel):
     items: list[CartItem]
     discount: float = Field(ge=0, default=0)
     payment_method: str = "cash"
+    payments: list[PaymentPart] = Field(default_factory=list)
     notes: str = ""
     warehouse_id: int | None = None
     shift_id: int | None = None
+
+
+class CurrencySettingsIn(BaseModel):
+    base_currency: str = Field(min_length=3, max_length=3)
+    currency_symbol: str = Field(min_length=1, max_length=8)
+    currency_name: str = ""
+
+
+class ExchangeRateIn(BaseModel):
+    currency_code: str = Field(min_length=3, max_length=3)
+    rate: float = Field(gt=0)
+    effective_at: str = ""
+    notes: str = ""
+
+
+class PaymentMethodIn(BaseModel):
+    code: str = Field(min_length=1, max_length=32)
+    name: str = Field(min_length=1, max_length=100)
+    method_type: str = "card"
+    sort_order: int = 0
+
+
+class PaymentMethodUpdate(BaseModel):
+    name: str | None = None
+    method_type: str | None = None
+    is_active: int | None = Field(default=None, ge=0, le=1)
+    sort_order: int | None = None
+
+
+class ExpenseIn(BaseModel):
+    category: str = Field(min_length=1, max_length=100)
+    amount: float = Field(gt=0)
+    description: str = ""
+    payment_method_code: str = "cash"
+    expense_date: str = ""
 
 
 class UnitIn(BaseModel):
@@ -922,10 +1225,14 @@ async def health():
 async def config():
     with db() as conn:
         user_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        currency = get_currency_config(conn)
+        payment_methods = list_payment_methods(conn, active_only=True)
     return {
         "auth_required": user_count > 0 or bool(settings.store_pin),
         "store_name": settings.store_name,
         "role_pages": ROLE_PAGES,
+        "currency": currency,
+        "payment_methods": payment_methods,
     }
 
 
@@ -943,6 +1250,135 @@ async def auth_check(body: dict):
             "pages": ROLE_PAGES.get(user["role"], []),
             "open_shift": row_to_dict(shift) if shift else None,
         }
+
+
+
+# --- Settings (owner) ---
+
+
+@app.get("/api/settings")
+async def get_settings(x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin, min_role="owner")
+    with db() as conn:
+        return {
+            "currency": get_currency_config(conn),
+            "exchange_rates": [
+                row_to_dict(r)
+                for r in conn.execute(
+                    "SELECT * FROM exchange_rates ORDER BY effective_at DESC, id DESC LIMIT 200"
+                ).fetchall()
+            ],
+            "payment_methods": list_payment_methods(conn, active_only=False),
+        }
+
+
+@app.put("/api/settings/currency")
+async def update_currency(body: CurrencySettingsIn, x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin, min_role="owner")
+    code = body.base_currency.upper()
+    with db() as conn:
+        set_setting(conn, "base_currency", code)
+        set_setting(conn, "currency_symbol", body.currency_symbol)
+        set_setting(conn, "currency_name", body.currency_name or code)
+        if not conn.execute(
+            "SELECT 1 FROM exchange_rates WHERE currency_code = ? AND rate = 1", (code,)
+        ).fetchone():
+            conn.execute(
+                "INSERT INTO exchange_rates (currency_code, rate, effective_at, notes, created_at) VALUES (?, 1, ?, 'Базовая валюта', ?)",
+                (code, utc_now(), utc_now()),
+            )
+    return {"ok": True}
+
+
+@app.post("/api/settings/exchange-rates")
+async def add_exchange_rate(body: ExchangeRateIn, x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin, min_role="owner")
+    when = body.effective_at or utc_now()
+    with db() as conn:
+        cur = conn.execute(
+            "INSERT INTO exchange_rates (currency_code, rate, effective_at, notes, created_at) VALUES (?, ?, ?, ?, ?)",
+            (body.currency_code.upper(), body.rate, when, body.notes, utc_now()),
+        )
+        row = conn.execute("SELECT * FROM exchange_rates WHERE id = ?", (cur.lastrowid,)).fetchone()
+    return row_to_dict(row)
+
+
+@app.post("/api/settings/payment-methods")
+async def add_payment_method(body: PaymentMethodIn, x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin, min_role="owner")
+    code = body.code.strip().lower()
+    with db() as conn:
+        if conn.execute("SELECT 1 FROM payment_methods WHERE code = ?", (code,)).fetchone():
+            raise HTTPException(status_code=400, detail="Код уже существует")
+        cur = conn.execute(
+            """
+            INSERT INTO payment_methods (code, name, method_type, is_active, sort_order, created_at)
+            VALUES (?, ?, ?, 1, ?, ?)
+            """,
+            (code, body.name.strip(), body.method_type, body.sort_order, utc_now()),
+        )
+        row = conn.execute("SELECT * FROM payment_methods WHERE id = ?", (cur.lastrowid,)).fetchone()
+    return row_to_dict(row)
+
+
+@app.put("/api/settings/payment-methods/{method_id}")
+async def update_payment_method(
+    method_id: int, body: PaymentMethodUpdate, x_pin: str | None = Header(default=None, alias="X-Pin")
+):
+    check_pin(x_pin, min_role="owner")
+    fields = {k: v for k, v in body.model_dump().items() if v is not None}
+    if not fields:
+        raise HTTPException(status_code=400, detail="Нет данных")
+    sets = ", ".join(f"{k} = ?" for k in fields)
+    with db() as conn:
+        conn.execute(f"UPDATE payment_methods SET {sets} WHERE id = ?", (*fields.values(), method_id))
+        row = conn.execute("SELECT * FROM payment_methods WHERE id = ?", (method_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Не найдено")
+    return row_to_dict(row)
+
+
+@app.get("/api/expenses")
+async def list_expenses(
+    period: str = Query(default="month", pattern="^(day|week|month|quarter|year|all)$"),
+    date_from: str = "",
+    date_to: str = "",
+    x_pin: str | None = Header(default=None, alias="X-Pin"),
+):
+    check_pin(x_pin, min_role="owner")
+    clause, params, _ = _report_period_clause(period, date_from, date_to, "expense_date")
+    with db() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM expenses WHERE 1=1 {clause.replace('s.created_at', 'expense_date')} ORDER BY expense_date DESC",
+            params,
+        ).fetchall()
+    return [row_to_dict(r) for r in rows]
+
+
+@app.post("/api/expenses")
+async def create_expense(body: ExpenseIn, x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin, min_role="owner")
+    when = body.expense_date or utc_now()[:10]
+    with db() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO expenses (category, amount, description, payment_method_code, expense_date, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (body.category.strip(), body.amount, body.description, body.payment_method_code, when, utc_now()),
+        )
+        row = conn.execute("SELECT * FROM expenses WHERE id = ?", (cur.lastrowid,)).fetchone()
+    return row_to_dict(row)
+
+
+@app.delete("/api/expenses/{expense_id}")
+async def delete_expense(expense_id: int, x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin, min_role="owner")
+    with db() as conn:
+        cur = conn.execute("DELETE FROM expenses WHERE id = ?", (expense_id,))
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Не найдено")
+    return {"ok": True}
 
 
 # --- Users (owner) ---
@@ -1497,39 +1933,42 @@ async def list_products(
     check_pin(x_pin)
     sql = "SELECT p.* FROM products p WHERE 1=1"
     params: list[Any] = []
-    if warehouse_id is not None:
-        sql += """
-            AND EXISTS (
-                SELECT 1 FROM warehouse_stock ws
-                WHERE ws.product_id = p.id AND ws.warehouse_id = ? AND ws.quantity > 0
-            )
-        """
-        params.append(warehouse_id)
-    if q:
-        like = f"%{q.strip()}%"
-        sql += """
-            AND (LOWER(p.name) LIKE LOWER(?) OR LOWER(p.brand) LIKE LOWER(?) OR LOWER(p.sku) LIKE LOWER(?)
-                 OR LOWER(p.barcode) LIKE LOWER(?) OR LOWER(p.supplier_name) LIKE LOWER(?)
-                 OR LOWER(p.model) LIKE LOWER(?) OR LOWER(p.color) LIKE LOWER(?)
-                 OR LOWER(p.memory) LIKE LOWER(?) OR LOWER(p.specs_extra) LIKE LOWER(?))
-        """
-        params.extend([like] * 9)
-    if category:
-        sql += " AND p.category = ?"
-        params.append(category)
-    if ownership_type:
-        sql += " AND p.ownership_type = ?"
-        params.append(ownership_type)
-    if supplier:
-        sql += " AND p.supplier_name LIKE ?"
-        params.append(f"%{supplier}%")
-    if color:
-        sql += " AND LOWER(TRIM(p.color)) LIKE LOWER(?)"
-        params.append(f"%{color.strip()}%")
-    if low_stock:
-        sql += " AND p.stock <= p.min_stock"
-    sql += " ORDER BY p.ownership_type, p.name"
     with db() as conn:
+        user = resolve_user(conn, x_pin)
+        if user and user.get("role") == "accessories":
+            category = "accessory"
+        if warehouse_id is not None:
+            sql += """
+                AND EXISTS (
+                    SELECT 1 FROM warehouse_stock ws
+                    WHERE ws.product_id = p.id AND ws.warehouse_id = ? AND ws.quantity > 0
+                )
+            """
+            params.append(warehouse_id)
+        if q:
+            like = f"%{q.strip()}%"
+            sql += """
+                AND (LOWER(p.name) LIKE LOWER(?) OR LOWER(p.brand) LIKE LOWER(?) OR LOWER(p.sku) LIKE LOWER(?)
+                     OR LOWER(p.barcode) LIKE LOWER(?) OR LOWER(p.supplier_name) LIKE LOWER(?)
+                     OR LOWER(p.model) LIKE LOWER(?) OR LOWER(p.color) LIKE LOWER(?)
+                     OR LOWER(p.memory) LIKE LOWER(?) OR LOWER(p.specs_extra) LIKE LOWER(?))
+            """
+            params.extend([like] * 9)
+        if category:
+            sql += " AND p.category = ?"
+            params.append(category)
+        if ownership_type:
+            sql += " AND p.ownership_type = ?"
+            params.append(ownership_type)
+        if supplier:
+            sql += " AND p.supplier_name LIKE ?"
+            params.append(f"%{supplier}%")
+        if color:
+            sql += " AND LOWER(TRIM(p.color)) LIKE LOWER(?)"
+            params.append(f"%{color.strip()}%")
+        if low_stock:
+            sql += " AND p.stock <= p.min_stock"
+        sql += " ORDER BY p.ownership_type, p.name"
         rows = conn.execute(sql, params).fetchall()
         return [enrich_product(conn, r) for r in rows]
 
@@ -1733,6 +2172,7 @@ async def create_sale(body: SaleIn, x_pin: str | None = Header(default=None, ali
 
     with db() as conn:
         warehouse_id = resolve_warehouse_id(conn, body.warehouse_id)
+        user = resolve_user(conn, x_pin)
         shift = get_open_shift(conn)
         shift_id = body.shift_id or (shift["id"] if shift else None)
         if shift_id is None:
@@ -1744,6 +2184,8 @@ async def create_sale(body: SaleIn, x_pin: str | None = Header(default=None, ali
             product = conn.execute("SELECT * FROM products WHERE id = ?", (item.product_id,)).fetchone()
             if not product:
                 raise HTTPException(status_code=404, detail=f"Товар #{item.product_id} не найден")
+            if user and user.get("role") == "accessories" and product["category"] != "accessory":
+                raise HTTPException(status_code=403, detail="Доступны только аксессуары")
             if int(product["track_units"] or 0):
                 avail = conn.execute(
                     """
@@ -1770,8 +2212,18 @@ async def create_sale(body: SaleIn, x_pin: str | None = Header(default=None, ali
 
         total = max(0.0, subtotal - body.discount)
         now = utc_now()
-        cash_amount = total if body.payment_method == "cash" else 0.0
-        card_amount = total if body.payment_method in ("card", "transfer") else 0.0
+
+        if body.payments:
+            pay_payload = [{"method_code": p.method_code, "amount": p.amount} for p in body.payments]
+            cash_amount, card_amount, payment_method, pay_payload = validate_sale_payments(
+                conn, pay_payload, total
+            )
+        else:
+            cash_amount = total if body.payment_method == "cash" else 0.0
+            card_amount = total if body.payment_method not in ("cash", "trade_in") else 0.0
+            payment_method = body.payment_method
+            pay_payload = [{"method_code": body.payment_method, "amount": total}]
+
         cur = conn.execute(
             """
             INSERT INTO sales
@@ -1779,10 +2231,11 @@ async def create_sale(body: SaleIn, x_pin: str | None = Header(default=None, ali
              warehouse_id, cash_amount, card_amount, trade_in_value, shift_id)
             VALUES (?, ?, ?, 'completed', ?, ?, ?, ?, ?, 0, ?)
             """,
-            (total, body.discount, body.payment_method, body.notes, now,
+            (total, body.discount, payment_method, body.notes, now,
              warehouse_id, cash_amount, card_amount, shift_id),
         )
         sale_id = cur.lastrowid
+        insert_sale_payments(conn, sale_id, pay_payload)
         for line in lines:
             p = line["product"]
             cur_item = conn.execute(
@@ -1816,10 +2269,7 @@ async def create_sale(body: SaleIn, x_pin: str | None = Header(default=None, ali
             )
 
         sale = conn.execute("SELECT * FROM sales WHERE id = ?", (sale_id,)).fetchone()
-        items = conn.execute("SELECT * FROM sale_items WHERE sale_id = ?", (sale_id,)).fetchall()
-        result = row_to_dict(sale)
-        result["items"] = enrich_sale_items(conn, items)
-    return result
+        return enrich_sale(conn, sale)
 
 
 @app.get("/api/sales")
@@ -1860,10 +2310,7 @@ async def get_sale(sale_id: int, x_pin: str | None = Header(default=None, alias=
         sale = conn.execute("SELECT * FROM sales WHERE id = ?", (sale_id,)).fetchone()
         if not sale:
             raise HTTPException(status_code=404, detail="Продажа не найдена")
-        items = conn.execute("SELECT * FROM sale_items WHERE sale_id = ?", (sale_id,)).fetchall()
-        result = row_to_dict(sale)
-        result["items"] = enrich_sale_items(conn, items)
-    return result
+        return enrich_sale(conn, sale)
 
 
 @app.post("/api/sales/{sale_id}/void")
@@ -2092,6 +2539,167 @@ async def create_supplier_payment(body: SupplierPaymentIn, x_pin: str | None = H
         )
         row = conn.execute("SELECT * FROM supplier_payments WHERE id = ?", (cur.lastrowid,)).fetchone()
     return row_to_dict(row)
+
+
+
+def _report_opiu(conn: sqlite3.Connection, period: str, date_from: str, date_to: str) -> dict[str, Any]:
+    clause, params, label = _report_period_clause(period, date_from, date_to)
+    fin = _finance_report(conn, period, "all", date_from, date_to)
+    exp_clause = clause.replace("s.created_at", "expense_date") if clause else ""
+    if period != "all" and not date_from and not date_to:
+        exp_clause = " AND expense_date >= ?"
+        exp_params = [period_start(period)[:10]]
+    elif clause:
+        exp_params = [p[:10] if isinstance(p, str) and len(p) > 10 else p for p in params]
+    else:
+        exp_params = []
+    expenses = conn.execute(
+        f"SELECT category, COALESCE(SUM(amount), 0) AS total FROM expenses WHERE 1=1 {exp_clause} GROUP BY category",
+        exp_params,
+    ).fetchall()
+    total_expenses = sum(float(r["total"]) for r in expenses)
+    gross_profit = fin["gross_revenue"] - fin["own_cogs"] - fin["supplier_due"]
+    operating_profit = gross_profit - total_expenses
+    return {
+        "period_label": label,
+        "revenue": fin["gross_revenue"],
+        "discounts": fin["discounts"],
+        "net_revenue": fin["net_revenue"],
+        "cogs_own": fin["own_cogs"],
+        "supplier_due": fin["supplier_due"],
+        "gross_profit": gross_profit,
+        "operating_expenses": total_expenses,
+        "expenses_by_category": [{"category": r["category"], "amount": float(r["total"])} for r in expenses],
+        "operating_profit": operating_profit,
+        "shop_profit": fin["shop_profit"],
+        "net_profit": operating_profit,
+    }
+
+
+def _report_dds(conn: sqlite3.Connection, period: str, date_from: str, date_to: str) -> dict[str, Any]:
+    clause, params, label = _report_period_clause(period, date_from, date_to, "s.created_at")
+    inflows = conn.execute(
+        f"""
+        SELECT sp.method_code, pm.name, pm.method_type, COALESCE(SUM(sp.amount), 0) AS amount
+        FROM sale_payments sp
+        JOIN sales s ON s.id = sp.sale_id
+        LEFT JOIN payment_methods pm ON pm.code = sp.method_code
+        WHERE s.status = 'completed' {clause}
+        GROUP BY sp.method_code
+        """,
+        params,
+    ).fetchall()
+    total_in = sum(float(r["amount"]) for r in inflows)
+    sup_clause = clause.replace("s.created_at", "created_at")
+    supplier_out = conn.execute(
+        f"SELECT COALESCE(SUM(amount), 0) FROM supplier_payments WHERE 1=1 {sup_clause.replace('s.', '') if 's.' in sup_clause else sup_clause}",
+        params if sup_clause else [],
+    ).fetchone()[0]
+    exp_clause = clause.replace("s.created_at", "expense_date")
+    if period != "all" and not date_from and not date_to:
+        exp_clause = " AND expense_date >= ?"
+        exp_params = [period_start(period)[:10]]
+    else:
+        exp_params = [p[:10] if isinstance(p, str) and len(p) > 10 else p for p in params] if exp_clause else []
+    expenses_out = conn.execute(
+        f"SELECT COALESCE(SUM(amount), 0) FROM expenses WHERE 1=1 {exp_clause}",
+        exp_params,
+    ).fetchone()[0]
+    operating_out = float(supplier_out) + float(expenses_out)
+    return {
+        "period_label": label,
+        "operating_inflows": [{"method_code": r["method_code"], "name": r["name"] or r["method_code"], "amount": float(r["amount"])} for r in inflows],
+        "total_inflows": total_in,
+        "supplier_payments": float(supplier_out),
+        "operating_expenses": float(expenses_out),
+        "total_outflows": operating_out,
+        "net_operating_cash": total_in - operating_out,
+    }
+
+
+def _report_balance(conn: sqlite3.Connection) -> dict[str, Any]:
+    cash_in = conn.execute(
+        """
+        SELECT COALESCE(SUM(sp.amount), 0) FROM sale_payments sp
+        JOIN sales s ON s.id = sp.sale_id
+        JOIN payment_methods pm ON pm.code = sp.method_code
+        WHERE s.status = 'completed' AND pm.method_type = 'cash'
+        """
+    ).fetchone()[0]
+    cash_out = conn.execute("SELECT COALESCE(SUM(amount), 0) FROM supplier_payments").fetchone()[0]
+    cash_out += conn.execute(
+        "SELECT COALESCE(SUM(amount), 0) FROM expenses WHERE payment_method_code = 'cash' OR payment_method_code IN (SELECT code FROM payment_methods WHERE method_type='cash')"
+    ).fetchone()[0]
+    shift_cash = conn.execute(
+        "SELECT COALESCE(SUM(opening_cash), 0) FROM shifts WHERE status = 'closed'"
+    ).fetchone()[0]
+    cash_balance = float(shift_cash) + float(cash_in) - float(cash_out)
+    inventory = conn.execute(
+        "SELECT COALESCE(SUM(p.purchase_price * ws.quantity), 0) FROM products p JOIN warehouse_stock ws ON ws.product_id = p.id"
+    ).fetchone()[0]
+    supplier_payable = 0.0
+    suppliers = conn.execute(
+        """
+        SELECT p.supplier_name,
+               COALESCE(SUM(CASE WHEN si.ownership_type='consignment' THEN si.supplier_due ELSE 0 END), 0) AS accrued
+        FROM sale_items si
+        JOIN sales s ON s.id = si.sale_id
+        JOIN products p ON p.id = si.product_id
+        WHERE s.status = 'completed' AND p.supplier_name != ''
+        GROUP BY p.supplier_name
+        """
+    ).fetchall()
+    for s in suppliers:
+        paid = conn.execute(
+            "SELECT COALESCE(SUM(amount), 0) FROM supplier_payments WHERE supplier_name = ?", (s["supplier_name"],)
+        ).fetchone()[0]
+        supplier_payable += max(0, float(s["accrued"]) - float(paid))
+    assets = cash_balance + float(inventory)
+    liabilities = supplier_payable
+    equity = assets - liabilities
+    return {
+        "assets": {
+            "cash": cash_balance,
+            "inventory": float(inventory),
+            "total": assets,
+        },
+        "liabilities": {
+            "supplier_payables": supplier_payable,
+            "total": liabilities,
+        },
+        "equity": equity,
+    }
+
+
+@app.get("/api/reports/opiu")
+async def report_opiu(
+    period: str = Query(default="month", pattern="^(day|week|month|quarter|year|all)$"),
+    date_from: str = "",
+    date_to: str = "",
+    x_pin: str | None = Header(default=None, alias="X-Pin"),
+):
+    check_pin(x_pin, min_role="owner")
+    with db() as conn:
+        return _report_opiu(conn, period, date_from, date_to)
+
+
+@app.get("/api/reports/dds")
+async def report_dds(
+    period: str = Query(default="month", pattern="^(day|week|month|quarter|year|all)$"),
+    date_from: str = "",
+    date_to: str = "",
+    x_pin: str | None = Header(default=None, alias="X-Pin"),
+):
+    check_pin(x_pin, min_role="owner")
+    with db() as conn:
+        return _report_dds(conn, period, date_from, date_to)
+
+
+@app.get("/api/reports/balance")
+async def report_balance(x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin, min_role="owner")
+    with db() as conn:
+        return _report_balance(conn)
 
 
 def _finance_report(conn: sqlite3.Connection, period: str, scope: str, date_from: str, date_to: str) -> dict[str, Any]:

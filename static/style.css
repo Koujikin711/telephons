@@ -1524,3 +1524,8 @@ body {
     transition-duration: 0.01ms !important;
   }
 }
+
+.split-payments { display: flex; flex-direction: column; gap: 0.4rem; margin: 0.75rem 0; max-height: 180px; overflow-y: auto; }
+.split-pay-row { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; font-size: 0.85rem; }
+.split-pay-row .input { width: 100px; text-align: right; }
+.split-pay-summary { display: flex; justify-content: space-between; font-size: 0.82rem; margin-bottom: 0.5rem; color: var(--muted); }

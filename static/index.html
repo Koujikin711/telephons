@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/style.css?v=8">
+  <link rel="stylesheet" href="/static/style.css?v=10">
 </head>
 <body>
   <div class="mesh-bg" aria-hidden="true"></div>
@@ -85,6 +85,9 @@
         <button class="nav-item" data-page="users">
           <span class="nav-icon">👤</span> Пользователи
         </button>
+        <button class="nav-item" data-page="settings">
+          <span class="nav-icon">⚙</span> Настройки
+        </button>
       </nav>
       <div class="sidebar-footer">
         <span id="clock" class="clock"></span>
@@ -152,11 +155,12 @@
                 </div>
                 <div class="total-line grand"><span>К оплате</span><span id="cart-total">0 ₽</span></div>
               </div>
-              <div class="pay-grid">
-                <button class="pay-btn active" data-pay="cash">Наличные</button>
-                <button class="pay-btn" data-pay="card">Карта</button>
-                <button class="pay-btn" data-pay="transfer">Перевод</button>
+              <div id="split-payments" class="split-payments"></div>
+              <div class="split-pay-summary">
+                <span id="split-paid-label">Оплачено: <strong id="split-paid-total">0</strong></span>
+                <span id="split-remain-label" class="hidden">Осталось: <strong id="split-remain-total">0</strong></span>
               </div>
+              <button type="button" id="split-fill-cash" class="btn btn-ghost btn-sm btn-block">Вся сумма наличными</button>
               <button id="checkout-btn" class="btn btn-success btn-block" disabled>Провести оплату</button>
               <p id="pos-shift-hint" class="hint hidden"></p>
               <button id="clear-cart-btn" class="btn btn-ghost btn-block">Очистить</button>
@@ -445,7 +449,68 @@
           </div>
         </section>
 
+
+        <!-- SETTINGS -->
+        <section id="page-settings" class="page">
+          <div class="grid-2">
+            <div class="card">
+              <div class="card-header"><h3>Валюта</h3></div>
+              <form id="currency-form" class="form-stack card-body">
+                <label>Код валюты<input id="set-currency-code" class="input" maxlength="3" placeholder="TJS"></label>
+                <label>Символ<input id="set-currency-symbol" class="input" placeholder="смн"></label>
+                <label>Название<input id="set-currency-name" class="input" placeholder="Сомони"></label>
+                <button type="submit" class="btn btn-primary">Сохранить валюту</button>
+              </form>
+            </div>
+            <div class="card">
+              <div class="card-header"><h3>Курс валюты</h3></div>
+              <form id="rate-form" class="form-stack card-body">
+                <label>Валюта<input id="rate-code" class="input" maxlength="3" placeholder="USD"></label>
+                <label>Курс к базовой<input type="number" id="rate-value" class="input" min="0" step="0.0001" required></label>
+                <label>Действует с<input type="datetime-local" id="rate-effective" class="input"></label>
+                <label>Комментарий<input id="rate-notes" class="input"></label>
+                <button type="submit" class="btn btn-primary">Добавить курс</button>
+              </form>
+              <div class="table-wrap card-body"><table class="data-table">
+                <thead><tr><th>Валюта</th><th>Курс</th><th>С даты</th><th></th></tr></thead>
+                <tbody id="rates-tbody"></tbody>
+              </table></div>
+            </div>
+          </div>
+          <div class="grid-2" style="margin-top:1rem">
+            <div class="card">
+              <div class="card-header"><h3>Способы оплаты</h3></div>
+              <form id="paymethod-form" class="form-stack card-body">
+                <label>Код<input id="pm-code" class="input" placeholder="ds"></label>
+                <label>Название<input id="pm-name" class="input" placeholder="ДС"></label>
+                <label>Тип<select id="pm-type" class="select"><option value="cash">Наличные</option><option value="card">Карта</option><option value="mobile">Моб. кошелёк</option><option value="transfer">Перевод</option></select></label>
+                <button type="submit" class="btn btn-primary">Добавить</button>
+              </form>
+              <div class="table-wrap card-body"><table class="data-table">
+                <thead><tr><th>Код</th><th>Название</th><th>Тип</th><th></th></tr></thead>
+                <tbody id="paymethods-tbody"></tbody>
+              </table></div>
+            </div>
+            <div class="card">
+              <div class="card-header"><h3>Расходы (для ОПиУ / ДДС)</h3></div>
+              <form id="expense-form" class="form-stack card-body">
+                <label>Категория<input id="exp-category" class="input" required placeholder="Аренда"></label>
+                <label>Сумма<input type="number" id="exp-amount" class="input" min="0.01" step="0.01" required></label>
+                <label>Дата<input type="date" id="exp-date" class="input"></label>
+                <label>Описание<input id="exp-desc" class="input"></label>
+                <label>Оплата<select id="exp-pay" class="select"></select></label>
+                <button type="submit" class="btn btn-primary">Добавить расход</button>
+              </form>
+              <div class="table-wrap card-body"><table class="data-table">
+                <thead><tr><th>Дата</th><th>Категория</th><th>Сумма</th><th></th></tr></thead>
+                <tbody id="expenses-tbody"></tbody>
+              </table></div>
+            </div>
+          </div>
+        </section>
+
         <!-- USERS -->
+
         <section id="page-users" class="page">
           <div class="grid-2">
             <div class="card">
@@ -456,6 +521,7 @@
                 <label>Роль<select id="user-role" class="select">
                   <option value="cashier">Кассир</option>
                   <option value="warehouse">Кладовщик</option>
+                  <option value="accessories">Аксессуары</option>
                   <option value="owner">Владелец</option>
                 </select></label>
                 <button type="submit" class="btn btn-primary">Добавить</button>
@@ -474,6 +540,12 @@
         <!-- REPORTS -->
         <section id="page-reports" class="page">
           <div class="toolbar">
+                        <div class="segmented" id="report-type">
+              <button class="seg active" data-rtype="finance">Финансы</button>
+              <button class="seg" data-rtype="opiu">ОПиУ</button>
+              <button class="seg" data-rtype="dds">ДДС</button>
+              <button class="seg" data-rtype="balance">Баланс</button>
+            </div>
             <div class="segmented" id="report-scope">
               <button class="seg active" data-scope="all">Общий</button>
               <button class="seg" data-scope="own">Собственные</button>
@@ -691,7 +763,8 @@
       <label>Роль<select id="ue-role" class="select">
         <option value="cashier">Кассир</option>
         <option value="warehouse">Кладовщик</option>
-        <option value="owner">Владелец</option>
+        <option value="accessories">Аксессуары</option>
+                  <option value="owner">Владелец</option>
       </select></label>
       <label class="check"><input type="checkbox" id="ue-active" checked> Активен</label>
       <div class="modal-actions">
@@ -702,6 +775,6 @@
   </dialog>
 
   <div id="toast" class="toast"></div>
-  <script src="/static/app.js?v=8"></script>
+  <script src="/static/app.js?v=10"></script>
 </body>
 </html>

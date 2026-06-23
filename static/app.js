@@ -4,6 +4,8 @@ let products = [];
 let warehouses = [];
 let cart = [];
 let paymentMethod = "cash";
+let storeConfig = { currency: { code: "TJS", symbol: "смн", name: "Сомони" }, payment_methods: [] };
+let reportType = "finance";
 let authRequired = false;
 let currentPage = "dashboard";
 let reportScope = "all";
@@ -20,13 +22,21 @@ let catalogDetailId = null;
 let pendingProductImage = null;
 let pendingProductImageUrl = null;
 
-const ROLE_LABELS = { owner: "Владелец", warehouse: "Кладовщик", cashier: "Кассир" };
+const ROLE_LABELS = { owner: "Владелец", warehouse: "Кладовщик", cashier: "Кассир", accessories: "Аксессуары" };
 
-const fmt = (n) => new Intl.NumberFormat("ru-RU", { style: "currency", currency: "RUB", maximumFractionDigits: 0 }).format(n);
+const fmt = (n) => {
+  const code = storeConfig.currency?.code || "TJS";
+  const digits = code === "TJS" ? 2 : 0;
+  try {
+    return new Intl.NumberFormat("ru-RU", { style: "currency", currency: code, maximumFractionDigits: digits }).format(n);
+  } catch {
+    return `${Number(n).toFixed(digits)} ${storeConfig.currency?.symbol || code}`;
+  }
+};
 const pct = (a, b) => b ? Math.round((a / b) * 100) : 0;
 const catLabel = (c) => ({ phone: "Телефон", accessory: "Аксессуар" }[c] || c);
 const ownLabel = (o) => ({ own: "Собственный", consignment: "Реализация" }[o] || o);
-const payLabel = (p) => ({ cash: "Наличные", card: "Карта", transfer: "Перевод", trade_in: "Обмен" }[p] || p);
+const payLabel = (p) => storeConfig.payment_methods?.find((m) => m.code === p)?.name || ({ cash: "Наличные", card: "Карта", transfer: "Перевод", trade_in: "Обмен", split: "Смешанная" }[p] || p);
 const scopeLabel = (s) => ({ all: "Общий", own: "Собственные", consignment: "Реализация", trade_ins: "Обмены" }[s] || s);
 const conditionLabel = (c) => ({ new: "Новый", used: "Б/у", refurbished: "Восстановленный" }[c] || c);
 const esc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -230,6 +240,7 @@ const PAGE_TITLES = {
   users: "Пользователи",
   reports: "Финансовые отчёты",
   analytics: "Аналитика",
+  settings: "Настройки",
 };
 
 function defaultWarehouseId() {
@@ -383,6 +394,7 @@ function navigate(page) {
     shifts: loadShiftsPage,
     imei: loadImeiPage,
     users: loadUsersPage,
+    settings: loadSettingsPage,
     reports: loadReport,
     analytics: loadAnalytics,
   };
@@ -434,6 +446,8 @@ async function init() {
     const cfg = await res.json();
     authRequired = cfg.auth_required;
     document.getElementById("store-name").textContent = cfg.store_name || "TeleStore";
+    if (cfg.currency) storeConfig.currency = cfg.currency;
+    if (cfg.payment_methods?.length) storeConfig.payment_methods = cfg.payment_methods;
 
     if (authRequired && !pin) {
       showLogin();
@@ -466,6 +480,7 @@ async function init() {
     bindShifts();
     bindImei();
     bindUsers();
+    bindSettings();
     await loadWarehouses();
     navigate(firstAllowedPage());
   } catch (e) {
@@ -543,11 +558,14 @@ function bindPos() {
       if (p) { addToCart(p.id); e.target.value = ""; loadProducts(); }
     }
   });
-  document.querySelectorAll(".pay-btn").forEach((b) => b.addEventListener("click", () => {
-    document.querySelectorAll(".pay-btn").forEach((x) => x.classList.remove("active"));
-    b.classList.add("active");
-    paymentMethod = b.dataset.pay;
-  }));
+  document.getElementById("split-fill-cash")?.addEventListener("click", () => {
+    const total = cartTotalDue();
+    document.querySelectorAll(".split-pay-input").forEach((inp) => { inp.value = inp.dataset.method === "cash" ? total : ""; });
+    updateSplitSummary();
+  });
+  document.getElementById("split-payments")?.addEventListener("input", (e) => {
+    if (e.target.classList.contains("split-pay-input")) updateSplitSummary();
+  });
   document.getElementById("cart-discount").addEventListener("input", renderCart);
   document.getElementById("checkout-btn").addEventListener("click", checkout);
   document.getElementById("clear-cart-btn").addEventListener("click", () => { cart = []; renderCart(); });
@@ -557,12 +575,15 @@ async function loadPos() {
   if (!warehouses.length) await loadWarehouses();
   await refreshSession();
   fillWarehouseSelect(document.getElementById("pos-warehouse"), document.getElementById("pos-warehouse").value || defaultWarehouseId());
+  const catEl = document.getElementById("pos-category");
+  if (catEl) catEl.closest(".toolbar")?.classList.toggle("hidden", currentUser?.role === "accessories");
   await loadProducts();
 }
 
 async function loadProducts() {
   const q = document.getElementById("pos-search")?.value || "";
-  const cat = document.getElementById("pos-category")?.value || "";
+  let cat = document.getElementById("pos-category")?.value || "";
+  if (currentUser?.role === "accessories") cat = "accessory";
   const own = document.getElementById("pos-ownership")?.value || "";
   const wh = document.getElementById("pos-warehouse")?.value || "";
   let url = `/api/products?q=${encodeURIComponent(q)}`;
@@ -668,8 +689,8 @@ function renderCart() {
     box.innerHTML = "";
     empty.classList.remove("hidden");
     document.getElementById("checkout-btn").disabled = true;
-    document.getElementById("cart-subtotal").textContent = "0 ₽";
-    document.getElementById("cart-total").textContent = "0 ₽";
+    document.getElementById("cart-subtotal").textContent = fmt(0);
+    document.getElementById("cart-total").textContent = fmt(0);
     return;
   }
   empty.classList.add("hidden");
@@ -694,6 +715,8 @@ function renderCart() {
   const disc = +document.getElementById("cart-discount").value || 0;
   document.getElementById("cart-subtotal").textContent = fmt(sub);
   document.getElementById("cart-total").textContent = fmt(Math.max(0, sub - disc));
+  renderSplitPayments();
+  updateSplitSummary();
   const shiftHint = document.getElementById("pos-shift-hint");
   if (shiftHint) {
     if (!openShift) {
@@ -732,6 +755,8 @@ async function checkout() {
   const discount = +document.getElementById("cart-discount").value || 0;
   const warehouse_id = +document.getElementById("pos-warehouse").value;
   try {
+    const payments = collectSplitPayments();
+    if (!payments.length) { toast("Укажите суммы оплаты", "error"); return; }
     const sale = await api("/api/sales", {
       method: "POST",
       body: JSON.stringify({
@@ -740,7 +765,7 @@ async function checkout() {
           quantity: c.quantity,
           unit_ids: c.unit_ids || [],
         })),
-        discount, payment_method: paymentMethod, warehouse_id,
+        discount, payments, warehouse_id,
       }),
     });
     cart = [];
@@ -765,7 +790,7 @@ function showReceipt(sale) {
     <hr>
     ${sale.discount > 0 ? `<div>Скидка: −${fmt(sale.discount)}</div>` : ""}
     <div style="text-align:right;font-weight:700;font-size:1.1rem">ИТОГО: ${fmt(sale.total)}</div>
-    <div style="text-align:center;color:var(--muted)">${payLabel(sale.payment_method)}</div>`;
+    ${(sale.payments?.length ? sale.payments.map((p) => `<div>${payLabel(p.method_code)}: ${fmt(p.amount)}</div>`).join("") : `<div style="text-align:center;color:var(--muted)">${payLabel(sale.payment_method)}</div>`)}`;
   document.getElementById("receipt-modal").showModal();
 }
 el("receipt-close")?.addEventListener("click", () => el("receipt-modal")?.close());
@@ -1438,7 +1463,7 @@ async function loadShiftsPage() {
   } else {
     cur.innerHTML = `
       <p style="color:var(--muted);margin-bottom:1rem">Смена не открыта. Укажите размен в кассе и откройте смену.</p>
-      <label>Размен, ₽<input type="number" id="shift-opening-cash" class="input" min="0" value="0"></label>
+      <label>Размен, ${storeConfig.currency?.symbol || "смн"}<input type="number" id="shift-opening-cash" class="input" min="0" value="0"></label>
       <button type="button" class="btn btn-primary" style="margin-top:.75rem" id="shift-open-btn">Открыть смену</button>`;
     closeCard.classList.add("hidden");
     document.getElementById("shift-open-btn").onclick = async () => {
@@ -1998,8 +2023,148 @@ async function loadSuppliers() {
   `).join("") || '<p style="color:var(--muted);font-size:.8rem">Нет выплат</p>';
 }
 
+
+
+function cartTotalDue() {
+  const sub = cart.reduce((s, c) => s + c.product.sale_price * c.quantity, 0);
+  const disc = +document.getElementById("cart-discount")?.value || 0;
+  return Math.max(0, sub - disc);
+}
+
+function renderSplitPayments() {
+  const box = document.getElementById("split-payments");
+  if (!box) return;
+  const methods = storeConfig.payment_methods?.length ? storeConfig.payment_methods : [
+    { code: "cash", name: "Наличные" }, { code: "card", name: "Карта" },
+    { code: "ds", name: "ДС" }, { code: "alif", name: "Alif" }, { code: "eskhata", name: "Эсхата" },
+  ];
+  const prev = {};
+  box.querySelectorAll(".split-pay-input").forEach((inp) => { if (inp.value) prev[inp.dataset.method] = inp.value; });
+  box.innerHTML = methods.map((m) => `
+    <label class="split-pay-row">
+      <span>${esc(m.name)}</span>
+      <input type="number" class="input sm split-pay-input" data-method="${esc(m.code)}" min="0" step="0.01" value="${prev[m.code] || ""}" placeholder="0">
+    </label>`).join("");
+}
+
+function updateSplitSummary() {
+  const total = cartTotalDue();
+  const paid = collectSplitPayments().reduce((s, p) => s + p.amount, 0);
+  const paidEl = document.getElementById("split-paid-total");
+  const remEl = document.getElementById("split-remain-total");
+  const remWrap = document.getElementById("split-remain-label");
+  if (paidEl) paidEl.textContent = fmt(paid);
+  if (remEl) remEl.textContent = fmt(Math.max(0, total - paid));
+  if (remWrap) remWrap.classList.toggle("hidden", Math.abs(total - paid) < 0.01);
+  if (remWrap) remWrap.style.color = total - paid > 0.01 ? "var(--danger)" : "var(--success)";
+}
+
+function collectSplitPayments() {
+  return [...document.querySelectorAll(".split-pay-input")]
+    .map((inp) => ({ method_code: inp.dataset.method, amount: +inp.value || 0 }))
+    .filter((p) => p.amount > 0);
+}
+
+function bindSettings() {
+  document.getElementById("currency-form")?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    try {
+      await api("/api/settings/currency", { method: "PUT", body: JSON.stringify({
+        base_currency: document.getElementById("set-currency-code").value.trim(),
+        currency_symbol: document.getElementById("set-currency-symbol").value.trim(),
+        currency_name: document.getElementById("set-currency-name").value.trim(),
+      }) });
+      toast("Валюта сохранена");
+      const cfg = await fetch("/api/config").then((r) => r.json());
+      if (cfg.currency) storeConfig.currency = cfg.currency;
+      renderCart();
+    } catch (err) { toast(err.message, "error"); }
+  });
+  document.getElementById("rate-form")?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    try {
+      await api("/api/settings/exchange-rates", { method: "POST", body: JSON.stringify({
+        currency_code: document.getElementById("rate-code").value.trim(),
+        rate: +document.getElementById("rate-value").value,
+        effective_at: document.getElementById("rate-effective").value.replace("T", " ") + ":00",
+        notes: document.getElementById("rate-notes").value,
+      }) });
+      toast("Курс добавлен");
+      loadSettingsPage();
+    } catch (err) { toast(err.message, "error"); }
+  });
+  document.getElementById("paymethod-form")?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    try {
+      await api("/api/settings/payment-methods", { method: "POST", body: JSON.stringify({
+        code: document.getElementById("pm-code").value.trim(),
+        name: document.getElementById("pm-name").value.trim(),
+        method_type: document.getElementById("pm-type").value,
+      }) });
+      toast("Способ оплаты добавлен");
+      const cfg = await fetch("/api/config").then((r) => r.json());
+      if (cfg.payment_methods) storeConfig.payment_methods = cfg.payment_methods;
+      loadSettingsPage();
+      renderSplitPayments();
+    } catch (err) { toast(err.message, "error"); }
+  });
+  document.getElementById("expense-form")?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    try {
+      await api("/api/expenses", { method: "POST", body: JSON.stringify({
+        category: document.getElementById("exp-category").value.trim(),
+        amount: +document.getElementById("exp-amount").value,
+        expense_date: document.getElementById("exp-date").value,
+        description: document.getElementById("exp-desc").value,
+        payment_method_code: document.getElementById("exp-pay").value,
+      }) });
+      toast("Расход добавлен");
+      loadSettingsPage();
+    } catch (err) { toast(err.message, "error"); }
+  });
+}
+
+async function loadSettingsPage() {
+  const data = await api("/api/settings");
+  storeConfig.currency = data.currency;
+  storeConfig.payment_methods = data.payment_methods.filter((m) => m.is_active);
+  document.getElementById("set-currency-code").value = data.currency.code || "";
+  document.getElementById("set-currency-symbol").value = data.currency.symbol || "";
+  document.getElementById("set-currency-name").value = data.currency.name || "";
+  document.getElementById("rates-tbody").innerHTML = (data.exchange_rates || []).map((r) =>
+    `<tr><td>${esc(r.currency_code)}</td><td>${r.rate}</td><td>${esc(r.effective_at)}</td><td>${esc(r.notes || "")}</td></tr>`
+  ).join("") || '<tr><td colspan="4">Нет курсов</td></tr>';
+  document.getElementById("paymethods-tbody").innerHTML = (data.payment_methods || []).map((m) =>
+    `<tr><td>${esc(m.code)}</td><td>${esc(m.name)}</td><td>${esc(m.method_type)}</td><td>${m.is_active ? "✓" : "—"}</td></tr>`
+  ).join("");
+  const expPay = document.getElementById("exp-pay");
+  if (expPay) expPay.innerHTML = data.payment_methods.filter((m) => m.is_active).map((m) =>
+    `<option value="${esc(m.code)}">${esc(m.name)}</option>`).join("");
+  const expenses = await api("/api/expenses?period=all");
+  document.getElementById("expenses-tbody").innerHTML = expenses.map((e) =>
+    `<tr><td>${esc(e.expense_date)}</td><td>${esc(e.category)}</td><td>${fmt(e.amount)}</td><td><button class="btn btn-danger btn-sm" onclick="deleteExpense(${e.id})">✕</button></td></tr>`
+  ).join("") || '<tr><td colspan="4">Нет расходов</td></tr>';
+  renderSplitPayments();
+}
+
+window.deleteExpense = async (id) => {
+  if (! confirm("Удалить расход?")) return;
+  try { await api(`/api/expenses/${id}`, { method: "DELETE" }); toast("Удалено"); loadSettingsPage(); }
+  catch (e) { toast(e.message, "error"); }
+};
+
 /* ── Reports ── */
 function bindReports() {
+  document.querySelectorAll("#report-type .seg").forEach((b) => {
+    b.onclick = () => {
+      document.querySelectorAll("#report-type .seg").forEach((x) => x.classList.remove("active"));
+      b.classList.add("active");
+      reportType = b.dataset.rtype;
+      document.getElementById("report-scope").style.display = reportType === "finance" ? "" : "none";
+      document.getElementById("report-period").closest(".toolbar") && (document.getElementById("report-period").style.display = reportType === "balance" ? "none" : "");
+      loadReport();
+    };
+  });
   document.querySelectorAll("#report-scope .seg").forEach((b) => {
     b.onclick = () => {
       document.querySelectorAll("#report-scope .seg").forEach((x) => x.classList.remove("active"));
@@ -2053,6 +2218,45 @@ async function loadReport() {
   const from = document.getElementById("report-from").value;
   const to = document.getElementById("report-to").value;
   const combinedEl = document.getElementById("report-combined");
+  const q = (base) => { let u = `${base}?period=${period}`; if (from) u += `&date_from=${from}`; if (to) u += `&date_to=${to}`; return u; };
+
+  if (reportType === "opiu") {
+    const r = await api(q("/api/reports/opiu"));
+    combinedEl.classList.add("hidden");
+    document.getElementById("report-content").innerHTML = `
+      <div class="report-header"><h3>ОПиУ</h3><p>${r.period_label || ""}</p></div>
+      <div class="report-kpi">
+        <div class="report-box"><div class="lbl">Выручка</div><div class="val">${fmt(r.revenue)}</div></div>
+        <div class="report-box"><div class="lbl">Валовая прибыль</div><div class="val">${fmt(r.gross_profit)}</div></div>
+        <div class="report-box"><div class="lbl">Расходы</div><div class="val">${fmt(r.operating_expenses)}</div></div>
+        <div class="report-box"><div class="lbl">Чистая прибыль</div><div class="val" style="color:var(--success)">${fmt(r.net_profit)}</div></div>
+      </div>`;
+    return;
+  }
+  if (reportType === "dds") {
+    const r = await api(q("/api/reports/dds"));
+    combinedEl.classList.add("hidden");
+    document.getElementById("report-content").innerHTML = `
+      <div class="report-header"><h3>ДДС</h3><p>${r.period_label || ""}</p></div>
+      <div class="report-kpi">
+        <div class="report-box"><div class="lbl">Поступления</div><div class="val">${fmt(r.total_inflows)}</div></div>
+        <div class="report-box"><div class="lbl">Выплаты</div><div class="val">${fmt(r.total_outflows)}</div></div>
+        <div class="report-box"><div class="lbl">Чистый поток</div><div class="val">${fmt(r.net_operating_cash)}</div></div>
+      </div>
+      <div class="card"><div class="card-body"><table class="data-table"><thead><tr><th>Способ</th><th>Сумма</th></tr></thead><tbody>${(r.operating_inflows||[]).map(p=>`<tr><td>${esc(p.name)}</td><td>${fmt(p.amount)}</td></tr>`).join("")}</tbody></table></div></div>`;
+    return;
+  }
+  if (reportType === "balance") {
+    const r = await api("/api/reports/balance");
+    combinedEl.classList.add("hidden");
+    document.getElementById("report-content").innerHTML = `
+      <div class="report-header"><h3>Баланс</h3></div>
+      <div class="metric-row"><span>Денежные средства</span><strong>${fmt(r.assets.cash)}</strong></div>
+      <div class="metric-row"><span>Запасы</span><strong>${fmt(r.assets.inventory)}</strong></div>
+      <div class="metric-row"><span>Долг поставщикам</span><strong>${fmt(r.liabilities.supplier_payables)}</strong></div>
+      <div class="metric-row"><span>Капитал</span><strong>${fmt(r.equity)}</strong></div>`;
+    return;
+  }
 
   if (reportScope === "trade_ins") {
     let url = `/api/reports/trade-ins?period=${period}`;
