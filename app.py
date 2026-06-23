@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import re
 import logging
@@ -39,11 +41,11 @@ ROLE_PAGES: dict[str, list[str]] = {
     "owner": [
         "dashboard", "pos", "sales", "catalog", "warehouses", "products-own",
         "products-consignment", "suppliers", "trade-in", "reports", "analytics",
-        "shifts", "users", "imei", "stocktake", "settings",
+        "shifts", "users", "imei", "reservations", "stocktake", "settings",
     ],
     "warehouse": [
         "dashboard", "catalog", "warehouses", "products-own", "products-consignment",
-        "trade-in", "imei", "stocktake",
+        "trade-in", "imei", "reservations", "stocktake",
     ],
     "cashier": ["dashboard", "pos", "sales", "trade-in", "shifts"],
     "accessories": ["dashboard", "pos", "sales", "catalog", "products-own"],
@@ -277,6 +279,35 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     _add_column(conn, "sale_item_units", "customs_cleared", "INTEGER NOT NULL DEFAULT 0")
     _add_column(conn, "sale_item_units", "customs_price", "REAL NOT NULL DEFAULT 0")
     _add_column(conn, "sale_item_units", "imei_pending", "INTEGER NOT NULL DEFAULT 0")
+    _add_column(conn, "product_units", "box_image_url", "TEXT DEFAULT ''")
+    _add_column(conn, "product_units", "customs_status", "TEXT NOT NULL DEFAULT 'none'")
+    conn.execute(
+        """
+        UPDATE product_units SET customs_status = 'cleared'
+        WHERE customs_cleared = 1 AND customs_status = 'none'
+        """
+    )
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS unit_reservations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            unit_id INTEGER NOT NULL,
+            product_id INTEGER NOT NULL,
+            warehouse_id INTEGER NOT NULL,
+            client_name TEXT NOT NULL,
+            client_phone TEXT DEFAULT '',
+            notes TEXT DEFAULT '',
+            reserved_until TEXT NOT NULL,
+            user_id INTEGER,
+            user_name TEXT DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (unit_id) REFERENCES product_units(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_reservations_unit ON unit_reservations(unit_id, status);
+        CREATE INDEX IF NOT EXISTS idx_reservations_until ON unit_reservations(reserved_until, status);
+        """
+    )
     conn.execute("UPDATE products SET track_units = 1 WHERE category = 'phone' AND track_units = 0")
     conn.execute(
         """
@@ -941,6 +972,30 @@ def shift_sales_totals(conn: sqlite3.Connection, shift_id: int) -> dict[str, Any
     }
 
 
+def expire_reservations(conn: sqlite3.Connection) -> None:
+    now = utc_now()
+    rows = conn.execute(
+        """
+        SELECT id, unit_id FROM unit_reservations
+        WHERE status = 'active' AND reserved_until < ?
+        """,
+        (now,),
+    ).fetchall()
+    for row in rows:
+        conn.execute("UPDATE unit_reservations SET status = 'expired' WHERE id = ?", (row["id"],))
+        conn.execute(
+            "UPDATE product_units SET status = 'in_stock' WHERE id = ? AND status = 'reserved'",
+            (row["unit_id"],),
+        )
+
+
+def fulfill_unit_reservation(conn: sqlite3.Connection, unit_id: int) -> None:
+    conn.execute(
+        "UPDATE unit_reservations SET status = 'fulfilled' WHERE unit_id = ? AND status = 'active'",
+        (unit_id,),
+    )
+
+
 def pick_units(
     conn: sqlite3.Connection,
     product_id: int,
@@ -948,6 +1003,7 @@ def pick_units(
     quantity: int,
     unit_ids: list[int] | None,
 ) -> list[sqlite3.Row]:
+    expire_reservations(conn)
     if unit_ids:
         if len(unit_ids) != quantity:
             raise HTTPException(status_code=400, detail="Количество IMEI должно совпадать с количеством товара")
@@ -956,7 +1012,7 @@ def pick_units(
             f"""
             SELECT * FROM product_units
             WHERE id IN ({placeholders}) AND product_id = ? AND warehouse_id = ?
-              AND status = 'in_stock'
+              AND status IN ('in_stock', 'reserved')
             """,
             (*unit_ids, product_id, warehouse_id),
         ).fetchall()
@@ -996,6 +1052,16 @@ def unit_has_imei(unit: sqlite3.Row | dict[str, Any]) -> bool:
 def enrich_unit_row(row: sqlite3.Row) -> dict[str, Any]:
     d = row_to_dict(row) or {}
     d["has_imei"] = unit_has_imei(row)
+    status = str(d.get("status") or "")
+    cs = str(d.get("customs_status") or "none")
+    if status == "reserved":
+        d["display_status"] = "reserved"
+    elif status == "in_stock" and not d["has_imei"]:
+        d["display_status"] = "no_imei"
+    elif cs == "pending":
+        d["display_status"] = "pending_customs"
+    else:
+        d["display_status"] = "ready"
     return d
 
 
@@ -1075,14 +1141,17 @@ def mark_unit_sold_full(
     customs_cleared: int,
     customs_price: float,
 ) -> None:
+    customs_status = "cleared" if customs_cleared else "pending"
     conn.execute(
         """
         UPDATE product_units
-        SET status = 'sold', sale_id = ?, imei = ?, customs_cleared = ?, customs_price = ?
+        SET status = 'sold', sale_id = ?, imei = ?, customs_cleared = ?, customs_price = ?,
+            customs_status = ?
         WHERE id = ?
         """,
-        (sale_id, imei, customs_cleared, customs_price, unit_id),
+        (sale_id, imei, customs_cleared, customs_price, customs_status, unit_id),
     )
+    fulfill_unit_reservation(conn, unit_id)
 
 
 def restore_units_for_sale(conn: sqlite3.Connection, sale_id: int) -> None:
@@ -1426,6 +1495,7 @@ class UnitIn(BaseModel):
     imei: str = ""
     serial: str = ""
     notes: str = ""
+    customs_status: Literal["none", "pending", "cleared"] = "none"
 
 
 class BulkUnitsIn(BaseModel):
@@ -1434,10 +1504,23 @@ class BulkUnitsIn(BaseModel):
     quantity: int = Field(ge=1, le=500)
     serial_prefix: str = Field(default="", max_length=40)
     notes: str = ""
+    mark_pending_customs: int = Field(default=0, ge=0, le=1)
 
 
 class CompleteImeiIn(BaseModel):
     imei: str = Field(min_length=5, max_length=20)
+
+
+class CustomsStatusIn(BaseModel):
+    customs_status: Literal["none", "pending", "cleared"]
+
+
+class ReservationIn(BaseModel):
+    unit_id: int
+    client_name: str = Field(min_length=1, max_length=120)
+    client_phone: str = ""
+    notes: str = ""
+    reserved_until: str = Field(min_length=10, max_length=30)
 
 
 class UserIn(BaseModel):
@@ -1879,32 +1962,33 @@ async def list_units(
     x_pin: str | None = Header(default=None, alias="X-Pin"),
 ):
     check_pin(x_pin)
-    sql = """
+    with db() as conn:
+        expire_reservations(conn)
+        sql = """
         SELECT u.*, p.name AS product_name, p.model, p.color AS product_color, w.name AS warehouse_name
         FROM product_units u
         JOIN products p ON p.id = u.product_id
         JOIN warehouses w ON w.id = u.warehouse_id
         WHERE 1=1
     """
-    params: list[Any] = []
-    if product_id:
-        sql += " AND u.product_id = ?"
-        params.append(product_id)
-    if warehouse_id:
-        sql += " AND u.warehouse_id = ?"
-        params.append(warehouse_id)
-    if status:
-        sql += " AND u.status = ?"
-        params.append(status)
-    if q:
-        uclause, uparams = unit_search_sql(q)
-        sql += uclause
-        params.extend(uparams)
-        like = f"%{q.strip()}%"
-        sql += " AND (p.name LIKE ? OR p.model LIKE ? OR p.color LIKE ?)"
-        params.extend([like, like, like])
-    sql += " ORDER BY u.created_at DESC LIMIT 500"
-    with db() as conn:
+        params: list[Any] = []
+        if product_id:
+            sql += " AND u.product_id = ?"
+            params.append(product_id)
+        if warehouse_id:
+            sql += " AND u.warehouse_id = ?"
+            params.append(warehouse_id)
+        if status:
+            sql += " AND u.status = ?"
+            params.append(status)
+        if q:
+            uclause, uparams = unit_search_sql(q)
+            sql += uclause
+            params.extend(uparams)
+            like = f"%{q.strip()}%"
+            sql += " AND (p.name LIKE ? OR p.model LIKE ? OR p.color LIKE ?)"
+            params.extend([like, like, like])
+        sql += " ORDER BY u.created_at DESC LIMIT 500"
         rows = conn.execute(sql, params).fetchall()
     return [enrich_unit_row(r) for r in rows]
 
@@ -1926,15 +2010,16 @@ async def bulk_create_units(body: BulkUnitsIn, x_pin: str | None = Header(defaul
             (body.product_id, wh),
         ).fetchone()[0]
         now = utc_now()
+        customs_status = "pending" if body.mark_pending_customs else "none"
         for i in range(body.quantity):
             serial = f"{prefix}-{(existing + i + 1):03d}"
             cur = conn.execute(
                 """
                 INSERT INTO product_units
-                (product_id, warehouse_id, imei, serial, status, notes, created_at)
-                VALUES (?, ?, '', ?, 'in_stock', ?, ?)
+                (product_id, warehouse_id, imei, serial, status, notes, created_at, customs_status)
+                VALUES (?, ?, '', ?, 'in_stock', ?, ?, ?)
                 """,
-                (body.product_id, wh, serial, body.notes or "Партия без IMEI", now),
+                (body.product_id, wh, serial, body.notes or "Партия без IMEI", now, customs_status),
             )
             adjust_warehouse_stock(
                 conn, wh, body.product_id, 1, "inbound",
@@ -1987,6 +2072,49 @@ async def report_imei_pending(x_pin: str | None = Header(default=None, alias="X-
             """
         ).fetchall()
     return [row_to_dict(r) for r in rows]
+
+
+@app.get("/api/units/lookup")
+async def lookup_unit(
+    q: str = Query(min_length=1),
+    warehouse_id: int | None = None,
+    x_pin: str | None = Header(default=None, alias="X-Pin"),
+):
+    check_pin(x_pin)
+    with db() as conn:
+        expire_reservations(conn)
+        sql = """
+            SELECT u.*, p.name AS product_name, p.model, p.color AS product_color,
+                   p.barcode, p.sale_price, p.track_units, p.category,
+                   w.name AS warehouse_name
+            FROM product_units u
+            JOIN products p ON p.id = u.product_id
+            JOIN warehouses w ON w.id = u.warehouse_id
+            WHERE u.status IN ('in_stock', 'reserved')
+        """
+        params: list[Any] = []
+        uclause, uparams = unit_search_sql(q)
+        sql += uclause
+        params.extend(uparams)
+        if warehouse_id:
+            sql += " AND u.warehouse_id = ?"
+            params.append(warehouse_id)
+        units = conn.execute(sql + " ORDER BY u.created_at DESC LIMIT 20", params).fetchall()
+        if units:
+            matches = []
+            for u in units:
+                d = row_to_dict(u)
+                d["is_reserved"] = u["status"] == "reserved"
+                matches.append(d)
+            return {"match_type": "unit", "matches": matches}
+        exact = conn.execute("SELECT * FROM products WHERE barcode = ?", (q.strip(),)).fetchone()
+        if exact:
+            return {"match_type": "product", "matches": [enrich_product(conn, exact)]}
+        clause, sparams = product_search_sql(q)
+        prows = conn.execute(f"SELECT p.* FROM products p WHERE 1=1 {clause} LIMIT 20", sparams).fetchall()
+        if prows:
+            return {"match_type": "product", "matches": [enrich_product(conn, r) for r in prows]}
+    return {"match_type": "none", "matches": []}
 
 
 @app.post("/api/units/{unit_id}/complete-imei")
@@ -2078,6 +2206,11 @@ async def create_unit(body: UnitIn, x_pin: str | None = Header(default=None, ali
         wh = resolve_warehouse_id(conn, body.warehouse_id)
         imei = body.imei.strip()
         serial = body.serial.strip()
+        cs = body.customs_status
+        if cs == "cleared":
+            customs_cleared, customs_price = 1, 0.0
+        else:
+            customs_cleared, customs_price = 0, 0.0
         if imei:
             dup = conn.execute(
                 "SELECT id FROM product_units WHERE imei = ? AND status != 'sold'", (imei,)
@@ -2087,10 +2220,11 @@ async def create_unit(body: UnitIn, x_pin: str | None = Header(default=None, ali
         cur = conn.execute(
             """
             INSERT INTO product_units
-            (product_id, warehouse_id, imei, serial, status, notes, created_at)
-            VALUES (?, ?, ?, ?, 'in_stock', ?, ?)
+            (product_id, warehouse_id, imei, serial, status, notes, created_at,
+             customs_status, customs_cleared, customs_price)
+            VALUES (?, ?, ?, ?, 'in_stock', ?, ?, ?, ?, ?)
             """,
-            (body.product_id, wh, imei, serial, body.notes, utc_now()),
+            (body.product_id, wh, imei, serial, body.notes, utc_now(), cs, customs_cleared, customs_price),
         )
         adjust_warehouse_stock(
             conn, wh, body.product_id, 1, "inbound",
@@ -2123,6 +2257,319 @@ async def delete_unit(unit_id: int, x_pin: str | None = Header(default=None, ali
         adjust_warehouse_stock(
             conn, unit["warehouse_id"], unit["product_id"], -1,
             "outbound", notes=f"Удаление IMEI #{unit_id}",
+        )
+    return {"ok": True}
+
+
+def _remove_unit_photos(unit_id: int) -> None:
+    for path in UPLOADS_DIR.glob(f"unit_{unit_id}.*"):
+        path.unlink(missing_ok=True)
+
+
+@app.get("/api/units/{unit_id}")
+async def get_unit(unit_id: int, x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin)
+    with db() as conn:
+        expire_reservations(conn)
+        row = conn.execute(
+            """
+            SELECT u.*, p.name AS product_name, p.model, p.color AS product_color,
+                   w.name AS warehouse_name
+            FROM product_units u
+            JOIN products p ON p.id = u.product_id
+            JOIN warehouses w ON w.id = u.warehouse_id
+            WHERE u.id = ?
+            """,
+            (unit_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Устройство не найдено")
+        res = conn.execute(
+            """
+            SELECT * FROM unit_reservations
+            WHERE unit_id = ? AND status = 'active'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (unit_id,),
+        ).fetchone()
+    data = enrich_unit_row(row)
+    if res:
+        data["reservation"] = row_to_dict(res)
+    return data
+
+
+@app.get("/api/units/{unit_id}/label")
+async def unit_label(unit_id: int, x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin)
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT u.*, p.name AS product_name, p.model, p.color AS product_color
+            FROM product_units u
+            JOIN products p ON p.id = u.product_id
+            WHERE u.id = ?
+            """,
+            (unit_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Устройство не найдено")
+    qr_data = f"UNIT:{unit_id}|{row['serial'] or ''}|{row['imei'] or ''}"
+    return {
+        "unit_id": unit_id,
+        "serial": row["serial"] or "",
+        "imei": row["imei"] or "",
+        "product_name": row["product_name"],
+        "color": row["product_color"] or "",
+        "model": row["model"] or "",
+        "qr_data": qr_data,
+    }
+
+
+@app.patch("/api/units/{unit_id}/customs-status")
+async def update_unit_customs_status(
+    unit_id: int, body: CustomsStatusIn, x_pin: str | None = Header(default=None, alias="X-Pin")
+):
+    check_pin(x_pin, min_role="warehouse")
+    with db() as conn:
+        unit = conn.execute("SELECT * FROM product_units WHERE id = ?", (unit_id,)).fetchone()
+        if not unit:
+            raise HTTPException(status_code=404, detail="Устройство не найдено")
+        if unit["status"] == "sold":
+            raise HTTPException(status_code=400, detail="Устройство уже продано")
+        cleared = 1 if body.customs_status == "cleared" else 0
+        conn.execute(
+            "UPDATE product_units SET customs_status = ?, customs_cleared = ? WHERE id = ?",
+            (body.customs_status, cleared, unit_id),
+        )
+        row = conn.execute(
+            """
+            SELECT u.*, p.name AS product_name, p.color AS product_color, w.name AS warehouse_name
+            FROM product_units u
+            JOIN products p ON p.id = u.product_id
+            JOIN warehouses w ON w.id = u.warehouse_id
+            WHERE u.id = ?
+            """,
+            (unit_id,),
+        ).fetchone()
+    return enrich_unit_row(row)
+
+
+@app.post("/api/units/{unit_id}/photo")
+async def upload_unit_photo(
+    unit_id: int,
+    file: UploadFile = File(...),
+    x_pin: str | None = Header(default=None, alias="X-Pin"),
+):
+    check_pin(x_pin, min_role="warehouse")
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Файл не выбран")
+    ext = Path(file.filename).suffix.lower()
+    if ext not in ALLOWED_IMAGE_EXT:
+        raise HTTPException(status_code=400, detail="Допустимы JPG, PNG, WEBP, GIF")
+    data = await file.read()
+    if len(data) > MAX_IMAGE_BYTES:
+        raise HTTPException(status_code=400, detail="Максимальный размер файла — 5 МБ")
+    with db() as conn:
+        unit = conn.execute("SELECT id FROM product_units WHERE id = ?", (unit_id,)).fetchone()
+        if not unit:
+            raise HTTPException(status_code=404, detail="Устройство не найдено")
+    _remove_unit_photos(unit_id)
+    filename = f"unit_{unit_id}{ext}"
+    (UPLOADS_DIR / filename).write_bytes(data)
+    image_url = f"/uploads/{filename}"
+    with db() as conn:
+        conn.execute("UPDATE product_units SET box_image_url = ? WHERE id = ?", (image_url, unit_id))
+        row = conn.execute(
+            """
+            SELECT u.*, p.name AS product_name, p.color AS product_color, w.name AS warehouse_name
+            FROM product_units u
+            JOIN products p ON p.id = u.product_id
+            JOIN warehouses w ON w.id = u.warehouse_id
+            WHERE u.id = ?
+            """,
+            (unit_id,),
+        ).fetchone()
+    return enrich_unit_row(row)
+
+
+@app.post("/api/units/import-csv")
+async def import_units_csv(
+    file: UploadFile = File(...),
+    warehouse_id: int | None = Query(default=None),
+    x_pin: str | None = Header(default=None, alias="X-Pin"),
+):
+    check_pin(x_pin, min_role="warehouse")
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Пустой файл")
+    text = raw.decode("utf-8-sig", errors="replace")
+    reader = csv.DictReader(io.StringIO(text))
+    if not reader.fieldnames:
+        raise HTTPException(status_code=400, detail="CSV без заголовков")
+    fields = {f.strip().lower(): f for f in reader.fieldnames}
+    created = []
+    errors: list[str] = []
+    with db() as conn:
+        default_wh = resolve_warehouse_id(conn, warehouse_id)
+        for i, row in enumerate(reader, start=2):
+            def cell(*names: str) -> str:
+                for n in names:
+                    key = fields.get(n.lower())
+                    if key and row.get(key):
+                        return str(row[key]).strip()
+                return ""
+
+            product_id_raw = cell("product_id", "id")
+            product_name = cell("product_name", "name", "product", "товар")
+            imei = cell("imei", "imei1")
+            serial = cell("serial", "serial_number", "серийник")
+            wh_raw = cell("warehouse_id", "warehouse", "склад")
+            cs_raw = cell("customs_status", "таможня").lower()
+            customs_status = "pending" if cs_raw in ("pending", "1", "да", "yes", "на растamожке", "на растаможке") else "none"
+
+            if not imei and not serial:
+                errors.append(f"Строка {i}: нужен IMEI или серийник")
+                continue
+
+            pid: int | None = None
+            if product_id_raw.isdigit():
+                pid = int(product_id_raw)
+            elif product_name:
+                prod = conn.execute(
+                    "SELECT id FROM products WHERE name = ? OR sku = ? LIMIT 1",
+                    (product_name, product_name),
+                ).fetchone()
+                if prod:
+                    pid = int(prod["id"])
+            if not pid:
+                errors.append(f"Строка {i}: товар не найден")
+                continue
+
+            wh_id = default_wh
+            if wh_raw.isdigit():
+                wh_id = resolve_warehouse_id(conn, int(wh_raw))
+
+            product = conn.execute("SELECT * FROM products WHERE id = ?", (pid,)).fetchone()
+            if not product:
+                errors.append(f"Строка {i}: товар #{pid} не найден")
+                continue
+
+            if imei:
+                dup = conn.execute(
+                    "SELECT id FROM product_units WHERE imei = ? AND status != 'sold'", (imei,)
+                ).fetchone()
+                if dup:
+                    errors.append(f"Строка {i}: IMEI {imei} уже есть")
+                    continue
+
+            cleared = 1 if customs_status == "cleared" else 0
+            cur = conn.execute(
+                """
+                INSERT INTO product_units
+                (product_id, warehouse_id, imei, serial, status, notes, created_at,
+                 customs_status, customs_cleared)
+                VALUES (?, ?, ?, ?, 'in_stock', ?, ?, ?, ?)
+                """,
+                (pid, wh_id, imei, serial, "CSV импорт", utc_now(), customs_status, cleared),
+            )
+            adjust_warehouse_stock(conn, wh_id, pid, 1, "inbound", notes=f"CSV: {imei or serial}")
+            conn.execute("UPDATE products SET track_units = 1 WHERE id = ?", (pid,))
+            unit_row = conn.execute("SELECT * FROM product_units WHERE id = ?", (cur.lastrowid,)).fetchone()
+            created.append(enrich_unit_row(unit_row))
+
+    return {"created": len(created), "errors": errors, "units": created[:50]}
+
+
+@app.get("/api/reservations")
+async def list_reservations(
+    status: str = "active",
+    x_pin: str | None = Header(default=None, alias="X-Pin"),
+):
+    check_pin(x_pin, min_role="warehouse")
+    with db() as conn:
+        expire_reservations(conn)
+        sql = """
+            SELECT r.*, u.imei, u.serial, u.box_image_url, u.customs_status,
+                   p.name AS product_name, p.color AS product_color,
+                   w.name AS warehouse_name
+            FROM unit_reservations r
+            JOIN product_units u ON u.id = r.unit_id
+            JOIN products p ON p.id = r.product_id
+            JOIN warehouses w ON w.id = r.warehouse_id
+            WHERE 1=1
+        """
+        params: list[Any] = []
+        if status:
+            sql += " AND r.status = ?"
+            params.append(status)
+        sql += " ORDER BY r.reserved_until ASC LIMIT 200"
+        rows = conn.execute(sql, params).fetchall()
+    return [row_to_dict(r) for r in rows]
+
+
+@app.post("/api/reservations")
+async def create_reservation(body: ReservationIn, x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin, min_role="warehouse")
+    user = None
+    with db() as conn:
+        expire_reservations(conn)
+        user = resolve_user(conn, x_pin)
+        unit = conn.execute(
+            "SELECT * FROM product_units WHERE id = ? AND status = 'in_stock'", (body.unit_id,)
+        ).fetchone()
+        if not unit:
+            raise HTTPException(status_code=400, detail="Устройство недоступно для резерва")
+        active = conn.execute(
+            "SELECT id FROM unit_reservations WHERE unit_id = ? AND status = 'active'", (body.unit_id,)
+        ).fetchone()
+        if active:
+            raise HTTPException(status_code=400, detail="Устройство уже зарезервировано")
+        until = body.reserved_until.replace("T", " ")
+        if len(until) == 10:
+            until += " 23:59:59"
+        cur = conn.execute(
+            """
+            INSERT INTO unit_reservations
+            (unit_id, product_id, warehouse_id, client_name, client_phone, notes,
+             reserved_until, user_id, user_name, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)
+            """,
+            (
+                body.unit_id, unit["product_id"], unit["warehouse_id"],
+                body.client_name.strip(), body.client_phone.strip(), body.notes.strip(),
+                until, user.get("id") if user else None, user.get("name", "") if user else "",
+                utc_now(),
+            ),
+        )
+        conn.execute("UPDATE product_units SET status = 'reserved' WHERE id = ?", (body.unit_id,))
+        row = conn.execute(
+            """
+            SELECT r.*, u.imei, u.serial, p.name AS product_name, p.color AS product_color,
+                   w.name AS warehouse_name
+            FROM unit_reservations r
+            JOIN product_units u ON u.id = r.unit_id
+            JOIN products p ON p.id = r.product_id
+            JOIN warehouses w ON w.id = r.warehouse_id
+            WHERE r.id = ?
+            """,
+            (cur.lastrowid,),
+        ).fetchone()
+    return row_to_dict(row)
+
+
+@app.delete("/api/reservations/{reservation_id}")
+async def cancel_reservation(reservation_id: int, x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin, min_role="warehouse")
+    with db() as conn:
+        res = conn.execute(
+            "SELECT * FROM unit_reservations WHERE id = ? AND status = 'active'", (reservation_id,)
+        ).fetchone()
+        if not res:
+            raise HTTPException(status_code=404, detail="Резерв не найден")
+        conn.execute("UPDATE unit_reservations SET status = 'cancelled' WHERE id = ?", (reservation_id,))
+        conn.execute(
+            "UPDATE product_units SET status = 'in_stock' WHERE id = ? AND status = 'reserved'",
+            (res["unit_id"],),
         )
     return {"ok": True}
 
@@ -3712,6 +4159,44 @@ async def dashboard(x_pin: str | None = Header(default=None, alias="X-Pin")):
             if bal > 0:
                 balances.append({"supplier_name": s["supplier_name"], "balance": bal})
         low_stock = conn.execute("SELECT COUNT(*) FROM products WHERE stock <= min_stock").fetchone()[0]
+        expire_reservations(conn)
+        stale_cutoff = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d %H:%M:%S")
+        imei_pending_stale = conn.execute(
+            """
+            SELECT COUNT(*) FROM sale_item_units siu
+            JOIN sale_items si ON si.id = siu.sale_item_id
+            JOIN sales s ON s.id = si.sale_id
+            WHERE siu.imei_pending = 1 AND s.status = 'completed' AND s.created_at < ?
+            """,
+            (stale_cutoff,),
+        ).fetchone()[0]
+        no_imei_stock = conn.execute(
+            """
+            SELECT COUNT(*) FROM product_units
+            WHERE status = 'in_stock' AND TRIM(COALESCE(imei, '')) = ''
+            """
+        ).fetchone()[0]
+        pending_customs = conn.execute(
+            """
+            SELECT COUNT(*) FROM product_units
+            WHERE status IN ('in_stock', 'reserved') AND customs_status = 'pending'
+            """
+        ).fetchone()[0]
+        active_reservations = conn.execute(
+            "SELECT COUNT(*) FROM unit_reservations WHERE status = 'active'"
+        ).fetchone()[0]
+        stale_items = conn.execute(
+            """
+            SELECT s.id AS sale_id, s.created_at, si.product_name, siu.serial, siu.imei,
+                   s.user_name AS cashier_name
+            FROM sale_item_units siu
+            JOIN sale_items si ON si.id = siu.sale_item_id
+            JOIN sales s ON s.id = si.sale_id
+            WHERE siu.imei_pending = 1 AND s.status = 'completed' AND s.created_at < ?
+            ORDER BY s.created_at ASC LIMIT 10
+            """,
+            (stale_cutoff,),
+        ).fetchall()
         warehouses = conn.execute(
             """
             SELECT w.id, w.name, w.is_default,
@@ -3731,6 +4216,13 @@ async def dashboard(x_pin: str | None = Header(default=None, alias="X-Pin")):
         "supplier_balances": balances,
         "low_stock_count": low_stock,
         "warehouses": [row_to_dict(w) for w in warehouses],
+        "alerts": {
+            "imei_pending_stale": int(imei_pending_stale),
+            "no_imei_stock": int(no_imei_stock),
+            "pending_customs": int(pending_customs),
+            "active_reservations": int(active_reservations),
+            "stale_imei_items": [row_to_dict(r) for r in stale_items],
+        },
     }
 
 
@@ -3862,43 +4354,6 @@ def _resolve_stocktake_scan(conn: sqlite3.Connection, warehouse_id: int, q: str)
         "product_id": product["id"], "unit_id": None, "quantity": 1,
         "imei": "", "serial": "", "color": product["color"] or "",
     }
-
-
-@app.get("/api/units/lookup")
-async def lookup_unit(
-    q: str = Query(min_length=1),
-    warehouse_id: int | None = None,
-    x_pin: str | None = Header(default=None, alias="X-Pin"),
-):
-    check_pin(x_pin)
-    with db() as conn:
-        sql = """
-            SELECT u.*, p.name AS product_name, p.model, p.color AS product_color,
-                   p.barcode, p.sale_price, p.track_units, p.category,
-                   w.name AS warehouse_name
-            FROM product_units u
-            JOIN products p ON p.id = u.product_id
-            JOIN warehouses w ON w.id = u.warehouse_id
-            WHERE u.status = 'in_stock'
-        """
-        params: list[Any] = []
-        uclause, uparams = unit_search_sql(q)
-        sql += uclause
-        params.extend(uparams)
-        if warehouse_id:
-            sql += " AND u.warehouse_id = ?"
-            params.append(warehouse_id)
-        units = conn.execute(sql + " ORDER BY u.created_at DESC LIMIT 20", params).fetchall()
-        if units:
-            return {"match_type": "unit", "matches": [row_to_dict(u) for u in units]}
-        exact = conn.execute("SELECT * FROM products WHERE barcode = ?", (q.strip(),)).fetchone()
-        if exact:
-            return {"match_type": "product", "matches": [enrich_product(conn, exact)]}
-        clause, sparams = product_search_sql(q)
-        prows = conn.execute(f"SELECT p.* FROM products p WHERE 1=1 {clause} LIMIT 20", sparams).fetchall()
-        if prows:
-            return {"match_type": "product", "matches": [enrich_product(conn, r) for r in prows]}
-    return {"match_type": "none", "matches": []}
 
 
 @app.get("/api/stocktake/current")

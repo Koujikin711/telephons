@@ -79,6 +79,37 @@ const conditionLabel = (c) => ({ new: "Новый", used: "Б/у", refurbished: 
 const esc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 const dash = (s) => s ? esc(s) : "—";
 
+function scanBeep(ok = true) {
+  try {
+    if (navigator.vibrate) navigator.vibrate(ok ? 40 : [30, 40, 30]);
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.frequency.value = ok ? 880 : 220;
+    gain.gain.value = 0.08;
+    osc.start();
+    osc.stop(ctx.currentTime + (ok ? 0.08 : 0.15));
+  } catch { /* ignore */ }
+}
+
+function focusScanInput(id) {
+  requestAnimationFrame(() => {
+    const el = document.getElementById(id);
+    if (el) { el.focus(); el.select?.(); }
+  });
+}
+
+function unitStatusBadge(u) {
+  const map = {
+    no_imei: '<span class="tag unit-no-imei-tag">нет IMEI</span>',
+    pending_customs: '<span class="tag unit-customs-tag">на растamожке</span>',
+    reserved: '<span class="tag unit-reserved-tag">резерв</span>',
+  };
+  return map[u.display_status] || "";
+}
+
 function productPhClass(p) {
   return (p?.category || "phone") === "phone" ? "ph-phone" : "ph-accessory";
 }
@@ -279,6 +310,7 @@ const PAGE_TITLES = {
   analytics: "Аналитика",
   settings: "Настройки",
   stocktake: "Инвентаризация",
+  reservations: "Резервы",
 };
 
 function defaultWarehouseId() {
@@ -431,6 +463,7 @@ function navigate(page) {
     "trade-in": loadTradeInPage,
     shifts: loadShiftsPage,
     imei: loadImeiPage,
+    reservations: loadReservationsPage,
     users: loadUsersPage,
     settings: loadSettingsPage,
     stocktake: loadStocktakePage,
@@ -518,6 +551,7 @@ async function init() {
     bindAnalytics();
     bindShifts();
     bindImei();
+    bindReservations();
     bindUsers();
     bindSettings();
     bindStocktake();
@@ -579,6 +613,36 @@ async function loadDashboard() {
         ${sup.map((s) => `<tr><td>${esc(s.supplier_name)}</td><td><strong>${fmt(s.balance)}</strong></td></tr>`).join("")}
        </tbody></table>`
     : '<p style="color:var(--muted)">Нет задолженности</p>';
+
+  const alerts = d.alerts || {};
+  const alertCard = document.getElementById("dash-alerts-card");
+  const alertBody = document.getElementById("dash-alerts");
+  const hasAlerts = (alerts.imei_pending_stale || 0) > 0 || (alerts.no_imei_stock || 0) > 0
+    || (alerts.pending_customs || 0) > 0 || (alerts.active_reservations || 0) > 0;
+  alertCard?.classList.toggle("hidden", !hasAlerts);
+  if (alertBody && hasAlerts) {
+    const rows = [];
+    if (alerts.imei_pending_stale > 0) {
+      rows.push(`<div class="dash-alert dash-alert-warn"><strong>⚠ IMEI не внесён &gt; 3 дней: ${alerts.imei_pending_stale}</strong>
+        <button class="btn btn-ghost btn-sm" onclick="navigate('imei')">Открыть IMEI</button></div>`);
+    }
+    if (alerts.no_imei_stock > 0) {
+      rows.push(`<div class="dash-alert"><span>На складе без IMEI: <strong>${alerts.no_imei_stock}</strong></span></div>`);
+    }
+    if (alerts.pending_customs > 0) {
+      rows.push(`<div class="dash-alert"><span>На растamожке: <strong>${alerts.pending_customs}</strong></span></div>`);
+    }
+    if (alerts.active_reservations > 0) {
+      rows.push(`<div class="dash-alert"><span>Активных резервов: <strong>${alerts.active_reservations}</strong></span>
+        <button class="btn btn-ghost btn-sm" onclick="navigate('reservations')">Резервы</button></div>`);
+    }
+    if (alerts.stale_imei_items?.length) {
+      rows.push(`<table class="data-table" style="margin-top:.5rem"><thead><tr><th>Чек</th><th>Дата</th><th>Товар</th><th>Серийник</th></tr></thead><tbody>
+        ${alerts.stale_imei_items.map((r) => `<tr><td>#${r.sale_id}</td><td>${r.created_at}</td><td>${esc(r.product_name)}</td><td>${esc(r.serial || "—")}</td></tr>`).join("")}
+      </tbody></table>`);
+    }
+    alertBody.innerHTML = rows.join("");
+  }
 }
 
 /* ── POS ── */
@@ -597,23 +661,27 @@ function bindPos() {
     e.preventDefault();
     const whId = +document.getElementById("pos-warehouse").value;
     const byBarcode = products.find((x) => x.barcode === q && whStock(x, whId) > 0);
-    if (byBarcode) { await addToCart(byBarcode.id); e.target.value = ""; loadProducts(); return; }
+    if (byBarcode) { await addToCart(byBarcode.id); e.target.value = ""; scanBeep(true); loadProducts(); return; }
     try {
       const hit = await api(`/api/units/lookup?q=${encodeURIComponent(q)}&warehouse_id=${whId}`);
       if (hit.match_type === "unit" && hit.matches.length === 1) {
         const u = hit.matches[0];
+        if (u.is_reserved) toast("Устройство в резерве — можно продать клиенту", "info");
         await addToCart(u.product_id, u.id);
         e.target.value = "";
+        scanBeep(true);
         loadProducts();
         return;
       }
       if (hit.match_type === "unit" && hit.matches.length > 1) {
+        scanBeep(false);
         toast(`Найдено ${hit.matches.length} устройств — уточните IMEI`, "error");
         return;
       }
       if (hit.match_type === "product" && hit.matches.length === 1) {
         await addToCart(hit.matches[0].id);
         e.target.value = "";
+        scanBeep(true);
         loadProducts();
         return;
       }
@@ -640,6 +708,7 @@ async function loadPos() {
   const catEl = document.getElementById("pos-category");
   if (catEl) catEl.closest(".toolbar")?.classList.toggle("hidden", currentUser?.role === "accessories");
   await loadProducts();
+  focusScanInput("pos-search");
 }
 
 async function loadProducts() {
@@ -688,9 +757,21 @@ async function addToCart(id, preselectedUnitId = null) {
   if (!p || stock <= 0) return;
   if (p.track_units) {
     if (preselectedUnitId) {
-      const units = await api(`/api/products/${p.id}/units?warehouse_id=${whId}&status=in_stock`);
-      const picked = units.find((u) => u.id === preselectedUnitId);
-      if (!picked) { toast("Устройство недоступно", "error"); return; }
+      let picked;
+      try {
+        picked = await api(`/api/units/${preselectedUnitId}`);
+      } catch {
+        toast("Устройство недоступно", "error");
+        return;
+      }
+      if (!picked || !["in_stock", "reserved"].includes(picked.status)) {
+        toast("Устройство недоступно", "error");
+        return;
+      }
+      if (+picked.warehouse_id !== whId) {
+        toast("Устройство на другом складе", "error");
+        return;
+      }
       const used = cart.flatMap((c) => c.unit_ids || []);
       if (used.includes(picked.id)) { toast("Уже в чеке", "error"); return; }
       let unitMeta = null;
@@ -1243,7 +1324,7 @@ async function loadWarehouseStock() {
   tb.innerHTML = items.map((p) => {
     const unitsHtml = p.units?.length
       ? `<details class="units-details"><summary>${p.units.length} шт.</summary><div class="units-list">${p.units.map((u) =>
-          `<div class="unit-chip ${u.has_imei === false ? "unit-no-imei" : ""}">${u.imei ? esc(u.imei) : esc(u.serial || "—")}${u.product_color || p.color ? ` · ${esc(u.product_color || p.color)}` : ""}</div>`
+          `<div class="unit-chip ${u.has_imei === false ? "unit-no-imei" : ""}${u.display_status === "pending_customs" ? " unit-pending-customs" : ""}${u.display_status === "reserved" ? " unit-reserved" : ""}">${u.imei ? esc(u.imei) : esc(u.serial || "—")}${u.product_color || p.color ? ` · ${esc(u.product_color || p.color)}` : ""}${unitStatusBadge(u)}</div>`
         ).join("")}</div></details>`
       : "—";
     return `<tr>
@@ -1751,8 +1832,10 @@ function bindImeiExtras() {
       document.getElementById("imei-bulk-card")?.classList.toggle("hidden", v !== "register");
       document.getElementById("imei-panel-pending-stock").classList.toggle("hidden", v !== "pending-stock");
       document.getElementById("imei-panel-pending-sale").classList.toggle("hidden", v !== "pending-sale");
+      document.getElementById("imei-panel-import")?.classList.toggle("hidden", v !== "import");
       if (v === "pending-stock") loadImeiPendingStock();
       if (v === "pending-sale") loadImeiPendingSale();
+      if (v === "import") bindImeiImportOnce();
     };
   });
   document.getElementById("bulk-units-form")?.addEventListener("submit", async (e) => {
@@ -1765,6 +1848,7 @@ function bindImeiExtras() {
           warehouse_id: +document.getElementById("bulk-warehouse").value,
           quantity: +document.getElementById("bulk-qty").value,
           serial_prefix: document.getElementById("bulk-prefix").value.trim(),
+          mark_pending_customs: document.getElementById("bulk-pending-customs")?.checked ? 1 : 0,
         }),
       });
       toast(`Создано ${res.created} устройств`);
@@ -1822,7 +1906,9 @@ async function loadImeiPage() {
     bulkProd.innerHTML = prods.map((p) => `<option value="${p.id}">${esc(p.name)} ${p.color ? "· " + esc(p.color) : ""}</option>`).join("");
   }
   bindImeiExtras();
+  fillWarehouseSelect(document.getElementById("imei-import-wh"), defaultWarehouseId());
   await loadImeiList();
+  focusScanInput("imei-search");
 }
 
 async function loadImeiList() {
@@ -1831,18 +1917,156 @@ async function loadImeiList() {
   let url = `/api/units?status=in_stock&q=${encodeURIComponent(q)}`;
   if (wh) url += `&warehouse_id=${wh}`;
   const units = await api(url);
-  const statusLabel = (s) => ({ in_stock: "На складе", sold: "Продан" }[s] || s);
+  const statusLabel = (u) => ({
+    in_stock: "На складе", sold: "Продан", reserved: "Резерв",
+  }[u.status] || u.status);
   document.getElementById("imei-tbody").innerHTML = units.map((u) => `
     <tr>
-      <td><strong>${dash(u.imei)}</strong>${!u.has_imei ? ' <span class="tag unit-no-imei-tag">нет IMEI</span>' : ""}</td>
+      <td><strong>${dash(u.imei)}</strong> ${unitStatusBadge(u)}</td>
       <td>${dash(u.serial)}</td>
       <td>${esc(u.product_name)}</td>
       <td>${dash(u.product_color)}</td>
       <td>${esc(u.warehouse_name)}</td>
-      <td>${statusLabel(u.status)}</td>
-      <td><button class="btn btn-ghost btn-sm" onclick="deleteUnit(${u.id})">Удалить</button></td>
+      <td>${statusLabel(u)}</td>
+      <td class="imei-actions">
+        ${u.box_image_url ? `<a href="${esc(u.box_image_url)}" target="_blank" class="btn btn-ghost btn-sm">📷</a>` : ""}
+        <button class="btn btn-ghost btn-sm" onclick="printUnitLabel(${u.id})" title="Этикетка">🏷</button>
+        ${u.status === "in_stock" ? `<button class="btn btn-ghost btn-sm" onclick="openReserveModal(${u.id})">Резерв</button>` : ""}
+        ${u.customs_status === "pending" ? `<button class="btn btn-ghost btn-sm" onclick="setUnitCustoms(${u.id}, 'cleared')">✓ таможня</button>` : `<button class="btn btn-ghost btn-sm" onclick="setUnitCustoms(${u.id}, 'pending')">Таможня</button>`}
+        <label class="btn btn-ghost btn-sm" style="cursor:pointer">Фото<input type="file" accept="image/*" hidden onchange="uploadUnitPhoto(${u.id}, this)"></label>
+        <button class="btn btn-ghost btn-sm" onclick="deleteUnit(${u.id})">✕</button>
+      </td>
     </tr>`).join("") || '<tr><td colspan="7" style="text-align:center;color:var(--muted)">Нет записей</td></tr>';
 }
+
+window.printUnitLabel = async (unitId) => {
+  try {
+    const d = await api(`/api/units/${unitId}/label`);
+    const qr = `https://api.qrserver.com/v1/create-qr-code/?size=140x140&data=${encodeURIComponent(d.qr_data)}`;
+    const w = window.open("", "_blank", "width=320,height=420");
+    if (!w) { toast("Разрешите всплывающие окна", "error"); return; }
+    w.document.write(`<!DOCTYPE html><html><head><title>Этикетка ${esc(d.serial)}</title>
+      <style>body{font-family:sans-serif;text-align:center;padding:12px} .s{font-size:11px;color:#666}
+      img{margin:8px 0} @media print{button{display:none}}</style></head><body>
+      <div><strong>TeleStore</strong></div>
+      <div>${esc(d.product_name)}</div>
+      <div class="s">${esc(d.model)} · ${esc(d.color)}</div>
+      <div style="font-size:1.1rem;margin:6px 0"><strong>${esc(d.serial || "—")}</strong></div>
+      ${d.imei ? `<div class="s">IMEI: ${esc(d.imei)}</div>` : ""}
+      <img src="${qr}" width="140" height="140" alt="QR">
+      <br><button onclick="window.print()">Печать</button></body></html>`);
+    w.document.close();
+  } catch (e) { toast(e.message, "error"); }
+};
+
+window.uploadUnitPhoto = async (unitId, input) => {
+  const file = input.files?.[0];
+  if (!file) return;
+  try {
+    const fd = new FormData();
+    fd.append("file", file);
+    const res = await fetch(`/api/units/${unitId}/photo`, {
+      method: "POST",
+      headers: { "X-Pin": pin },
+      body: fd,
+    });
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || "Ошибка загрузки");
+    toast("Фото сохранено");
+    loadImeiList();
+  } catch (e) { toast(e.message, "error"); }
+  input.value = "";
+};
+
+window.setUnitCustoms = async (unitId, status) => {
+  try {
+    await api(`/api/units/${unitId}/customs-status`, { method: "PATCH", body: JSON.stringify({ customs_status: status }) });
+    toast(status === "pending" ? "На растamожке" : "Таможня пройдена");
+    loadImeiList();
+  } catch (e) { toast(e.message, "error"); }
+};
+
+window.openReserveModal = async (unitId) => {
+  document.getElementById("reserve-unit-id").value = unitId;
+  const u = await api(`/api/units/${unitId}`);
+  document.getElementById("reserve-unit-info").textContent =
+    `${u.product_name} · ${u.serial || u.imei || "#" + u.id}`;
+  const until = new Date();
+  until.setDate(until.getDate() + 2);
+  document.getElementById("reserve-until").value = until.toISOString().slice(0, 16);
+  document.getElementById("reserve-modal").showModal();
+};
+
+let imeiImportBound = false;
+function bindImeiImportOnce() {
+  if (imeiImportBound) return;
+  imeiImportBound = true;
+  document.getElementById("imei-import-form")?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const file = document.getElementById("imei-import-file").files?.[0];
+    if (!file) { toast("Выберите CSV", "error"); return; }
+    const wh = document.getElementById("imei-import-wh")?.value || "";
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      let url = "/api/units/import-csv";
+      if (wh) url += `?warehouse_id=${wh}`;
+      const res = await fetch(url, { method: "POST", headers: { "X-Pin": pin }, body: fd });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Ошибка импорта");
+      toast(`Импорт: ${data.created} шт.${data.errors?.length ? `, ошибок: ${data.errors.length}` : ""}`);
+      if (data.errors?.length) console.warn(data.errors);
+      loadImeiList();
+    } catch (err) { toast(err.message, "error"); }
+  });
+}
+
+function bindReservations() {
+  document.getElementById("reserve-form")?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    try {
+      await api("/api/reservations", {
+        method: "POST",
+        body: JSON.stringify({
+          unit_id: +document.getElementById("reserve-unit-id").value,
+          client_name: document.getElementById("reserve-client").value.trim(),
+          client_phone: document.getElementById("reserve-phone").value.trim(),
+          notes: document.getElementById("reserve-notes").value.trim(),
+          reserved_until: document.getElementById("reserve-until").value,
+        }),
+      });
+      document.getElementById("reserve-modal").close();
+      toast("Резерв создан");
+      loadReservationsPage();
+      loadImeiList();
+    } catch (err) { toast(err.message, "error"); }
+  });
+  document.getElementById("reserve-cancel")?.addEventListener("click", () => document.getElementById("reserve-modal").close());
+}
+
+async function loadReservationsPage() {
+  const rows = await api("/api/reservations?status=active");
+  document.getElementById("reservations-tbody").innerHTML = rows.map((r) => `
+    <tr>
+      <td>${esc(r.client_name)}</td>
+      <td>${dash(r.client_phone)}</td>
+      <td>${esc(r.product_name)} ${dash(r.product_color)}</td>
+      <td>${dash(r.serial || r.imei)}</td>
+      <td>${esc(r.warehouse_name)}</td>
+      <td>${r.reserved_until}</td>
+      <td>${esc(r.user_name)}</td>
+      <td><button class="btn btn-ghost btn-sm" onclick="cancelReservation(${r.id})">Снять</button></td>
+    </tr>`).join("") || '<tr><td colspan="8" style="text-align:center;color:var(--muted)">Нет активных резервов</td></tr>';
+}
+
+window.cancelReservation = async (id) => {
+  if (!confirm("Снять резерв?")) return;
+  try {
+    await api(`/api/reservations/${id}`, { method: "DELETE" });
+    toast("Резерв снят");
+    loadReservationsPage();
+    loadImeiList();
+  } catch (e) { toast(e.message, "error"); }
+};
 
 window.deleteUnit = async (id) => {
   if (!confirm("Удалить IMEI с учёта?")) return;
@@ -2711,13 +2935,14 @@ function bindStocktake() {
       });
       input.value = "";
       input.focus();
+      scanBeep(true);
       const last = stocktakeData.lines[0];
       document.getElementById("st-last-scan").textContent = last
         ? `+ ${last.product_name}${last.imei ? ` · ${last.imei}` : ""}${last.serial ? ` · ${last.serial}` : ""}`
         : "";
       renderStocktake();
       toast("Добавлено");
-    } catch (err) { toast(err.message, "error"); }
+    } catch (err) { scanBeep(false); toast(err.message, "error"); }
   });
 }
 

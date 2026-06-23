@@ -1539,4 +1539,14 @@ body {
 
 .unit-no-imei { border-color: #f59e0b !important; background: rgba(245, 158, 11, 0.12) !important; }
 .unit-no-imei-tag { font-size: 0.65rem !important; background: rgba(245, 158, 11, 0.2) !important; color: #b45309 !important; }
+.unit-customs-tag { font-size: 0.65rem !important; background: rgba(59, 130, 246, 0.2) !important; color: #1d4ed8 !important; }
+.unit-reserved-tag { font-size: 0.65rem !important; background: rgba(168, 85, 247, 0.2) !important; color: #7e22ce !important; }
+.unit-pending-customs { border-color: #3b82f6 !important; background: rgba(59, 130, 246, 0.1) !important; }
+.unit-reserved { border-color: #a855f7 !important; background: rgba(168, 85, 247, 0.1) !important; }
+.dash-alert { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; padding: 0.6rem 0; border-bottom: 1px solid var(--border); }
+.dash-alert:last-child { border-bottom: none; }
+.dash-alert-warn { color: #b45309; }
+.imei-actions { white-space: nowrap; }
+.imei-actions .btn-sm { padding: 0.2rem 0.4rem; font-size: 0.75rem; }
+.check-row { display: flex; align-items: center; gap: 0.5rem; font-size: 0.9rem; }
 .input-sm { padding: 0.25rem 0.5rem; font-size: 0.85rem; }
