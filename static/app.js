@@ -297,7 +297,6 @@ const PAGE_TITLES = {
   dashboard: "Обзор",
   pos: "Касса",
   sales: "Продажи",
-  catalog: "Каталог",
   warehouses: "Склады",
   "products-own": "Собственные товары",
   "products-consignment": "Товары под реализацию",
@@ -438,6 +437,7 @@ function debounce(fn, ms) {
 }
 
 function navigate(page) {
+  if (page === "catalog") page = "warehouses";
   if (!canAccess(page)) {
     page = firstAllowedPage();
   }
@@ -455,7 +455,6 @@ function navigate(page) {
     dashboard: loadDashboard,
     pos: loadPos,
     sales: loadSales,
-    catalog: loadCatalog,
     warehouses: loadWarehousesPage,
     "products-own": loadOwnProducts,
     "products-consignment": loadConsProducts,
@@ -1243,14 +1242,33 @@ window.openCatalogDetail = async (id) => {
 };
 
 /* ── Warehouses ── */
+let inboundMode = "new";
+let inboundExistingProduct = null;
+
 function bindWarehouses() {
   document.getElementById("warehouse-cancel").onclick = () => document.getElementById("warehouse-modal").close();
   document.getElementById("warehouse-form").onsubmit = saveWarehouse;
   document.getElementById("stock-move-cancel").onclick = () => document.getElementById("stock-move-modal").close();
   document.getElementById("stock-move-form").onsubmit = submitStockMove;
-  document.getElementById("wh-btn-inbound").onclick = () => openStockMoveModal("inbound");
+  document.getElementById("wh-btn-inbound").onclick = () => openInboundModal();
   document.getElementById("wh-btn-outbound").onclick = () => openStockMoveModal("outbound");
   document.getElementById("wh-btn-transfer").onclick = () => openStockMoveModal("transfer");
+  document.getElementById("inbound-cancel")?.addEventListener("click", () => document.getElementById("inbound-modal").close());
+  document.getElementById("inbound-form")?.addEventListener("submit", submitInboundReceipt);
+  document.querySelectorAll("#inbound-mode-tabs .seg").forEach((b) => {
+    b.addEventListener("click", () => {
+      document.querySelectorAll("#inbound-mode-tabs .seg").forEach((x) => x.classList.remove("active"));
+      b.classList.add("active");
+      inboundMode = b.dataset.inboundMode;
+      document.getElementById("inbound-panel-new").classList.toggle("hidden", inboundMode !== "new");
+      document.getElementById("inbound-panel-existing").classList.toggle("hidden", inboundMode !== "existing");
+      updateInboundFields();
+    });
+  });
+  ["ib-category", "ib-condition", "ib-ownership"].forEach((id) => {
+    document.getElementById(id)?.addEventListener("change", updateInboundFields);
+  });
+  document.getElementById("ib-existing-product")?.addEventListener("change", onInboundExistingSelect);
   document.getElementById("wh-show-total").onclick = () => {
     whStockViewTotal = !whStockViewTotal;
     document.getElementById("wh-show-total").textContent = whStockViewTotal
@@ -1317,14 +1335,14 @@ async function loadWarehouseStock() {
   const wh = warehouses.find((w) => w.id === selectedWarehouseId);
   title.textContent = wh ? `Остатки: ${wh.name}` : "Остатки склада";
   if (!selectedWarehouseId) {
-    tb.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--muted)">Выберите склад</td></tr>';
+    tb.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--muted)">Выберите склад</td></tr>';
     return;
   }
   const items = await api(`/api/warehouses/${selectedWarehouseId}/stock`);
   tb.innerHTML = items.map((p) => {
     const unitsHtml = p.units?.length
       ? `<details class="units-details"><summary>${p.units.length} шт.</summary><div class="units-list">${p.units.map((u) =>
-          `<div class="unit-chip ${u.has_imei === false ? "unit-no-imei" : ""}${u.display_status === "pending_customs" ? " unit-pending-customs" : ""}${u.display_status === "reserved" ? " unit-reserved" : ""}">${u.imei ? esc(u.imei) : esc(u.serial || "—")}${u.product_color || p.color ? ` · ${esc(u.product_color || p.color)}` : ""}${unitStatusBadge(u)}</div>`
+          `<div class="unit-chip ${u.has_imei === false ? "unit-no-imei" : ""}${u.display_status === "pending_customs" ? " unit-pending-customs" : ""}${u.display_status === "reserved" ? " unit-reserved" : ""}">${u.imei ? esc(u.imei) : esc(u.serial || "—")}${u.battery_capacity != null ? ` · 🔋${u.battery_capacity}%` : ""}${u.product_color || p.color ? ` · ${esc(u.product_color || p.color)}` : ""}${unitStatusBadge(u)}</div>`
         ).join("")}</div></details>`
       : "—";
     return `<tr>
@@ -1332,10 +1350,11 @@ async function loadWarehouseStock() {
       <td>${dash(p.model)}</td>
       <td>${dash(p.color)}</td>
       <td><span class="tag tag-${p.category}">${catLabel(p.category)}</span></td>
+      <td>${fmt(p.purchase_price)}</td>
       <td><strong>${p.warehouse_quantity}</strong></td>
       <td>${unitsHtml}</td>
     </tr>`;
-  }).join("") || '<tr><td colspan="6" style="text-align:center;color:var(--muted)">Нет остатков</td></tr>';
+  }).join("") || '<tr><td colspan="7" style="text-align:center;color:var(--muted)">Нет остатков</td></tr>';
 }
 
 window.openWarehouseModal = (wh = null) => {
@@ -1390,6 +1409,135 @@ window.deleteWarehouse = async (id) => {
   } catch (e) { toast(e.message, "error"); }
 };
 
+function isUsedCondition(c) {
+  return c === "used" || c === "refurbished";
+}
+
+function updateInboundFields() {
+  const isNew = inboundMode === "new";
+  let track = false;
+  let cond = "new";
+  if (isNew) {
+    track = document.getElementById("ib-category")?.value === "phone";
+    cond = document.getElementById("ib-condition")?.value || "new";
+    document.getElementById("ib-supplier-row")?.classList.toggle("hidden", document.getElementById("ib-ownership")?.value !== "consignment");
+  } else {
+    track = !!inboundExistingProduct?.track_units;
+    cond = inboundExistingProduct?.condition || "new";
+  }
+  document.getElementById("inbound-device-block")?.classList.toggle("hidden", !track);
+  document.getElementById("ib-qty-row")?.classList.toggle("hidden", !isNew || track);
+  document.getElementById("ib-existing-qty-row")?.classList.toggle("hidden", isNew || track);
+  document.getElementById("ib-battery-row")?.classList.toggle("hidden", !isUsedCondition(cond));
+}
+
+async function onInboundExistingSelect() {
+  const id = +document.getElementById("ib-existing-product").value;
+  if (!id) {
+    inboundExistingProduct = null;
+    document.getElementById("ib-existing-meta").innerHTML = "";
+    updateInboundFields();
+    return;
+  }
+  inboundExistingProduct = await api(`/api/products/${id}`);
+  document.getElementById("ib-existing-meta").innerHTML = `
+    <div class="metric-row"><span>Закупка</span><strong>${fmt(inboundExistingProduct.purchase_price)}</strong></div>
+    <div class="metric-row"><span>Цена продажи</span><strong>${fmt(inboundExistingProduct.sale_price)}</strong></div>
+    <div class="metric-row"><span>Состояние</span><strong>${conditionLabel(inboundExistingProduct.condition)}</strong></div>
+    <div class="metric-row"><span>Категория</span><strong>${catLabel(inboundExistingProduct.category)}</strong></div>`;
+  updateInboundFields();
+}
+
+async function openInboundModal() {
+  if (!selectedWarehouseId) return;
+  const wh = warehouses.find((w) => w.id === selectedWarehouseId);
+  document.getElementById("inbound-wh-label").textContent = `Склад: ${wh?.name || selectedWarehouseId}`;
+  inboundMode = "new";
+  inboundExistingProduct = null;
+  document.querySelectorAll("#inbound-mode-tabs .seg").forEach((x) => x.classList.toggle("active", x.dataset.inboundMode === "new"));
+  document.getElementById("inbound-panel-new").classList.remove("hidden");
+  document.getElementById("inbound-panel-existing").classList.add("hidden");
+  ["ib-name", "ib-brand", "ib-model", "ib-color", "ib-memory", "ib-ram", "ib-sku", "ib-barcode", "ib-imei", "ib-serial", "ib-notes", "ib-supplier"].forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.value = "";
+  });
+  document.getElementById("ib-purchase").value = "";
+  document.getElementById("ib-sale").value = "";
+  document.getElementById("ib-qty").value = "1";
+  document.getElementById("ib-battery").value = "";
+  document.getElementById("ib-category").value = "phone";
+  document.getElementById("ib-condition").value = "new";
+  document.getElementById("ib-ownership").value = "own";
+  const products = await api("/api/products");
+  document.getElementById("ib-existing-product").innerHTML = products.map((p) =>
+    `<option value="${p.id}">${esc(p.name)}${p.color ? ` · ${esc(p.color)}` : ""}${p.track_units ? " ★" : ""}</option>`
+  ).join("") || '<option value="">Нет товаров</option>';
+  document.getElementById("ib-existing-meta").innerHTML = "";
+  updateInboundFields();
+  document.getElementById("inbound-modal").showModal();
+  focusScanInput("ib-imei");
+}
+
+async function submitInboundReceipt(e) {
+  e.preventDefault();
+  const batteryRaw = document.getElementById("ib-battery").value;
+  const battery = batteryRaw === "" ? null : +batteryRaw;
+  const body = {
+    warehouse_id: selectedWarehouseId,
+    mode: inboundMode,
+    imei: document.getElementById("ib-imei").value.trim(),
+    serial: document.getElementById("ib-serial").value.trim(),
+    battery_capacity: battery,
+    notes: document.getElementById("ib-notes").value.trim(),
+    quantity: inboundMode === "existing" && !inboundExistingProduct?.track_units
+      ? (+document.getElementById("ib-existing-qty").value || 1)
+      : (+document.getElementById("ib-qty").value || 1),
+  };
+  if (inboundMode === "new") {
+    const name = document.getElementById("ib-name").value.trim();
+    if (!name) { toast("Укажите название", "error"); return; }
+    body.product = {
+      name,
+      category: document.getElementById("ib-category").value,
+      ownership_type: document.getElementById("ib-ownership").value,
+      supplier_name: document.getElementById("ib-supplier").value.trim(),
+      brand: document.getElementById("ib-brand").value.trim(),
+      model: document.getElementById("ib-model").value.trim(),
+      color: document.getElementById("ib-color").value.trim(),
+      memory: document.getElementById("ib-memory").value.trim(),
+      ram: document.getElementById("ib-ram").value.trim(),
+      condition: document.getElementById("ib-condition").value,
+      purchase_price: +document.getElementById("ib-purchase").value,
+      sale_price: +document.getElementById("ib-sale").value,
+      sku: document.getElementById("ib-sku").value.trim(),
+      barcode: document.getElementById("ib-barcode").value.trim(),
+    };
+    if (isUsedCondition(body.product.condition) && battery == null) {
+      toast("Для Б/у укажите ёмкость батареи", "error");
+      return;
+    }
+  } else {
+    body.product_id = +document.getElementById("ib-existing-product").value;
+    if (!body.product_id) { toast("Выберите товар", "error"); return; }
+    if (isUsedCondition(inboundExistingProduct?.condition) && battery == null) {
+      toast("Для Б/у укажите ёмкость батареи", "error");
+      return;
+    }
+  }
+  try {
+    await api("/api/stock/inbound-receipt", { method: "POST", body: JSON.stringify(body) });
+    document.getElementById("inbound-modal").close();
+    toast("Товар принят на склад");
+    scanBeep(true);
+    loadWarehouseStock();
+    loadWarehouseMovements();
+    if (currentPage === "pos") loadProducts();
+  } catch (err) {
+    scanBeep(false);
+    toast(err.message, "error");
+  }
+}
+
 async function openStockMoveModal(type) {
   if (!selectedWarehouseId) return;
   document.getElementById("sm-type").value = type;
@@ -1399,15 +1547,10 @@ async function openStockMoveModal(type) {
   fillWarehouseSelect(document.getElementById("sm-to-warehouse"), null, { empty: true, emptyLabel: "— склад назначения —" });
 
   let productOptions;
-  if (type === "inbound") {
-    const all = await api("/api/products");
-    productOptions = all.map((p) => `<option value="${p.id}">${esc(p.name)} (${esc(p.sku)})</option>`).join("");
-  } else {
-    const stock = await api(`/api/warehouses/${selectedWarehouseId}/stock`);
-    productOptions = stock.map((p) =>
-      `<option value="${p.id}">${esc(p.name)} — ост: ${p.warehouse_quantity}</option>`
-    ).join("");
-  }
+  const stock = await api(`/api/warehouses/${selectedWarehouseId}/stock`);
+  productOptions = stock.map((p) =>
+    `<option value="${p.id}">${esc(p.name)} — ост: ${p.warehouse_quantity}</option>`
+  ).join("");
   document.getElementById("sm-product").innerHTML = productOptions || '<option value="">Нет товаров</option>';
   document.getElementById("sm-qty").value = "1";
   document.getElementById("sm-notes").value = "";

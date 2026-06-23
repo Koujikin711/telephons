@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/style.css?v=15">
+  <link rel="stylesheet" href="/static/style.css?v=16">
 </head>
 <body>
   <div class="mesh-bg" aria-hidden="true"></div>
@@ -53,9 +53,6 @@
           <span class="nav-icon">☰</span> Продажи
         </button>
         <div class="nav-group-label">Склад</div>
-        <button class="nav-item" data-page="catalog">
-          <span class="nav-icon">☷</span> Каталог
-        </button>
         <button class="nav-item" data-page="warehouses">
           <span class="nav-icon">▦</span> Склады
         </button>
@@ -196,45 +193,6 @@
           </table></div></div>
         </section>
 
-        <!-- CATALOG -->
-        <section id="page-catalog" class="page">
-          <div class="catalog-hero">
-            <div class="catalog-hero-text">
-              <h3>Каталог товаров</h3>
-              <p id="catalog-stats">Загрузка…</p>
-            </div>
-            <button type="button" class="btn btn-primary" data-action="product-add-own">+ Добавить товар</button>
-          </div>
-          <div class="catalog-filters">
-            <input type="search" id="catalog-search" class="input" placeholder="Название, IMEI (5 цифр), цвет, модель…">
-            <select id="catalog-category" class="select">
-              <option value="">Все категории</option>
-              <option value="phone">Телефоны</option>
-              <option value="accessory">Аксессуары</option>
-            </select>
-            <select id="catalog-ownership" class="select">
-              <option value="">Все типы</option>
-              <option value="own">Собственные</option>
-              <option value="consignment">Реализация</option>
-            </select>
-            <select id="catalog-color" class="select">
-              <option value="">Все цвета</option>
-            </select>
-            <select id="catalog-sort" class="select">
-              <option value="name">По названию</option>
-              <option value="price_asc">Цена ↑</option>
-              <option value="price_desc">Цена ↓</option>
-              <option value="stock">По остатку</option>
-            </select>
-          </div>
-          <div id="catalog-grid" class="catalog-grid"></div>
-          <div id="catalog-empty" class="catalog-empty hidden">
-            <div class="catalog-empty-icon">📦</div>
-            <p>Товары не найдены</p>
-            <button type="button" class="btn btn-secondary" data-action="product-add-own">Добавить первый товар</button>
-          </div>
-        </section>
-
         <!-- WAREHOUSES -->
         <section id="page-warehouses" class="page">
           <div class="grid-2 wh-layout">
@@ -252,7 +210,7 @@
               <div class="card-header">
                 <h3 id="wh-stock-title">Остатки склада</h3>
                 <div class="wh-actions">
-                  <button id="wh-btn-inbound" class="btn btn-secondary btn-sm" disabled>Приход</button>
+                  <button id="wh-btn-inbound" class="btn btn-primary btn-sm" disabled>Приход товара</button>
                   <button id="wh-btn-outbound" class="btn btn-secondary btn-sm" disabled>Расход</button>
                   <button id="wh-btn-transfer" class="btn btn-secondary btn-sm" disabled>Перемещение</button>
                 </div>
@@ -261,7 +219,7 @@
                 <button id="wh-show-total" class="btn btn-ghost btn-sm">Сводка по всем складам</button>
               </div>
               <div class="table-wrap"><table class="data-table">
-                <thead><tr><th>Товар</th><th>Модель</th><th>Цвет</th><th>Категория</th><th>Кол-во</th><th>Устройства</th></tr></thead>
+                <thead><tr><th>Товар</th><th>Модель</th><th>Цвет</th><th>Категория</th><th>Закупка</th><th>Кол-во</th><th>Устройства</th></tr></thead>
                 <tbody id="wh-stock-tbody"></tbody>
               </table></div>
             </div>
@@ -826,6 +784,70 @@
     </form>
   </dialog>
 
+  <dialog id="inbound-modal" class="modal modal-lg">
+    <form id="inbound-form" novalidate>
+      <h3>Приход на склад</h3>
+      <p class="hint" id="inbound-wh-label"></p>
+      <div class="segmented inbound-mode-tabs" id="inbound-mode-tabs">
+        <button type="button" class="seg active" data-inbound-mode="new">Новый товар</button>
+        <button type="button" class="seg" data-inbound-mode="existing">Существующий</button>
+      </div>
+      <div id="inbound-panel-new" class="inbound-panel">
+        <div class="form-row">
+          <label>Тип<select id="ib-ownership" class="select"><option value="own">Собственный</option><option value="consignment">Реализация</option></select></label>
+          <label>Категория<select id="ib-category" class="select"><option value="phone">Телефон</option><option value="accessory">Аксессуар</option></select></label>
+        </div>
+        <label id="ib-supplier-row" class="hidden">Поставщик<input id="ib-supplier" class="input"></label>
+        <label>Название<input id="ib-name" class="input" required placeholder="iPhone 15 Pro 256GB Black"></label>
+        <div class="form-row">
+          <label>Бренд<input id="ib-brand" class="input"></label>
+          <label>Модель<input id="ib-model" class="input"></label>
+        </div>
+        <div class="form-row">
+          <label>Цвет<input id="ib-color" class="input"></label>
+          <label>Память<input id="ib-memory" class="input" placeholder="256 ГБ"></label>
+        </div>
+        <div class="form-row">
+          <label>RAM<input id="ib-ram" class="input"></label>
+          <label>Состояние<select id="ib-condition" class="select">
+            <option value="new">Новый</option>
+            <option value="used">Б/у</option>
+            <option value="refurbished">Восстановленный</option>
+          </select></label>
+        </div>
+        <div class="form-row">
+          <label>Закупочная цена<input type="number" id="ib-purchase" class="input" min="0" step="0.01" required></label>
+          <label>Цена продажи<input type="number" id="ib-sale" class="input" min="0" step="0.01" required></label>
+        </div>
+        <div class="form-row">
+          <label>Артикул<input id="ib-sku" class="input"></label>
+          <label>Штрихкод<input id="ib-barcode" class="input"></label>
+        </div>
+        <label id="ib-qty-row">Количество<input type="number" id="ib-qty" class="input" min="1" value="1"></label>
+      </div>
+      <div id="inbound-panel-existing" class="inbound-panel hidden">
+        <label>Товар<select id="ib-existing-product" class="select"></select></label>
+        <div id="ib-existing-meta" class="inbound-product-meta"></div>
+        <label id="ib-existing-qty-row" class="hidden">Количество<input type="number" id="ib-existing-qty" class="input" min="1" value="1"></label>
+      </div>
+      <div id="inbound-device-block" class="inbound-device-block">
+        <h4 class="sub-heading">Устройство (IMEI)</h4>
+        <div class="form-row">
+          <label>IMEI<input id="ib-imei" class="input" placeholder="15 цифр"></label>
+          <label>Серийный номер<input id="ib-serial" class="input"></label>
+        </div>
+      </div>
+      <div id="ib-battery-row" class="hidden">
+        <label>Ёмкость батареи, % <span class="req">*</span><input type="number" id="ib-battery" class="input" min="0" max="100" placeholder="85"></label>
+      </div>
+      <label>Комментарий<input id="ib-notes" class="input"></label>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-ghost" id="inbound-cancel">Отмена</button>
+        <button type="submit" class="btn btn-primary">Принять на склад</button>
+      </div>
+    </form>
+  </dialog>
+
   <dialog id="stock-move-modal" class="modal">
     <form id="stock-move-form" method="dialog">
       <h3 id="stock-move-title">Движение</h3>
@@ -927,6 +949,6 @@
   </dialog>
 
   <div id="toast" class="toast"></div>
-  <script src="/static/app.js?v=15"></script>
+  <script src="/static/app.js?v=16"></script>
 </body>
 </html>

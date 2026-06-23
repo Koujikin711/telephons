@@ -39,16 +39,16 @@ DEFAULT_WAREHOUSE_NAME = "Основной склад"
 
 ROLE_PAGES: dict[str, list[str]] = {
     "owner": [
-        "dashboard", "pos", "sales", "catalog", "warehouses", "products-own",
+        "dashboard", "pos", "sales", "warehouses", "products-own",
         "products-consignment", "suppliers", "trade-in", "reports", "analytics",
         "shifts", "users", "imei", "reservations", "stocktake", "settings",
     ],
     "warehouse": [
-        "dashboard", "catalog", "warehouses", "products-own", "products-consignment",
+        "dashboard", "warehouses", "products-own", "products-consignment",
         "trade-in", "imei", "reservations", "stocktake",
     ],
     "cashier": ["dashboard", "pos", "sales", "trade-in", "shifts"],
-    "accessories": ["dashboard", "pos", "sales", "catalog", "products-own"],
+    "accessories": ["dashboard", "pos", "sales", "products-own"],
 }
 
 ROLE_LEVEL = {"cashier": 1, "accessories": 2, "warehouse": 2, "owner": 3}
@@ -281,6 +281,7 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     _add_column(conn, "sale_item_units", "imei_pending", "INTEGER NOT NULL DEFAULT 0")
     _add_column(conn, "product_units", "box_image_url", "TEXT DEFAULT ''")
     _add_column(conn, "product_units", "customs_status", "TEXT NOT NULL DEFAULT 'none'")
+    _add_column(conn, "product_units", "battery_capacity", "INTEGER")
     conn.execute(
         """
         UPDATE product_units SET customs_status = 'cleared'
@@ -1579,6 +1580,40 @@ class StockMovementIn(BaseModel):
     notes: str = ""
 
 
+class InboundProductNew(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    category: str = "phone"
+    ownership_type: OwnershipType = "own"
+    supplier_name: str = ""
+    brand: str = ""
+    sku: str = ""
+    barcode: str = ""
+    purchase_price: float = Field(ge=0)
+    sale_price: float = Field(ge=0)
+    min_stock: int = Field(ge=0, default=2)
+    model: str = ""
+    color: str = ""
+    size: str = ""
+    memory: str = ""
+    ram: str = ""
+    customs_cleared: int = Field(ge=0, le=1, default=0)
+    customs_price: float = Field(ge=0, default=0)
+    specs_extra: str = ""
+    condition: ProductCondition = "new"
+
+
+class InboundReceiptIn(BaseModel):
+    warehouse_id: int
+    mode: Literal["new", "existing"]
+    product_id: int | None = None
+    quantity: int = Field(default=1, ge=1)
+    imei: str = ""
+    serial: str = ""
+    battery_capacity: int | None = Field(default=None, ge=0, le=100)
+    notes: str = ""
+    product: InboundProductNew | None = None
+
+
 class StockTransferIn(BaseModel):
     product_id: int
     from_warehouse_id: int
@@ -2723,6 +2758,100 @@ async def stock_inbound(body: StockMovementIn, x_pin: str | None = Header(defaul
         )
         product = conn.execute("SELECT * FROM products WHERE id = ?", (body.product_id,)).fetchone()
         return enrich_product(conn, product) if product else {"ok": True}
+
+
+def _require_battery_for_used(condition: str, battery: int | None) -> None:
+    if condition in ("used", "refurbished") and battery is None:
+        raise HTTPException(status_code=400, detail="Для Б/у укажите ёмкость батареи (%)")
+
+
+@app.post("/api/stock/inbound-receipt")
+async def stock_inbound_receipt(body: InboundReceiptIn, x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin, min_role="warehouse")
+    with db() as conn:
+        wh_id = resolve_warehouse_id(conn, body.warehouse_id)
+        if body.mode == "new":
+            if not body.product:
+                raise HTTPException(status_code=400, detail="Заполните данные нового товара")
+            p = body.product
+            if p.ownership_type == "consignment" and not p.supplier_name.strip():
+                raise HTTPException(status_code=400, detail="Укажите поставщика для реализации")
+            _require_battery_for_used(p.condition, body.battery_capacity)
+            track = 1 if p.category == "phone" else 0
+            if track and not body.imei.strip() and not body.serial.strip():
+                raise HTTPException(status_code=400, detail="Укажите IMEI или серийный номер")
+            cur = conn.execute(
+                """
+                INSERT INTO products
+                (name, category, ownership_type, supplier_name, brand, sku, barcode,
+                 purchase_price, sale_price, stock, min_stock, created_at,
+                 model, color, size, memory, ram, customs_cleared, customs_price, specs_extra, condition, track_units, image_url)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '')
+                """,
+                (
+                    p.name, p.category, p.ownership_type, p.supplier_name.strip(),
+                    p.brand, p.sku, p.barcode, p.purchase_price, p.sale_price,
+                    p.min_stock, utc_now(),
+                    p.model, p.color, p.size, p.memory, p.ram,
+                    p.customs_cleared, p.customs_price, p.specs_extra, p.condition, track,
+                ),
+            )
+            product_id = int(cur.lastrowid)
+            product = conn.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
+        else:
+            if not body.product_id:
+                raise HTTPException(status_code=400, detail="Выберите товар")
+            product = conn.execute("SELECT * FROM products WHERE id = ?", (body.product_id,)).fetchone()
+            if not product:
+                raise HTTPException(status_code=404, detail="Товар не найден")
+            product_id = int(product["id"])
+            _require_battery_for_used(product["condition"], body.battery_capacity)
+            if int(product["track_units"] or 0) and not body.imei.strip() and not body.serial.strip():
+                raise HTTPException(status_code=400, detail="Укажите IMEI или серийный номер")
+
+        track = int(product["track_units"] or 0)
+        qty = 1 if track else body.quantity
+        unit_row = None
+        if track:
+            imei = body.imei.strip()
+            serial = body.serial.strip()
+            if imei:
+                dup = conn.execute(
+                    "SELECT id FROM product_units WHERE imei = ? AND status != 'sold'", (imei,)
+                ).fetchone()
+                if dup:
+                    raise HTTPException(status_code=400, detail="IMEI уже в системе")
+            cs = "pending" if not int(product["customs_cleared"] or 0) and product["category"] == "phone" else "none"
+            cur_u = conn.execute(
+                """
+                INSERT INTO product_units
+                (product_id, warehouse_id, imei, serial, status, notes, created_at,
+                 customs_status, customs_cleared, battery_capacity)
+                VALUES (?, ?, ?, ?, 'in_stock', ?, ?, ?, ?, ?)
+                """,
+                (
+                    product_id, wh_id, imei, serial,
+                    body.notes or "Приход на склад", utc_now(), cs,
+                    int(product["customs_cleared"] or 0), body.battery_capacity,
+                ),
+            )
+            unit_row = conn.execute("SELECT * FROM product_units WHERE id = ?", (cur_u.lastrowid,)).fetchone()
+            adjust_warehouse_stock(
+                conn, wh_id, product_id, 1, "inbound",
+                notes=f"Приход: {imei or serial or f'#{cur_u.lastrowid}'}",
+            )
+        else:
+            adjust_warehouse_stock(
+                conn, wh_id, product_id, qty, "inbound",
+                notes=body.notes or "Приход на склад",
+            )
+
+        product = conn.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
+        result = enrich_product(conn, product)
+        if unit_row:
+            result["unit"] = enrich_unit_row(unit_row)
+        return result
 
 
 @app.post("/api/stock/outbound")
