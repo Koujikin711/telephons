@@ -561,7 +561,7 @@ body {
 .card:hover { box-shadow: var(--shadow-lg); }
 
 .card-header {
-  padding: 1rem 1.25rem;
+  padding: 1.1rem 1.5rem;
   border-bottom: 1px solid var(--border);
   display: flex;
   align-items: center;
@@ -569,12 +569,12 @@ body {
   background: var(--gradient-soft);
 }
 .card-header h3 {
-  font-size: 0.88rem;
+  font-size: 0.95rem;
   font-weight: 700;
   color: var(--text-secondary);
   letter-spacing: 0.01em;
 }
-.card-body { padding: 1.25rem; }
+.card-body { padding: 1.35rem 1.5rem; }
 
 /* ── KPI ── */
 .kpi-grid {
@@ -639,7 +639,46 @@ body {
 .kpi.accent-warn .value { color: var(--warning); }
 
 .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1.25rem; }
-.grid-3 { display: grid; grid-template-columns: 2fr 1fr 1fr; gap: 1.25rem; }
+.grid-3 { display: grid; grid-template-columns: repeat(3, minmax(280px, 1fr)); gap: 1.25rem; }
+
+/* ── Analytics layout ── */
+.analytics-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(320px, 1fr));
+  gap: 1.25rem;
+  align-items: stretch;
+}
+.analytics-grid .card { margin-bottom: 0; }
+.analytics-grid .chart-card-wide { grid-column: 1 / -1; }
+.chart-card-body {
+  min-height: 240px;
+  display: flex;
+  flex-direction: column;
+}
+.chart-card-wide .chart-card-body { min-height: 280px; }
+.empty-state {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 160px;
+  padding: 2rem 1.5rem;
+  color: var(--muted);
+  font-size: 0.92rem;
+  font-weight: 500;
+  text-align: center;
+  line-height: 1.5;
+}
+.scope-split-panel { font-size: 0.9rem; }
+.scope-split-filter {
+  color: var(--muted);
+  font-size: 0.88rem;
+  margin: 0 0 1rem;
+  padding-bottom: 0.75rem;
+  border-bottom: 1px solid var(--border);
+}
+.top-products-list { display: flex; flex-direction: column; flex: 1; }
+
 .section-title { font-size: 1.05rem; font-weight: 700; margin: 1.5rem 0 0.85rem; letter-spacing: -0.01em; }
 
 /* ── Segmented control ── */
@@ -944,21 +983,25 @@ body {
 .metric-row {
   display: flex;
   justify-content: space-between;
-  padding: 0.45rem 0;
-  font-size: 0.88rem;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.65rem 0;
+  font-size: 0.9rem;
   font-weight: 500;
   border-bottom: 1px solid rgba(99, 102, 241, 0.06);
 }
+.metric-row span:first-child { flex: 1; min-width: 0; padding-right: 0.75rem; }
 .metric-row:last-child { border-bottom: none; }
-.metric-row strong { font-weight: 700; }
+.metric-row strong { font-weight: 700; white-space: nowrap; }
 
 /* ── Charts ── */
 .bar-chart {
   display: flex;
   align-items: flex-end;
-  gap: 4px;
-  height: 190px;
-  padding: 0.75rem 0;
+  gap: 6px;
+  height: 220px;
+  padding: 0.5rem 0.25rem 0.25rem;
+  flex: 1;
 }
 .bar-col {
   flex: 1;
@@ -989,16 +1032,19 @@ body {
 .top-item {
   display: flex;
   justify-content: space-between;
-  padding: 0.55rem 0;
+  align-items: flex-start;
+  gap: 1rem;
+  padding: 0.7rem 0;
   border-bottom: 1px solid var(--border);
-  font-size: 0.88rem;
+  font-size: 0.9rem;
   font-weight: 500;
   transition: padding-left var(--dur) var(--ease-out);
 }
+.top-item span:first-child { flex: 1; min-width: 0; padding-right: 0.75rem; line-height: 1.4; }
 .top-item:hover { padding-left: 4px; }
-.top-item .rev { font-weight: 800; color: var(--success); }
+.top-item .rev { font-weight: 800; color: var(--success); white-space: nowrap; flex-shrink: 0; }
 
-.chart-card { min-height: 280px; }
+.chart-card { min-height: 0; }
 
 /* ── Forms ── */
 .form-stack label {
@@ -1147,8 +1193,8 @@ body {
 }
 
 /* ── Split bars ── */
-.split-bar { margin: 0.55rem 0; }
-.split-row { display: flex; align-items: center; gap: 0.55rem; margin-bottom: 0.55rem; font-size: 0.88rem; font-weight: 500; }
+.split-bar { margin: 0.35rem 0 0.85rem; }
+.split-row { display: flex; align-items: center; gap: 0.65rem; margin-bottom: 0.65rem; font-size: 0.9rem; font-weight: 500; line-height: 1.4; }
 .split-bar-fill {
   height: 10px;
   border-radius: 99px;
@@ -1198,7 +1244,8 @@ body {
 
 /* ── Responsive ── */
 @media (max-width: 1100px) {
-  .grid-3, .compare-grid, .grid-2 { grid-template-columns: 1fr; }
+  .grid-3, .compare-grid, .grid-2, .analytics-grid { grid-template-columns: 1fr; }
+  .analytics-grid .chart-card-wide { grid-column: auto; }
   .pos-layout { grid-template-columns: 1fr; height: auto; }
 }
 

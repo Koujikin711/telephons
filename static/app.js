@@ -2892,11 +2892,11 @@ async function loadAnalytics() {
   document.getElementById("daily-chart").innerHTML = daily.map((d) => {
     const h = Math.round((d.revenue / maxR) * 150);
     return `<div class="bar-col" title="${d.day}: ${fmt(d.revenue)}"><div class="bar" style="height:${h}px"></div><span class="bl">${d.day.slice(5)}</span></div>`;
-  }).join("") || '<p style="color:var(--muted)">Нет данных</p>';
+  }).join("") || '<div class="empty-state">Нет данных за выбранный период</div>';
 
   document.getElementById("top-products").innerHTML = top.length
     ? top.map((t) => `<div class="top-item"><span>${esc(t.name)} <span class="tag tag-${t.ownership_type === "consignment" ? "cons" : "own"}" style="font-size:.6rem">${t.qty} шт</span></span><span class="rev">${fmt(t.revenue)}</span></div>`).join("")
-    : '<p style="color:var(--muted)">Нет данных</p>';
+    : '<div class="empty-state">Нет продаж за период</div>';
 
   if (analyticsScope === "all") {
     const [ownS, consS] = await Promise.all([
@@ -2909,13 +2909,13 @@ async function loadAnalytics() {
       <div class="split-bar"><div class="split-bar-fill"><div style="width:${pct(ownS.revenue, total)}%;background:var(--own)"></div></div></div>
       <div class="split-row"><span class="tag tag-cons">Реализация</span> ${fmt(consS.revenue)} (${pct(consS.revenue, total)}%)</div>
       <div class="split-bar"><div class="split-bar-fill"><div style="width:${pct(consS.revenue, total)}%;background:var(--consignment)"></div></div></div>
-      <div style="margin-top:.75rem;font-size:.85rem">
+      <div class="split-metrics">
         <div class="metric-row"><span>Прибыль (свои)</span><strong>${fmt(ownS.profit)}</strong></div>
         <div class="metric-row"><span>Комиссия (реализация)</span><strong>${fmt(consS.profit)}</strong></div>
       </div>`;
   } else {
-    document.getElementById("scope-split").innerHTML = `<p style="color:var(--muted);font-size:.85rem">Фильтр: ${scopeLabel(analyticsScope)}</p>
-      <div class="metric-row" style="margin-top:.5rem"><span>Прибыль</span><strong>${fmt(summary.profit)}</strong></div>`;
+    document.getElementById("scope-split").innerHTML = `<p class="scope-split-filter">Фильтр: ${scopeLabel(analyticsScope)}</p>
+      <div class="metric-row"><span>Прибыль</span><strong>${fmt(summary.profit)}</strong></div>`;
   }
 }
 

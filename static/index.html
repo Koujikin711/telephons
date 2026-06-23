@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/style.css?v=14">
+  <link rel="stylesheet" href="/static/style.css?v=15">
 </head>
 <body>
   <div class="mesh-bg" aria-hidden="true"></div>
@@ -702,18 +702,24 @@
             </select>
           </div>
           <div class="kpi-grid" id="analytics-kpi"></div>
-          <div class="grid-3">
-            <div class="card chart-card">
+          <div class="analytics-grid">
+            <div class="card chart-card chart-card-wide">
               <div class="card-header"><h3>Динамика выручки</h3></div>
-              <div id="daily-chart" class="bar-chart"></div>
+              <div class="card-body chart-card-body">
+                <div id="daily-chart" class="bar-chart"></div>
+              </div>
             </div>
             <div class="card chart-card">
               <div class="card-header"><h3>Топ товаров</h3></div>
-              <div id="top-products"></div>
+              <div class="card-body chart-card-body">
+                <div id="top-products" class="top-products-list"></div>
+              </div>
             </div>
             <div class="card chart-card">
               <div class="card-header"><h3>Структура</h3></div>
-              <div id="scope-split"></div>
+              <div class="card-body chart-card-body">
+                <div id="scope-split" class="scope-split-panel"></div>
+              </div>
             </div>
           </div>
         </section>
@@ -921,6 +927,6 @@
   </dialog>
 
   <div id="toast" class="toast"></div>
-  <script src="/static/app.js?v=14"></script>
+  <script src="/static/app.js?v=15"></script>
 </body>
 </html>
