@@ -274,6 +274,7 @@ const PAGE_TITLES = {
   reports: "Финансовые отчёты",
   analytics: "Аналитика",
   settings: "Настройки",
+  stocktake: "Инвентаризация",
 };
 
 function defaultWarehouseId() {
@@ -428,6 +429,7 @@ function navigate(page) {
     imei: loadImeiPage,
     users: loadUsersPage,
     settings: loadSettingsPage,
+    stocktake: loadStocktakePage,
     reports: loadReport,
     analytics: loadAnalytics,
   };
@@ -514,6 +516,7 @@ async function init() {
     bindImei();
     bindUsers();
     bindSettings();
+    bindStocktake();
     await loadWarehouses();
     navigate(firstAllowedPage());
   } catch (e) {
@@ -583,13 +586,35 @@ function bindPos() {
       loadProducts();
     }, 250));
   });
-  document.getElementById("pos-search").addEventListener("keydown", (e) => {
-    if (e.key === "Enter") {
-      const q = e.target.value.trim();
-      const whId = +document.getElementById("pos-warehouse").value;
-      const p = products.find((x) => x.barcode === q && whStock(x, whId) > 0);
-      if (p) { addToCart(p.id); e.target.value = ""; loadProducts(); }
-    }
+  document.getElementById("pos-search").addEventListener("keydown", async (e) => {
+    if (e.key !== "Enter") return;
+    const q = e.target.value.trim();
+    if (!q) return;
+    e.preventDefault();
+    const whId = +document.getElementById("pos-warehouse").value;
+    const byBarcode = products.find((x) => x.barcode === q && whStock(x, whId) > 0);
+    if (byBarcode) { await addToCart(byBarcode.id); e.target.value = ""; loadProducts(); return; }
+    try {
+      const hit = await api(`/api/units/lookup?q=${encodeURIComponent(q)}&warehouse_id=${whId}`);
+      if (hit.match_type === "unit" && hit.matches.length === 1) {
+        const u = hit.matches[0];
+        await addToCart(u.product_id, u.id);
+        e.target.value = "";
+        loadProducts();
+        return;
+      }
+      if (hit.match_type === "unit" && hit.matches.length > 1) {
+        toast(`Найдено ${hit.matches.length} устройств — уточните IMEI`, "error");
+        return;
+      }
+      if (hit.match_type === "product" && hit.matches.length === 1) {
+        await addToCart(hit.matches[0].id);
+        e.target.value = "";
+        loadProducts();
+        return;
+      }
+    } catch (err) { /* fall through to search */ }
+    loadProducts();
   });
   document.getElementById("split-fill-cash")?.addEventListener("click", () => {
     const total = cartTotalDue();
@@ -652,12 +677,22 @@ function renderPosProducts() {
   });
 }
 
-function addToCart(id) {
+async function addToCart(id, preselectedUnitId = null) {
   const whId = +document.getElementById("pos-warehouse").value;
   const p = products.find((x) => x.id === id);
   const stock = whStock(p, whId);
   if (!p || stock <= 0) return;
   if (p.track_units) {
+    if (preselectedUnitId) {
+      const units = await api(`/api/products/${p.id}/units?warehouse_id=${whId}&status=in_stock`);
+      const picked = units.find((u) => u.id === preselectedUnitId);
+      if (!picked) { toast("IMEI недоступен", "error"); return; }
+      const used = cart.flatMap((c) => c.unit_ids || []);
+      if (used.includes(picked.id)) { toast("Этот IMEI уже в чеке", "error"); return; }
+      cart.push({ product_id: id, quantity: 1, product: p, unit_ids: [picked.id], unit_labels: [picked.imei || picked.serial || `#${picked.id}`] });
+      renderCart();
+      return;
+    }
     pickImeiForProduct(p, whId).then((picked) => {
       if (!picked) return;
       const used = cart.flatMap((c) => c.unit_ids || []);
@@ -1110,14 +1145,21 @@ async function loadWarehouseStock() {
     return;
   }
   const items = await api(`/api/warehouses/${selectedWarehouseId}/stock`);
-  tb.innerHTML = items.map((p) => `
-    <tr>
+  tb.innerHTML = items.map((p) => {
+    const unitsHtml = p.units?.length
+      ? `<details class="units-details"><summary>${p.units.length} шт.</summary><div class="units-list">${p.units.map((u) =>
+          `<div class="unit-chip">${u.imei ? esc(u.imei) : esc(u.serial || "—")}${u.product_color || p.color ? ` · ${esc(u.product_color || p.color)}` : ""}</div>`
+        ).join("")}</div></details>`
+      : "—";
+    return `<tr>
       <td><strong>${esc(p.name)}</strong></td>
       <td>${dash(p.model)}</td>
       <td>${dash(p.color)}</td>
       <td><span class="tag tag-${p.category}">${catLabel(p.category)}</span></td>
       <td><strong>${p.warehouse_quantity}</strong></td>
-    </tr>`).join("") || '<tr><td colspan="5" style="text-align:center;color:var(--muted)">Нет остатков</td></tr>';
+      <td>${unitsHtml}</td>
+    </tr>`;
+  }).join("") || '<tr><td colspan="6" style="text-align:center;color:var(--muted)">Нет остатков</td></tr>';
 }
 
 window.openWarehouseModal = (wh = null) => {
@@ -1628,10 +1670,11 @@ async function loadImeiList() {
       <td><strong>${dash(u.imei)}</strong></td>
       <td>${dash(u.serial)}</td>
       <td>${esc(u.product_name)}</td>
+      <td>${dash(u.product_color)}</td>
       <td>${esc(u.warehouse_name)}</td>
       <td>${statusLabel(u.status)}</td>
       <td><button class="btn btn-ghost btn-sm" onclick="deleteUnit(${u.id})">Удалить</button></td>
-    </tr>`).join("") || '<tr><td colspan="6" style="text-align:center;color:var(--muted)">Нет записей</td></tr>';
+    </tr>`).join("") || '<tr><td colspan="7" style="text-align:center;color:var(--muted)">Нет записей</td></tr>';
 }
 
 window.deleteUnit = async (id) => {
@@ -2470,5 +2513,161 @@ async function loadAnalytics() {
       <div class="metric-row" style="margin-top:.5rem"><span>Прибыль</span><strong>${fmt(summary.profit)}</strong></div>`;
   }
 }
+
+/* ── Stocktake ── */
+let stocktakeData = null;
+
+function bindStocktake() {
+  document.getElementById("st-scan-form")?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const input = document.getElementById("st-scan-input");
+    const q = input.value.trim();
+    if (!q || !stocktakeData?.session) return;
+    try {
+      stocktakeData = await api(`/api/stocktake/${stocktakeData.session.id}/scan`, {
+        method: "POST",
+        body: JSON.stringify({ q }),
+      });
+      input.value = "";
+      input.focus();
+      const last = stocktakeData.lines[0];
+      document.getElementById("st-last-scan").textContent = last
+        ? `+ ${last.product_name}${last.imei ? ` · ${last.imei}` : ""}${last.serial ? ` · ${last.serial}` : ""}`
+        : "";
+      renderStocktake();
+      toast("Добавлено");
+    } catch (err) { toast(err.message, "error"); }
+  });
+}
+
+async function loadStocktakePage() {
+  if (!warehouses.length) await loadWarehouses();
+  try {
+    stocktakeData = await api("/api/stocktake/current");
+  } catch {
+    stocktakeData = { session: null };
+  }
+  renderStocktakeSessionPanel();
+  renderStocktake();
+}
+
+function renderStocktakeSessionPanel() {
+  const panel = document.getElementById("st-session-panel");
+  if (!panel) return;
+  if (stocktakeData?.session) {
+    const s = stocktakeData.session;
+    const wh = warehouses.find((w) => w.id === s.warehouse_id);
+    panel.innerHTML = `
+      <div class="metric-row"><span>Склад</span><strong>${esc(wh?.name || s.warehouse_id)}</strong></div>
+      <div class="metric-row"><span>Начата</span><strong>${s.started_at}</strong></div>
+      <div class="metric-row"><span>Отсканировано</span><strong>${stocktakeData.counted_total} / ${stocktakeData.expected_total}</strong></div>
+      <button type="button" class="btn btn-primary" style="margin-top:.75rem" id="st-complete-btn">Завершить и применить</button>
+      <p class="hint" style="margin-top:.5rem">Для аксессуаров расхождения скорректируют остаток. Телефоны — отчёт по IMEI.</p>`;
+    document.getElementById("st-complete-btn").onclick = completeStocktake;
+    return;
+  }
+  panel.innerHTML = `
+    <label>Склад<select id="st-wh-select" class="select">${warehouses.map((w) =>
+      `<option value="${w.id}">${esc(w.name)}</option>`).join("")}</select></label>
+    <label>Комментарий<input id="st-notes" class="input"></label>
+    <button type="button" class="btn btn-primary" style="margin-top:.75rem" id="st-start-btn">Начать инвентаризацию</button>`;
+  document.getElementById("st-start-btn").onclick = startStocktake;
+}
+
+async function startStocktake() {
+  try {
+    stocktakeData = await api("/api/stocktake/start", {
+      method: "POST",
+      body: JSON.stringify({
+        warehouse_id: +document.getElementById("st-wh-select").value,
+        notes: document.getElementById("st-notes").value,
+      }),
+    });
+    toast("Инвентаризация начата");
+    renderStocktakeSessionPanel();
+    renderStocktake();
+    document.getElementById("st-scan-input")?.focus();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function completeStocktake() {
+  if (!stocktakeData?.session) return;
+  if (!confirm("Завершить инвентаризацию? Остатки аксессуаров будут скорректированы.")) return;
+  try {
+    stocktakeData = await api(`/api/stocktake/${stocktakeData.session.id}/complete`, { method: "POST" });
+    toast("Инвентаризация завершена");
+    stocktakeData = { session: null };
+    renderStocktakeSessionPanel();
+    renderStocktake();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+function renderStocktake() {
+  const expTb = document.getElementById("st-expected-tbody");
+  const linesTb = document.getElementById("st-lines-tbody");
+  const varBody = document.getElementById("st-variance-body");
+  if (!expTb) return;
+  if (!stocktakeData?.session) {
+    expTb.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--muted)">Начните инвентаризацию</td></tr>';
+    linesTb.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--muted)">—</td></tr>';
+    if (varBody) varBody.innerHTML = "";
+    return;
+  }
+  const unitsByProduct = {};
+  (stocktakeData.expected?.units || []).forEach((u) => {
+    unitsByProduct[u.product_id] = unitsByProduct[u.product_id] || [];
+    unitsByProduct[u.product_id].push(u);
+  });
+  const scannedIds = new Set((stocktakeData.lines || []).filter((l) => l.unit_id).map((l) => l.unit_id));
+  expTb.innerHTML = (stocktakeData.expected?.products || []).map((p) => {
+    const units = unitsByProduct[p.id] || [];
+    const devs = units.length
+      ? units.map((u) => {
+          const ok = scannedIds.has(u.id);
+          return `<span class="unit-chip ${ok ? "unit-ok" : "unit-miss"}">${esc(u.imei || u.serial || "#" + u.id)}</span>`;
+        }).join("")
+      : `<button type="button" class="btn btn-ghost btn-sm" onclick="stCountProduct(${p.id})">+1</button>`;
+    return `<tr>
+      <td>${esc(p.name)}</td>
+      <td>${dash(p.color)}</td>
+      <td><strong>${p.qty}</strong></td>
+      <td><div class="units-list">${devs}</div></td>
+    </tr>`;
+  }).join("") || '<tr><td colspan="4">Пусто</td></tr>';
+  linesTb.innerHTML = (stocktakeData.lines || []).map((l) => `
+    <tr>
+      <td>${esc(l.product_name)}</td>
+      <td>${dash(l.imei)}${l.serial ? ` / ${esc(l.serial)}` : ""}</td>
+      <td>${dash(l.color)}</td>
+      <td><button type="button" class="btn btn-ghost btn-sm" onclick="stUndoLine(${l.id})">✕</button></td>
+    </tr>`).join("") || '<tr><td colspan="4" style="color:var(--muted)">Пока ничего</td></tr>';
+  const vars = stocktakeData.variances || [];
+  const missing = stocktakeData.missing_units || [];
+  if (varBody) {
+    varBody.innerHTML = vars.length || missing.length
+      ? `${vars.map((v) => `<div class="metric-row"><span>${esc(v.product_name)}${v.color ? ` (${esc(v.color)})` : ""}</span><strong>${v.counted} / ${v.expected} (${v.difference >= 0 ? "+" : ""}${v.difference})</strong></div>`).join("")}
+         ${missing.length ? `<p class="hint" style="margin-top:.75rem">Не отсканировано IMEI: ${missing.length}</p><div class="units-list">${missing.slice(0, 30).map((u) => `<span class="unit-chip unit-miss">${esc(u.imei || u.serial)}</span>`).join("")}${missing.length > 30 ? "…" : ""}</div>` : ""}`
+      : '<p style="color:var(--success)">Расхождений нет</p>';
+  }
+}
+
+window.stCountProduct = async (productId) => {
+  if (!stocktakeData?.session) return;
+  try {
+    stocktakeData = await api(`/api/stocktake/${stocktakeData.session.id}/count`, {
+      method: "POST", body: JSON.stringify({ product_id: productId, quantity: 1 }),
+    });
+    renderStocktake();
+    toast("+1");
+  } catch (e) { toast(e.message, "error"); }
+};
+
+window.stUndoLine = async (lineId) => {
+  if (!stocktakeData?.session) return;
+  try {
+    stocktakeData = await api(`/api/stocktake/${stocktakeData.session.id}/lines/${lineId}`, { method: "DELETE" });
+    renderStocktake();
+  } catch (e) { toast(e.message, "error"); }
+};
 
 init();

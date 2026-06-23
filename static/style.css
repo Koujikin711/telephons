@@ -1536,3 +1536,9 @@ body {
 .receipt .receipt-payments { margin-top: 0.5rem; border-top: 1px dashed var(--border); padding-top: 0.5rem; }
 .receipt .receipt-pay-row { display: flex; justify-content: space-between; margin: 0.2rem 0; font-size: 0.9rem; }
 .shift-actual-pay { margin-bottom: 0.5rem; }
+
+.units-list { display: flex; flex-wrap: wrap; gap: 0.35rem; }
+.unit-chip { font-size: 0.75rem; padding: 0.2rem 0.45rem; border-radius: 6px; background: var(--surface-2, #f0f2f5); border: 1px solid var(--border, #ddd); font-family: monospace; }
+.unit-ok { background: rgba(34, 197, 94, 0.15); border-color: var(--success, #22c55e); }
+.unit-miss { background: rgba(239, 68, 68, 0.1); border-color: var(--danger, #ef4444); }
+.units-details summary { cursor: pointer; color: var(--accent, #3b82f6); font-size: 0.85rem; }

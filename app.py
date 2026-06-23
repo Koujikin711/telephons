@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import logging
 import os
 import sqlite3
@@ -38,11 +39,11 @@ ROLE_PAGES: dict[str, list[str]] = {
     "owner": [
         "dashboard", "pos", "sales", "catalog", "warehouses", "products-own",
         "products-consignment", "suppliers", "trade-in", "reports", "analytics",
-        "shifts", "users", "imei", "settings",
+        "shifts", "users", "imei", "stocktake", "settings",
     ],
     "warehouse": [
         "dashboard", "catalog", "warehouses", "products-own", "products-consignment",
-        "trade-in", "imei",
+        "trade-in", "imei", "stocktake",
     ],
     "cashier": ["dashboard", "pos", "sales", "trade-in", "shifts"],
     "accessories": ["dashboard", "pos", "sales", "catalog", "products-own"],
@@ -71,6 +72,119 @@ def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     if row is None:
         return None
     return dict(row)
+
+
+
+def normalize_search_q(q: str) -> str:
+    return q.strip()
+
+
+def only_digits(s: str) -> str:
+    return re.sub(r"\D", "", s)
+
+
+def is_code_query(q: str) -> bool:
+    """Digits-only query (IMEI fragment, barcode)."""
+    d = only_digits(q)
+    return len(d) >= 5 and len(d) == len(q.replace(" ", "").replace("-", ""))
+
+
+def product_search_sql(q: str) -> tuple[str, list[Any]]:
+    q = normalize_search_q(q)
+    if not q:
+        return "", []
+    like = f"%{q}%"
+    fields = (
+        "p.name", "p.brand", "p.sku", "p.barcode", "p.supplier_name",
+        "p.model", "p.color", "p.memory", "p.specs_extra", "p.ram",
+    )
+    text = " OR ".join(f"LOWER({f}) LIKE LOWER(?)" for f in fields)
+    params: list[Any] = [like] * len(fields)
+    d = only_digits(q)
+    if len(d) >= 5 and re.fullmatch(r"[\d\s-]+", q):
+        suffix = d[-min(len(d), 15):]
+        unit_sql = """
+            OR EXISTS (
+                SELECT 1 FROM product_units u
+                WHERE u.product_id = p.id AND u.status = 'in_stock'
+                  AND (u.imei LIKE ? OR u.serial LIKE ? OR u.imei LIKE ? OR u.serial LIKE ?)
+            )
+        """
+        text = f"({text}{unit_sql})"
+        params.extend([f"%{suffix}", f"%{suffix}", f"%{d}%", f"%{d}%"])
+    else:
+        unit_sql = """
+            OR EXISTS (
+                SELECT 1 FROM product_units u
+                WHERE u.product_id = p.id AND u.status = 'in_stock'
+                  AND (u.imei LIKE ? OR u.serial LIKE ?)
+            )
+        """
+        text = f"({text}{unit_sql})"
+        params.extend([like, like])
+    return f" AND {text}", params
+
+
+def unit_search_sql(q: str, imei_col: str = "u.imei", serial_col: str = "u.serial") -> tuple[str, list[Any]]:
+    q = normalize_search_q(q)
+    if not q:
+        return "", []
+    d = only_digits(q)
+    if len(d) >= 5 and re.fullmatch(r"[\d\s-]+", q):
+        suffix = d[-min(len(d), 15):]
+        return (
+            f" AND ({imei_col} LIKE ? OR {serial_col} LIKE ? OR {imei_col} LIKE ? OR {serial_col} LIKE ?)",
+            [f"%{suffix}", f"%{suffix}", f"%{d}%", f"%{d}%"],
+        )
+    like = f"%{q}%"
+    return f" AND ({imei_col} LIKE ? OR {serial_col} LIKE ?)", [like, like]
+
+
+def transfer_product_units(
+    conn: sqlite3.Connection,
+    product_id: int,
+    from_warehouse_id: int,
+    to_warehouse_id: int,
+    quantity: int,
+) -> None:
+    product = conn.execute("SELECT track_units FROM products WHERE id = ?", (product_id,)).fetchone()
+    if not product or not int(product["track_units"] or 0):
+        return
+    rows = conn.execute(
+        """
+        SELECT id FROM product_units
+        WHERE product_id = ? AND warehouse_id = ? AND status = 'in_stock'
+        ORDER BY id LIMIT ?
+        """,
+        (product_id, from_warehouse_id, quantity),
+    ).fetchall()
+    if len(rows) < quantity:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Недостаточно устройств с IMEI: нужно {quantity}, доступно {len(rows)}",
+        )
+    for row in rows:
+        conn.execute(
+            "UPDATE product_units SET warehouse_id = ? WHERE id = ?",
+            (to_warehouse_id, row["id"]),
+        )
+
+
+def units_for_product_at_warehouse(
+    conn: sqlite3.Connection, product_id: int, warehouse_id: int
+) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT u.id, u.imei, u.serial, u.status, u.notes, u.created_at,
+               p.color AS product_color, p.name AS product_name, p.model
+        FROM product_units u
+        JOIN products p ON p.id = u.product_id
+        WHERE u.product_id = ? AND u.warehouse_id = ? AND u.status = 'in_stock'
+        ORDER BY p.color, u.imei, u.serial
+        """,
+        (product_id, warehouse_id),
+    ).fetchall()
+    return [row_to_dict(r) for r in rows]
 
 
 @contextmanager
@@ -125,6 +239,35 @@ def migrate_db(conn: sqlite3.Connection) -> None:
             user_id = (SELECT user_id FROM shifts WHERE shifts.id = sales.shift_id),
             user_name = COALESCE((SELECT user_name FROM shifts WHERE shifts.id = sales.shift_id), '')
         WHERE user_id IS NULL AND shift_id IS NOT NULL
+        """
+    )
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS stocktake_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            warehouse_id INTEGER NOT NULL,
+            user_id INTEGER,
+            user_name TEXT DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'open',
+            notes TEXT DEFAULT '',
+            started_at TEXT NOT NULL,
+            completed_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS stocktake_lines (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id INTEGER NOT NULL,
+            product_id INTEGER NOT NULL,
+            unit_id INTEGER,
+            quantity INTEGER NOT NULL DEFAULT 1,
+            imei TEXT DEFAULT '',
+            serial TEXT DEFAULT '',
+            color TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES stocktake_sessions(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_units_imei ON product_units(imei);
+        CREATE INDEX IF NOT EXISTS idx_units_serial ON product_units(serial);
+        CREATE INDEX IF NOT EXISTS idx_stocktake_wh ON stocktake_sessions(warehouse_id, status);
         """
     )
     _add_column(conn, "products", "track_units", "INTEGER NOT NULL DEFAULT 0")
@@ -1613,7 +1756,7 @@ async def list_units(
 ):
     check_pin(x_pin)
     sql = """
-        SELECT u.*, p.name AS product_name, p.model, w.name AS warehouse_name
+        SELECT u.*, p.name AS product_name, p.model, p.color AS product_color, w.name AS warehouse_name
         FROM product_units u
         JOIN products p ON p.id = u.product_id
         JOIN warehouses w ON w.id = u.warehouse_id
@@ -1630,8 +1773,11 @@ async def list_units(
         sql += " AND u.status = ?"
         params.append(status)
     if q:
-        like = f"%{q}%"
-        sql += " AND (u.imei LIKE ? OR u.serial LIKE ? OR p.name LIKE ?)"
+        uclause, uparams = unit_search_sql(q)
+        sql += uclause
+        params.extend(uparams)
+        like = f"%{q.strip()}%"
+        sql += " AND (p.name LIKE ? OR p.model LIKE ? OR p.color LIKE ?)"
         params.extend([like, like, like])
     sql += " ORDER BY u.created_at DESC LIMIT 500"
     with db() as conn:
@@ -1805,6 +1951,10 @@ async def warehouse_stock(warehouse_id: int, x_pin: str | None = Header(default=
         for r in rows:
             item = enrich_product(conn, r)
             item["warehouse_quantity"] = r["warehouse_quantity"]
+            if int(r["track_units"] or 0):
+                item["units"] = units_for_product_at_warehouse(conn, r["id"], warehouse_id)
+            else:
+                item["units"] = []
             result.append(item)
     return result
 
@@ -1976,6 +2126,9 @@ async def stock_transfer(body: StockTransferIn, x_pin: str | None = Header(defau
         resolve_warehouse_id(conn, body.to_warehouse_id)
         now = utc_now()
         notes = body.notes or "Перемещение между складами"
+        transfer_product_units(
+            conn, body.product_id, body.from_warehouse_id, body.to_warehouse_id, body.quantity
+        )
         _, movement_id = adjust_warehouse_stock(
             conn, body.from_warehouse_id, body.product_id, -body.quantity,
             "transfer_out", target_warehouse_id=body.to_warehouse_id, notes=notes,
@@ -2039,14 +2192,9 @@ async def list_products(
             """
             params.append(warehouse_id)
         if q:
-            like = f"%{q.strip()}%"
-            sql += """
-                AND (LOWER(p.name) LIKE LOWER(?) OR LOWER(p.brand) LIKE LOWER(?) OR LOWER(p.sku) LIKE LOWER(?)
-                     OR LOWER(p.barcode) LIKE LOWER(?) OR LOWER(p.supplier_name) LIKE LOWER(?)
-                     OR LOWER(p.model) LIKE LOWER(?) OR LOWER(p.color) LIKE LOWER(?)
-                     OR LOWER(p.memory) LIKE LOWER(?) OR LOWER(p.specs_extra) LIKE LOWER(?))
-            """
-            params.extend([like] * 9)
+            clause, sparams = product_search_sql(q)
+            sql += clause
+            params.extend(sparams)
         if category:
             sql += " AND p.category = ?"
             params.append(category)
@@ -3293,6 +3441,320 @@ async def dashboard(x_pin: str | None = Header(default=None, alias="X-Pin")):
         "low_stock_count": low_stock,
         "warehouses": [row_to_dict(w) for w in warehouses],
     }
+
+
+
+class StocktakeStartIn(BaseModel):
+    warehouse_id: int
+    notes: str = ""
+
+
+class StocktakeScanIn(BaseModel):
+    q: str = Field(min_length=1)
+
+
+class StocktakeCountIn(BaseModel):
+    product_id: int
+    quantity: int = Field(ge=1)
+
+
+def _stocktake_expected(conn: sqlite3.Connection, warehouse_id: int) -> dict[str, Any]:
+    products = conn.execute(
+        """
+        SELECT p.id, p.name, p.model, p.color, p.category, p.track_units, ws.quantity AS qty
+        FROM warehouse_stock ws
+        JOIN products p ON p.id = ws.product_id
+        WHERE ws.warehouse_id = ? AND ws.quantity > 0
+        ORDER BY p.name
+        """,
+        (warehouse_id,),
+    ).fetchall()
+    units = conn.execute(
+        """
+        SELECT u.id, u.product_id, u.imei, u.serial, p.color, p.name AS product_name
+        FROM product_units u
+        JOIN products p ON p.id = u.product_id
+        WHERE u.warehouse_id = ? AND u.status = 'in_stock'
+        ORDER BY p.name, u.imei
+        """,
+        (warehouse_id,),
+    ).fetchall()
+    return {
+        "products": [row_to_dict(r) for r in products],
+        "units": [row_to_dict(r) for r in units],
+    }
+
+
+def _stocktake_summary(conn: sqlite3.Connection, session_id: int) -> dict[str, Any]:
+    session = conn.execute("SELECT * FROM stocktake_sessions WHERE id = ?", (session_id,)).fetchone()
+    if not session:
+        raise HTTPException(status_code=404, detail="Инвентаризация не найдена")
+    lines = conn.execute(
+        """
+        SELECT l.*, p.name AS product_name, p.model, p.track_units
+        FROM stocktake_lines l
+        JOIN products p ON p.id = l.product_id
+        WHERE l.session_id = ?
+        ORDER BY l.created_at DESC
+        """,
+        (session_id,),
+    ).fetchall()
+    expected = _stocktake_expected(conn, session["warehouse_id"])
+    scanned_unit_ids = {r["unit_id"] for r in lines if r["unit_id"]}
+    counted_by_product: dict[int, int] = {}
+    for line in lines:
+        counted_by_product[line["product_id"]] = counted_by_product.get(line["product_id"], 0) + int(line["quantity"])
+    variances = []
+    for p in expected["products"]:
+        pid = p["id"]
+        exp = int(p["qty"])
+        cnt = counted_by_product.get(pid, 0)
+        if exp != cnt:
+            variances.append({
+                "product_id": pid,
+                "product_name": p["name"],
+                "color": p["color"],
+                "expected": exp,
+                "counted": cnt,
+                "difference": cnt - exp,
+                "track_units": int(p["track_units"] or 0),
+            })
+    missing_units = [u for u in expected["units"] if u["id"] not in scanned_unit_ids]
+    return {
+        "session": row_to_dict(session),
+        "lines": [row_to_dict(r) for r in lines],
+        "expected": expected,
+        "variances": variances,
+        "missing_units": missing_units,
+        "counted_total": sum(counted_by_product.values()),
+        "expected_total": sum(int(p["qty"]) for p in expected["products"]),
+    }
+
+
+def _resolve_stocktake_scan(conn: sqlite3.Connection, warehouse_id: int, q: str) -> dict[str, Any]:
+    q = normalize_search_q(q)
+    uclause, uparams = unit_search_sql(q)
+    units = conn.execute(
+        f"""
+        SELECT u.*, p.name AS product_name, p.color
+        FROM product_units u
+        JOIN products p ON p.id = u.product_id
+        WHERE u.warehouse_id = ? AND u.status = 'in_stock'
+        {uclause}
+        LIMIT 5
+        """,
+        [warehouse_id, *uparams],
+    ).fetchall()
+    if len(units) > 1:
+        raise HTTPException(status_code=400, detail="Найдено несколько устройств — введите больше цифр IMEI")
+    if len(units) == 1:
+        unit = units[0]
+        return {
+            "product_id": unit["product_id"], "unit_id": unit["id"], "quantity": 1,
+            "imei": unit["imei"] or "", "serial": unit["serial"] or "",
+            "color": unit["color"] or "",
+        }
+    product = conn.execute("SELECT * FROM products WHERE barcode = ?", (q,)).fetchone()
+    if not product:
+        clause, params = product_search_sql(q)
+        product = conn.execute(
+            f"SELECT * FROM products p WHERE 1=1 {clause} LIMIT 1", params
+        ).fetchone()
+    if not product:
+        raise HTTPException(status_code=404, detail="Товар или IMEI не найден")
+    if int(product["track_units"] or 0):
+        raise HTTPException(status_code=400, detail="Для телефона отсканируйте IMEI (достаточно последних 5 цифр)")
+    stock = get_warehouse_stock(conn, warehouse_id, product["id"])
+    if stock <= 0:
+        raise HTTPException(status_code=400, detail="Товар не числится на этом складе")
+    return {
+        "product_id": product["id"], "unit_id": None, "quantity": 1,
+        "imei": "", "serial": "", "color": product["color"] or "",
+    }
+
+
+@app.get("/api/units/lookup")
+async def lookup_unit(
+    q: str = Query(min_length=1),
+    warehouse_id: int | None = None,
+    x_pin: str | None = Header(default=None, alias="X-Pin"),
+):
+    check_pin(x_pin)
+    with db() as conn:
+        sql = """
+            SELECT u.*, p.name AS product_name, p.model, p.color AS product_color,
+                   p.barcode, p.sale_price, p.track_units, p.category,
+                   w.name AS warehouse_name
+            FROM product_units u
+            JOIN products p ON p.id = u.product_id
+            JOIN warehouses w ON w.id = u.warehouse_id
+            WHERE u.status = 'in_stock'
+        """
+        params: list[Any] = []
+        uclause, uparams = unit_search_sql(q)
+        sql += uclause
+        params.extend(uparams)
+        if warehouse_id:
+            sql += " AND u.warehouse_id = ?"
+            params.append(warehouse_id)
+        units = conn.execute(sql + " ORDER BY u.created_at DESC LIMIT 20", params).fetchall()
+        if units:
+            return {"match_type": "unit", "matches": [row_to_dict(u) for u in units]}
+        exact = conn.execute("SELECT * FROM products WHERE barcode = ?", (q.strip(),)).fetchone()
+        if exact:
+            return {"match_type": "product", "matches": [enrich_product(conn, exact)]}
+        clause, sparams = product_search_sql(q)
+        prows = conn.execute(f"SELECT p.* FROM products p WHERE 1=1 {clause} LIMIT 20", sparams).fetchall()
+        if prows:
+            return {"match_type": "product", "matches": [enrich_product(conn, r) for r in prows]}
+    return {"match_type": "none", "matches": []}
+
+
+@app.get("/api/stocktake/current")
+async def stocktake_current(x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin, min_role="warehouse")
+    with db() as conn:
+        row = conn.execute(
+            "SELECT * FROM stocktake_sessions WHERE status = 'open' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if not row:
+            return {"session": None}
+        return _stocktake_summary(conn, row["id"])
+
+
+@app.post("/api/stocktake/start")
+async def stocktake_start(body: StocktakeStartIn, x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin, min_role="warehouse")
+    user = None
+    with db() as conn:
+        user = resolve_user(conn, x_pin)
+        if conn.execute("SELECT id FROM stocktake_sessions WHERE status = 'open'").fetchone():
+            raise HTTPException(status_code=400, detail="Уже есть открытая инвентаризация")
+        resolve_warehouse_id(conn, body.warehouse_id)
+        cur = conn.execute(
+            """
+            INSERT INTO stocktake_sessions (warehouse_id, user_id, user_name, notes, started_at, status)
+            VALUES (?, ?, ?, ?, ?, 'open')
+            """,
+            (body.warehouse_id, user.get("id") if user else None, user.get("name", "") if user else "",
+             body.notes, utc_now()),
+        )
+        session_id = cur.lastrowid
+    with db() as conn:
+        return _stocktake_summary(conn, session_id)
+
+
+@app.post("/api/stocktake/{session_id}/scan")
+async def stocktake_scan(session_id: int, body: StocktakeScanIn, x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin, min_role="warehouse")
+    with db() as conn:
+        session = conn.execute(
+            "SELECT * FROM stocktake_sessions WHERE id = ? AND status = 'open'", (session_id,)
+        ).fetchone()
+        if not session:
+            raise HTTPException(status_code=404, detail="Открытая инвентаризация не найдена")
+        hit = _resolve_stocktake_scan(conn, session["warehouse_id"], body.q)
+        if hit.get("unit_id"):
+            dup = conn.execute(
+                "SELECT id FROM stocktake_lines WHERE session_id = ? AND unit_id = ?",
+                (session_id, hit["unit_id"]),
+            ).fetchone()
+            if dup:
+                raise HTTPException(status_code=400, detail="Это устройство уже отсканировано")
+        conn.execute(
+            """
+            INSERT INTO stocktake_lines
+            (session_id, product_id, unit_id, quantity, imei, serial, color, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (session_id, hit["product_id"], hit.get("unit_id"), hit["quantity"],
+             hit["imei"], hit["serial"], hit["color"], utc_now()),
+        )
+        return _stocktake_summary(conn, session_id)
+
+
+@app.post("/api/stocktake/{session_id}/count")
+async def stocktake_count(session_id: int, body: StocktakeCountIn, x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin, min_role="warehouse")
+    with db() as conn:
+        session = conn.execute(
+            "SELECT * FROM stocktake_sessions WHERE id = ? AND status = 'open'", (session_id,)
+        ).fetchone()
+        if not session:
+            raise HTTPException(status_code=404, detail="Открытая инвентаризация не найдена")
+        product = conn.execute("SELECT * FROM products WHERE id = ?", (body.product_id,)).fetchone()
+        if not product:
+            raise HTTPException(status_code=404, detail="Товар не найден")
+        if int(product["track_units"] or 0):
+            raise HTTPException(status_code=400, detail="Для телефонов сканируйте IMEI по одному")
+        conn.execute(
+            """
+            INSERT INTO stocktake_lines
+            (session_id, product_id, unit_id, quantity, imei, serial, color, created_at)
+            VALUES (?, ?, NULL, ?, '', '', ?, ?)
+            """,
+            (session_id, body.product_id, body.quantity, product["color"] or "", utc_now()),
+        )
+        return _stocktake_summary(conn, session_id)
+
+
+@app.delete("/api/stocktake/{session_id}/lines/{line_id}")
+async def stocktake_undo_line(session_id: int, line_id: int, x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin, min_role="warehouse")
+    with db() as conn:
+        session = conn.execute(
+            "SELECT id FROM stocktake_sessions WHERE id = ? AND status = 'open'", (session_id,)
+        ).fetchone()
+        if not session:
+            raise HTTPException(status_code=404, detail="Открытая инвентаризация не найдена")
+        conn.execute(
+            "DELETE FROM stocktake_lines WHERE id = ? AND session_id = ?", (line_id, session_id)
+        )
+        return _stocktake_summary(conn, session_id)
+
+
+@app.post("/api/stocktake/{session_id}/complete")
+async def stocktake_complete(session_id: int, x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin, min_role="warehouse")
+    with db() as conn:
+        session = conn.execute(
+            "SELECT * FROM stocktake_sessions WHERE id = ? AND status = 'open'", (session_id,)
+        ).fetchone()
+        if not session:
+            raise HTTPException(status_code=404, detail="Открытая инвентаризация не найдена")
+        summary = _stocktake_summary(conn, session_id)
+        wh = session["warehouse_id"]
+        for v in summary["variances"]:
+            if v["track_units"]:
+                continue
+            diff = v["difference"]
+            if diff != 0:
+                adjust_warehouse_stock(
+                    conn, wh, v["product_id"], diff, "stocktake",
+                    notes=f"Инвентаризация #{session_id}: {v['counted']} из {v['expected']}",
+                )
+        conn.execute(
+            "UPDATE stocktake_sessions SET status = 'closed', completed_at = ? WHERE id = ?",
+            (utc_now(), session_id),
+        )
+        summary["session"]["status"] = "closed"
+        return summary
+
+
+@app.get("/api/stocktake/history")
+async def stocktake_history(limit: int = Query(default=20, ge=1, le=100), x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin, min_role="warehouse")
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT s.*, w.name AS warehouse_name
+            FROM stocktake_sessions s
+            JOIN warehouses w ON w.id = s.warehouse_id
+            ORDER BY s.started_at DESC LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [row_to_dict(r) for r in rows]
 
 
 if __name__ == "__main__":
