@@ -1418,7 +1418,8 @@ def resolve_bu_warehouse_id(conn: sqlite3.Connection) -> int:
     row = conn.execute(
         """
         SELECT id FROM warehouses
-        WHERE LOWER(name) LIKE '%бу%' OR LOWER(name) LIKE '%б/у%'
+        WHERE name LIKE '%БУ%' OR name LIKE '%бу%' OR name LIKE '%Б/У%' OR name LIKE '%б/у%'
+           OR LOWER(name) LIKE '%bu%'
         ORDER BY id LIMIT 1
         """
     ).fetchone()
