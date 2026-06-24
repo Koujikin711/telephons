@@ -4214,7 +4214,10 @@ async def list_warehouses(x_pin: str | None = Header(default=None, alias="X-Pin"
         rows = conn.execute(
             "SELECT * FROM warehouses ORDER BY is_default DESC, name"
         ).fetchall()
-    return [row_to_dict(r) for r in rows]
+        return [
+            row_to_dict(r) | {"currency": get_warehouse_currency(conn, int(r["id"]))}
+            for r in rows
+        ]
 
 
 @app.post("/api/warehouses")

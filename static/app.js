@@ -57,13 +57,12 @@ const fmt = (n) => {
   }
 };
 const fmtCurrency = (n, cur) => {
-  const code = cur?.code || "TJS";
-  const digits = 2;
-  try {
-    return new Intl.NumberFormat("ru-RU", { style: "currency", currency: code, maximumFractionDigits: digits }).format(n);
-  } catch {
-    return `${Number(n).toFixed(digits)} ${cur?.symbol || code}`;
-  }
+  const code = (cur?.code || "TJS").toUpperCase();
+  const val = Number(n);
+  if (Number.isNaN(val)) return "—";
+  const num = new Intl.NumberFormat("ru-RU", { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(val);
+  if (code === "USD") return `$ ${num}`;
+  return `${num} ${cur?.symbol || "смн"}`;
 };
 const saleFmt = (s, n) => fmtCurrency(n, currency_meta(s?.currency_code));
 const currency_meta = (code) => {
@@ -72,6 +71,22 @@ const currency_meta = (code) => {
     ? { code: "USD", symbol: "$", name: "Доллар США" }
     : { code: "TJS", symbol: "смн", name: "Сомони" };
 };
+function warehouseCurrency(whId) {
+  const w = warehouses.find((x) => x.id === whId);
+  if (w?.currency) return w.currency;
+  return currency_meta(warehouseKind(whId) === "used" ? "TJS" : "USD");
+}
+function whMoney(n, whId = selectedWarehouseId) {
+  return fmtCurrency(n, warehouseCurrency(whId));
+}
+function finFmt(block, field = "gross_revenue") {
+  const rows = block?.by_currency;
+  if (rows?.length > 1) {
+    return rows.map((c) => fmtCurrency(c[field], c)).join("<br>");
+  }
+  if (rows?.length === 1) return fmtCurrency(block[field], rows[0]);
+  return fmt(block?.[field]);
+}
 const pct = (a, b) => b ? Math.round((a / b) * 100) : 0;
 const catLabel = (c) => ({ phone: "Телефон", accessory: "Аксессуар" }[c] || c);
 const ownLabel = (o) => ({ own: "Собственный", consignment: "Реализация" }[o] || o);
@@ -80,18 +95,19 @@ const payLabel = (p) => storeConfig.payment_methods?.find((m) => m.code === p)?.
 function formatPaySummary(sale) {
   if (sale.payments?.length) {
     if (sale.payments.length === 1) return payLabel(sale.payments[0].method_code);
-    return sale.payments.map((p) => `${payLabel(p.method_code)} ${fmt(p.amount)}`).join(" · ");
+    return sale.payments.map((p) => `${payLabel(p.method_code)} ${saleFmt(sale, p.amount)}`).join(" · ");
   }
   return payLabel(sale.payment_method);
 }
 
 function renderReceiptHtml(sale) {
+  const sf = (n) => saleFmt(sale, n);
   const cashier = sale.user_name ? `<div class="receipt-meta">Кассир: ${esc(sale.user_name)}</div>` : "";
   const payBlock = sale.payments?.length
     ? `<div class="receipt-payments">${sale.payments.map((p) =>
-        `<div class="receipt-pay-row"><span>${payLabel(p.method_code)}</span><strong>${fmt(p.amount)}</strong></div>`
+        `<div class="receipt-pay-row"><span>${payLabel(p.method_code)}</span><strong>${sf(p.amount)}</strong></div>`
       ).join("")}</div>`
-    : `<div class="receipt-payments"><div class="receipt-pay-row"><span>${payLabel(sale.payment_method)}</span><strong>${fmt(sale.total)}</strong></div></div>`;
+    : `<div class="receipt-payments"><div class="receipt-pay-row"><span>${payLabel(sale.payment_method)}</span><strong>${sf(sale.total)}</strong></div></div>`;
   return `
     <div class="rt">TeleStore ERP</div>
     <div class="receipt-meta">Чек №${sale.id}</div>
@@ -101,14 +117,14 @@ function renderReceiptHtml(sale) {
     ${sale.items.map((i) => {
       const unitLines = (i.units || []).map((u) => {
         const id = u.imei || u.serial || (u.imei_pending ? "IMEI позже" : "—");
-        const cust = u.customs_cleared ? ` · таможня ${fmt(u.customs_price)}` : "";
+        const cust = u.customs_cleared ? ` · таможня ${sf(u.customs_price)}` : "";
         return `<div class="receipt-meta" style="text-align:left;font-size:.8rem">↳ ${esc(id)}${cust}</div>`;
       }).join("");
-      return `<div class="receipt-line">${esc(i.product_name)} ×${i.quantity}<span>${fmt(i.subtotal)}</span></div>${unitLines}`;
+      return `<div class="receipt-line">${esc(i.product_name)} ×${i.quantity}<span>${sf(i.subtotal)}</span></div>${unitLines}`;
     }).join("")}
     <hr>
-    ${sale.discount > 0 ? `<div class="receipt-line">Скидка<span>−${fmt(sale.discount)}</span></div>` : ""}
-    <div class="receipt-total">ИТОГО: ${fmt(sale.total)}</div>
+    ${sale.discount > 0 ? `<div class="receipt-line">Скидка<span>−${sf(sale.discount)}</span></div>` : ""}
+    <div class="receipt-total">ИТОГО: ${sf(sale.total)}</div>
     ${payBlock}`;
 }
 
@@ -620,11 +636,11 @@ async function loadDashboard() {
   const d = await api("/api/dashboard");
   document.getElementById("dash-kpi").innerHTML = `
     <div class="kpi accent-blue kpi-clickable" data-kpi="revenue_today" title="Нажмите для детализации">
-      <div class="label">Выручка сегодня</div><div class="value">${fmt(d.today.gross_revenue)}</div><div class="sub">${d.today.sales_count} продаж · подробнее →</div></div>
+      <div class="label">Выручка сегодня</div><div class="value">${finFmt(d.today, "gross_revenue")}</div><div class="sub">${d.today.sales_count} продаж · подробнее →</div></div>
     <div class="kpi accent-green kpi-clickable" data-kpi="profit_today" title="Нажмите для детализации">
-      <div class="label">Прибыль сегодня</div><div class="value">${fmt(d.today.shop_profit)}</div><div class="sub">маржа ${d.today.margin_pct}% · подробнее →</div></div>
+      <div class="label">Прибыль сегодня</div><div class="value">${finFmt(d.today, "shop_profit")}</div><div class="sub">маржа ${d.today.margin_pct}% · подробнее →</div></div>
     <div class="kpi accent-blue kpi-clickable" data-kpi="revenue_month" title="Нажмите для детализации">
-      <div class="label">Выручка за месяц</div><div class="value">${fmt(d.month.gross_revenue)}</div><div class="sub">${d.month.sales_count} продаж · подробнее →</div></div>
+      <div class="label">Выручка за месяц</div><div class="value">${finFmt(d.month, "gross_revenue")}</div><div class="sub">${d.month.sales_count} продаж · подробнее →</div></div>
     <div class="kpi accent-warn kpi-clickable" data-kpi="low_stock" title="Нажмите для списка">
       <div class="label">Мало на складе</div><div class="value">${d.low_stock_count}</div><div class="sub">позиций · подробнее →</div></div>
   `;
@@ -633,8 +649,8 @@ async function loadDashboard() {
   });
   document.getElementById("dash-today").innerHTML = `
     ${renderCurrencyBreakdown(d.month.by_currency)}
-    <div class="metric-row"><span>Выручка сегодня</span><strong>${fmt(d.today.gross_revenue)}</strong></div>
-    <div class="metric-row"><span>Прибыль сегодня</span><strong>${fmt(d.today.shop_profit)}</strong></div>
+    <div class="metric-row"><span>Выручка сегодня</span><strong>${finFmt(d.today, "gross_revenue")}</strong></div>
+    <div class="metric-row"><span>Прибыль сегодня</span><strong>${finFmt(d.today, "shop_profit")}</strong></div>
     <div class="metric-row"><span>К оплате поставщикам</span><strong>${fmt(d.today.supplier_due)}</strong></div>
     <div class="metric-row"><span>Себестоимость (свои)</span><strong>${fmt(d.today.own_cogs)}</strong></div>
   `;
@@ -1374,12 +1390,12 @@ window.showSale = async (id) => {
   const isOwner = !currentUser || currentUser.role === "owner";
   const payHtml = sale.payments?.length
     ? `<div class="card" style="margin-top:1rem"><div class="card-header"><h3>Оплата</h3></div><div class="card-body">${sale.payments.map((p) =>
-        `<div class="metric-row"><span>${payLabel(p.method_code)}</span><strong>${fmt(p.amount)}</strong></div>`
+        `<div class="metric-row"><span>${payLabel(p.method_code)}</span><strong>${saleFmt(sale, p.amount)}</strong></div>`
       ).join("")}</div></div>`
-    : `<p style="color:var(--muted)">${payLabel(sale.payment_method)} · ${fmt(sale.total)}</p>`;
+    : `<p style="color:var(--muted)">${payLabel(sale.payment_method)} · ${saleFmt(sale, sale.total)}</p>`;
   const unitsExtra = sale.items.flatMap((i) => (i.units || []).filter((u) => u.customs_cleared || u.imei_pending)).length
     ? `<div class="card" style="margin-top:1rem"><div class="card-header"><h3>Устройства</h3></div><div class="card-body">${sale.items.flatMap((i) => (i.units || []).map((u) =>
-        `<div class="metric-row"><span>${esc(u.imei || u.serial || "—")}</span><span>${u.customs_cleared ? `Таможня ${fmt(u.customs_price)}` : ""}${u.imei_pending ? " · IMEI позже" : ""}</span></div>`
+        `<div class="metric-row"><span>${esc(u.imei || u.serial || "—")}</span><span>${u.customs_cleared ? `Таможня ${saleFmt(sale, u.customs_price)}` : ""}${u.imei_pending ? " · IMEI позже" : ""}</span></div>`
       )).join("")}</div></div>` : "";
   document.getElementById("sale-detail-content").innerHTML = `
     <h3>Продажа #${sale.id}</h3>
@@ -1389,9 +1405,9 @@ window.showSale = async (id) => {
       <td>${esc(i.product_name)}</td>
       <td style="font-size:.8rem">${i.units?.length ? i.units.map((u) => esc(u.imei || u.serial || "—") + (u.imei_pending ? " ⏳" : "")).join("<br>") : "—"}</td>
       <td><span class="tag tag-${i.ownership_type === "consignment" ? "cons" : "own"}">${ownLabel(i.ownership_type)}</span></td>
-      <td>${i.quantity}</td><td>${fmt(i.subtotal)}</td><td>${fmt(i.shop_profit)}</td>
+      <td>${i.quantity}</td><td>${saleFmt(sale, i.subtotal)}</td><td>${saleFmt(sale, i.shop_profit)}</td>
     </tr>`).join("")}</tbody></table>
-    <div style="margin-top:1rem;text-align:right;font-size:1.1rem;font-weight:700">Итого: ${fmt(sale.total)}</div>
+    <div style="margin-top:1rem;text-align:right;font-size:1.1rem;font-weight:700">Итого: ${saleFmt(sale, sale.total)}</div>
     ${unitsExtra}
     ${payHtml}
     ${isOwner ? `<button class="btn btn-danger" style="margin-top:1rem" onclick="voidSale(${id})">Отменить продажу</button>` : ""}`;
@@ -1776,7 +1792,8 @@ async function loadWarehouseStock() {
 
   const wh = warehouses.find((w) => w.id === selectedWarehouseId);
   const kind = warehouseKind(selectedWarehouseId);
-  title.textContent = wh ? `Остатки: ${wh.name}` : "Остатки склада";
+  const curTag = wh?.currency?.code === "USD" ? " $" : " смн";
+  title.textContent = wh ? `Остатки: ${wh.name} (${wh.currency?.symbol || curTag.trim()})` : "Остатки склада";
   tabs?.classList.toggle("hidden", !hasWh);
   const stockTab = document.getElementById("wh-tab-stock");
   if (stockTab) stockTab.textContent = kind === "used" ? "Остатки" : "Новые товары";
@@ -1801,7 +1818,7 @@ async function loadWarehouseStock() {
   const data = await api(`/api/warehouses/${selectedWarehouseId}/devices`);
   whDevicesCache = data.items || [];
   tb.innerHTML = whDevicesCache.map((u) => {
-    const profitHint = u.sale_price > u.purchase_price ? fmt(u.sale_price - u.purchase_price) : "—";
+    const profitHint = u.sale_price > u.purchase_price ? whMoney(u.sale_price - u.purchase_price) : "—";
     const sellBtn = `<button class="btn btn-primary btn-sm" onclick="openWhSellModal(${u.id})">Продать</button>`;
     if (kind === "used") {
       return `<tr>
@@ -1810,7 +1827,7 @@ async function loadWarehouseStock() {
         <td>${dash(u.memory)}</td>
         <td>${u.battery_capacity != null ? u.battery_capacity + "%" : "—"}</td>
         <td>${esc(u.imei || u.serial || "—")}</td>
-        <td>${fmt(u.purchase_price)}</td>
+        <td>${whMoney(u.purchase_price)}</td>
         <td>${esc(u.client_name || "—")}</td>
         <td>${sellBtn}</td>
       </tr>`;
@@ -1822,7 +1839,7 @@ async function loadWarehouseStock() {
       <td>${dash(u.memory)}</td>
       <td>${esc(u.region || "—")}</td>
       <td>${esc(u.imei || "—")}</td>
-      <td>${fmt(u.purchase_price)}</td>
+      <td>${whMoney(u.purchase_price)}</td>
       <td>${esc(u.supplier_name || "—")}</td>
       <td>${sellBtn}</td>
     </tr>`;
@@ -1858,8 +1875,8 @@ async function loadWhZReport() {
   const month = +document.getElementById("wh-z-month")?.value || defaultMonth;
   const r = await api(`/api/warehouses/${selectedWarehouseId}/z-report?period=custom&year=${year}&month=${month}`);
   const isUsed = kind === "used";
-  const whFmt = (n) => fmtCurrency(n, r.currency || storeConfig.currency);
-  const curLabel = r.currency?.code === "USD" ? "$" : (r.currency?.symbol || "смн");
+  const whFmt = (n) => fmtCurrency(n, r.currency || warehouseCurrency(selectedWarehouseId));
+  const curLabel = (r.currency || warehouseCurrency(selectedWarehouseId))?.code === "USD" ? "$" : "смн";
   const zRow = (l, sold) => {
     const profit = l.profit != null ? whFmt(l.profit) : (sold ? "—" : whFmt(-(l.purchase_price + l.extra_cost)));
     if (isUsed) {
@@ -2020,7 +2037,7 @@ window.openWhSellModal = (unitId) => {
   if (!sellUnitTarget) return;
   document.getElementById("wh-sell-meta").innerHTML = `
     <div class="metric-row"><span>${esc(sellUnitTarget.model)}</span><strong>${esc(sellUnitTarget.imei || "")}</strong></div>
-    <div class="metric-row"><span>Себестоимость</span><strong>${fmt(sellUnitTarget.purchase_price)}</strong></div>`;
+    <div class="metric-row"><span>Себестоимость</span><strong>${whMoney(sellUnitTarget.purchase_price)}</strong></div>`;
   document.getElementById("wh-sell-price").value = sellUnitTarget.sale_price > 0 ? sellUnitTarget.sale_price : "";
   const paidEl = document.getElementById("wh-sell-paid");
   if (paidEl) paidEl.value = sellUnitTarget.sale_price > 0 ? sellUnitTarget.sale_price : "";
@@ -2040,7 +2057,7 @@ function updateWhSellProfit() {
   const debtBlock = document.getElementById("wh-sell-debtor-fields");
   if (debtBlock) debtBlock.classList.toggle("hidden", price - paid <= 0.01);
   document.getElementById("wh-sell-profit").textContent = price > 0
-    ? `Прибыль: ${fmt(profit)}${price - paid > 0.01 ? ` · в долг ${fmt(price - paid)}` : ""}`
+    ? `Прибыль: ${whMoney(profit)}${price - paid > 0.01 ? ` · в долг ${whMoney(price - paid)}` : ""}`
     : "Укажите цену продажи";
 }
 
@@ -2070,7 +2087,7 @@ async function submitWhSell(e) {
       }),
     });
     document.getElementById("wh-sell-modal").close();
-    toast(`Продано! Прибыль: ${fmt(sale_price - sellUnitTarget.purchase_price)}`);
+    toast(`Продано! Прибыль: ${whMoney(sale_price - sellUnitTarget.purchase_price)}`);
     loadWarehouseStock();
     if (currentPage === "pos") loadPosCashRegister();
     if (currentPage === "products-consignment") loadConsProducts();
@@ -2099,8 +2116,8 @@ async function onInboundExistingSelect() {
   }
   inboundExistingProduct = await api(`/api/products/${id}`);
   document.getElementById("ib-existing-meta").innerHTML = `
-    <div class="metric-row"><span>Закупка</span><strong>${fmt(inboundExistingProduct.purchase_price)}</strong></div>
-    <div class="metric-row"><span>Цена продажи</span><strong>${fmt(inboundExistingProduct.sale_price)}</strong></div>
+    <div class="metric-row"><span>Закупка</span><strong>${whMoney(inboundExistingProduct.purchase_price)}</strong></div>
+    <div class="metric-row"><span>Цена продажи</span><strong>${whMoney(inboundExistingProduct.sale_price)}</strong></div>
     <div class="metric-row"><span>Состояние</span><strong>${conditionLabel(inboundExistingProduct.condition)}</strong></div>
     <div class="metric-row"><span>Категория</span><strong>${catLabel(inboundExistingProduct.category)}</strong></div>`;
   updateInboundFields();
