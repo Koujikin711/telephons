@@ -206,7 +206,17 @@ def db():
         conn.close()
 
 
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    return bool(
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+        ).fetchone()
+    )
+
+
 def _add_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    if not _table_exists(conn, table):
+        return
     cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
     if column not in cols:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
@@ -237,14 +247,15 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     _add_column(conn, "sales", "user_name", "TEXT DEFAULT ''")
     _add_column(conn, "shifts", "expected_payments_json", "TEXT DEFAULT ''")
     _add_column(conn, "shifts", "actual_payments_json", "TEXT DEFAULT ''")
-    conn.execute(
-        """
-        UPDATE sales SET
-            user_id = (SELECT user_id FROM shifts WHERE shifts.id = sales.shift_id),
-            user_name = COALESCE((SELECT user_name FROM shifts WHERE shifts.id = sales.shift_id), '')
-        WHERE user_id IS NULL AND shift_id IS NOT NULL
-        """
-    )
+    if _table_exists(conn, "shifts"):
+        conn.execute(
+            """
+            UPDATE sales SET
+                user_id = (SELECT user_id FROM shifts WHERE shifts.id = sales.shift_id),
+                user_name = COALESCE((SELECT user_name FROM shifts WHERE shifts.id = sales.shift_id), '')
+            WHERE user_id IS NULL AND shift_id IS NOT NULL
+            """
+        )
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS stocktake_sessions (
@@ -269,11 +280,16 @@ def migrate_db(conn: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL,
             FOREIGN KEY (session_id) REFERENCES stocktake_sessions(id) ON DELETE CASCADE
         );
-        CREATE INDEX IF NOT EXISTS idx_units_imei ON product_units(imei);
-        CREATE INDEX IF NOT EXISTS idx_units_serial ON product_units(serial);
         CREATE INDEX IF NOT EXISTS idx_stocktake_wh ON stocktake_sessions(warehouse_id, status);
         """
     )
+    if _table_exists(conn, "product_units"):
+        conn.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_units_imei ON product_units(imei);
+            CREATE INDEX IF NOT EXISTS idx_units_serial ON product_units(serial);
+            """
+        )
     _add_column(conn, "products", "track_units", "INTEGER NOT NULL DEFAULT 0")
     _add_column(conn, "products", "image_url", "TEXT DEFAULT ''")
     _add_column(conn, "product_units", "customs_cleared", "INTEGER NOT NULL DEFAULT 0")
@@ -288,18 +304,20 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     _add_column(conn, "product_units", "region", "TEXT DEFAULT ''")
     _add_column(conn, "product_units", "arrival_date", "TEXT DEFAULT ''")
     _add_column(conn, "warehouses", "warehouse_type", "TEXT NOT NULL DEFAULT 'new'")
-    conn.execute(
-        """
-        UPDATE product_units SET customs_status = 'cleared'
-        WHERE customs_cleared = 1 AND customs_status = 'none'
-        """
-    )
-    conn.execute(
-        """
-        UPDATE warehouses SET warehouse_type = 'used'
-        WHERE LOWER(name) LIKE '%бу%' OR LOWER(name) LIKE '%б/у%' OR LOWER(name) LIKE '%б у%'
-        """
-    )
+    if _table_exists(conn, "product_units"):
+        conn.execute(
+            """
+            UPDATE product_units SET customs_status = 'cleared'
+            WHERE customs_cleared = 1 AND customs_status = 'none'
+            """
+        )
+    if _table_exists(conn, "warehouses"):
+        conn.execute(
+            """
+            UPDATE warehouses SET warehouse_type = 'used'
+            WHERE LOWER(name) LIKE '%бу%' OR LOWER(name) LIKE '%б/у%' OR LOWER(name) LIKE '%б у%'
+            """
+        )
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS unit_reservations (
@@ -365,7 +383,7 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     _add_column(conn, "sales", "amount_paid", "REAL")
     _add_column(conn, "sales", "amount_due", "REAL NOT NULL DEFAULT 0")
     _add_column(conn, "expenses", "department", "TEXT NOT NULL DEFAULT 'main'")
-    if not conn.execute(
+    if _table_exists(conn, "warehouses") and not conn.execute(
         "SELECT 1 FROM warehouses WHERE LOWER(name) LIKE '%аксесс%'"
     ).fetchone():
         conn.execute(
@@ -1527,7 +1545,7 @@ def _import_z_register_rows(
                  model, color, size, memory, ram, customs_cleared, customs_price, specs_extra,
                  condition, track_units, image_url)
                 VALUES (?, 'phone', 'own', '', '', '', '', ?, ?, 0, 0, ?,
-                        ?, '', '', ?, '', 0, 0, '', ?, 1, '')
+                        ?, ?, '', ?, '', 0, 0, '', ?, 1, '')
                 """,
                 (name, purchase, sp, utc_now(), name, color, memory, condition),
             )
@@ -2443,21 +2461,25 @@ def adjust_warehouse_stock(
             status_code=400,
             detail=f"Недостаточно «{name}» на складе: доступно {current}, нужно {abs(delta)}",
         )
-    if current == 0 and delta > 0:
-        conn.execute(
-            """
-            INSERT INTO warehouse_stock (warehouse_id, product_id, quantity)
-            VALUES (?, ?, ?)
-            """,
-            (warehouse_id, product_id, delta),
-        )
-    else:
+    has_row = conn.execute(
+        "SELECT 1 FROM warehouse_stock WHERE warehouse_id = ? AND product_id = ?",
+        (warehouse_id, product_id),
+    ).fetchone()
+    if has_row:
         conn.execute(
             """
             UPDATE warehouse_stock SET quantity = ?
             WHERE warehouse_id = ? AND product_id = ?
             """,
             (new_qty, warehouse_id, product_id),
+        )
+    elif delta > 0:
+        conn.execute(
+            """
+            INSERT INTO warehouse_stock (warehouse_id, product_id, quantity)
+            VALUES (?, ?, ?)
+            """,
+            (warehouse_id, product_id, delta),
         )
     movement_id = record_stock_movement(
         conn, warehouse_id, product_id, movement_type, abs(delta),
@@ -4196,8 +4218,14 @@ async def import_z_register_file(
     raw = await file.read()
     if not raw:
         raise HTTPException(status_code=400, detail="Пустой файл")
-    with db() as conn:
-        result = import_z_register_excel(conn, raw, file.filename or "import.xlsx", sheet)
+    try:
+        with db() as conn:
+            result = import_z_register_excel(conn, raw, file.filename or "import.xlsx", sheet)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Z-register import failed")
+        raise HTTPException(status_code=500, detail=f"Ошибка импорта: {exc}") from exc
     return result
 
 
