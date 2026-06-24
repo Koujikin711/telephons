@@ -1824,7 +1824,7 @@ async function loadWhZReport() {
     el.innerHTML = `
       <div class="toolbar" style="margin-bottom:0.75rem;flex-wrap:wrap">
         <label>Месяц<select id="wh-z-month" class="select sm-select">
-          ${[1,2,3,4,5,6,7,8,9,10,11,12].map((m)=>`<option value="${m}"${m===5?' selected':''}>${['','Янв','Фев','Мар','Апр','Май','Июн','Июл','Авг','Сен','Окт','Ноя','Дек'].m]}</option>`).join('')}
+          ${[1,2,3,4,5,6,7,8,9,10,11,12].map((m)=>{const mn=['','Янв','Фев','Мар','Апр','Май','Июн','Июл','Авг','Сен','Окт','Ноя','Дек'];return `<option value="${m}"${m===5?' selected':''}>${mn[m]}</option>`;}).join('')}
         </select></label>
         <label>Год<input type="number" id="wh-z-year" class="input sm" value="${defaultYear}" min="2020" max="2035" style="width:5rem"></label>
         <button type="button" id="wh-z-refresh" class="btn btn-secondary btn-sm">Показать</button>
