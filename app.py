@@ -304,6 +304,7 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     _add_column(conn, "product_units", "region", "TEXT DEFAULT ''")
     _add_column(conn, "product_units", "arrival_date", "TEXT DEFAULT ''")
     _add_column(conn, "warehouses", "warehouse_type", "TEXT NOT NULL DEFAULT 'new'")
+    _add_column(conn, "warehouses", "currency_code", "TEXT NOT NULL DEFAULT ''")
     if _table_exists(conn, "product_units"):
         conn.execute(
             """
@@ -319,6 +320,8 @@ def migrate_db(conn: sqlite3.Connection) -> None:
             """
         )
         _merge_duplicate_bu_warehouses(conn)
+        _set_warehouse_currencies(conn)
+        _fix_z_register_warehouse_split(conn)
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS unit_reservations (
@@ -1510,7 +1513,7 @@ def _parse_z_register_sheet(ws: Any, sheet_kind: str) -> list[dict[str, Any]]:
             sale_date = ws.cell(r, 11).value
             profit = ws.cell(r, 12).value
             comments = ws.cell(r, 13).value
-            condition = "new" if str(battery or "").strip().lower() == "new" else "used"
+            condition = "new"
         if not name or str(name).strip().lower() in ("", "none"):
             continue
         rows.append({
@@ -1537,9 +1540,12 @@ def _import_z_register_rows(
     conn: sqlite3.Connection,
     rows: list[dict[str, Any]],
     warehouse_id: int,
+    *,
+    sheet_kind: str = "used",
 ) -> dict[str, Any]:
     created_units = sold = skipped = 0
     errors: list[str] = []
+    expected_condition = "new" if sheet_kind == "new" else "used"
     for row in rows:
         name = row["name"]
         imei = row["imei"]
@@ -1557,7 +1563,7 @@ def _import_z_register_rows(
         sale_price = row["sale_price"]
         sale_date = row["sale_date"]
         profit = row["profit"]
-        condition = row["condition"]
+        condition = expected_condition
         memory = row["memory"]
         color = row["color"]
         serial = imei if imei else f"Z{row['row_num']}-{warehouse_id}"
@@ -1569,15 +1575,16 @@ def _import_z_register_rows(
               AND LOWER(TRIM(COALESCE(model, ''))) = LOWER(TRIM(?))
               AND LOWER(TRIM(COALESCE(memory, ''))) = LOWER(TRIM(?))
               AND LOWER(TRIM(COALESCE(color, ''))) = LOWER(TRIM(?))
+              AND condition = ?
             LIMIT 1
             """,
-            (name, name, memory, color),
+            (name, name, memory, color, condition),
         ).fetchone()
         if existing:
             product_id = int(existing["id"])
             conn.execute(
-                "UPDATE products SET purchase_price = ?, sale_price = COALESCE(?, sale_price) WHERE id = ?",
-                (purchase, sale_price, product_id),
+                "UPDATE products SET purchase_price = ?, sale_price = COALESCE(?, sale_price), condition = ? WHERE id = ?",
+                (purchase, sale_price, condition, product_id),
             )
         else:
             sp = sale_price if sale_price and sale_price > 0 else round(purchase * 1.15, 2)
@@ -1685,8 +1692,105 @@ def import_z_register_excel(
     for sn, kind, wh_id in targets:
         ws = wb[sn]
         rows = _parse_z_register_sheet(ws, kind)
-        results["sheets"][sn] = _import_z_register_rows(conn, rows, wh_id) | {"warehouse_id": wh_id, "kind": kind}
+        results["sheets"][sn] = _import_z_register_rows(conn, rows, wh_id, sheet_kind=kind) | {"warehouse_id": wh_id, "kind": kind}
     return results
+
+
+def get_warehouse_receipt_kind(conn: sqlite3.Connection, warehouse_id: int) -> str:
+    row = conn.execute("SELECT name, warehouse_type FROM warehouses WHERE id = ?", (warehouse_id,)).fetchone()
+    if not row:
+        return "new"
+    wt = (row["warehouse_type"] or "").strip().lower()
+    if wt == "used":
+        return "used"
+    if wt == "new":
+        return "new"
+    name = (row["name"] or "").lower()
+    if "бу" in name or "б/у" in name or "б у" in name:
+        return "used"
+    return "new"
+
+
+def get_warehouse_currency(conn: sqlite3.Connection, warehouse_id: int) -> dict[str, str]:
+    row = conn.execute(
+        "SELECT currency_code, warehouse_type, name FROM warehouses WHERE id = ?", (warehouse_id,)
+    ).fetchone()
+    code = (row["currency_code"] or "").strip().upper() if row else ""
+    if not code:
+        code = "TJS" if get_warehouse_receipt_kind(conn, warehouse_id) == "used" else "USD"
+    if code == "USD":
+        return {"code": "USD", "symbol": "$", "name": "Доллар США"}
+    return {"code": "TJS", "symbol": "смн", "name": "Сомони"}
+
+
+def _set_warehouse_currencies(conn: sqlite3.Connection) -> None:
+    if not _table_exists(conn, "warehouses"):
+        return
+    for row in conn.execute("SELECT id, warehouse_type, currency_code, is_default FROM warehouses").fetchall():
+        wh_id = int(row["id"])
+        kind = get_warehouse_receipt_kind(conn, wh_id)
+        if kind == "used":
+            expected = "TJS"
+        elif int(row["is_default"] or 0):
+            expected = "USD"
+        else:
+            continue
+        current = (row["currency_code"] or "").strip().upper()
+        if current != expected:
+            conn.execute("UPDATE warehouses SET currency_code = ? WHERE id = ?", (expected, wh_id))
+
+
+def _transfer_unit_between_warehouses(
+    conn: sqlite3.Connection,
+    unit_id: int,
+    product_id: int,
+    from_wh: int,
+    to_wh: int,
+) -> None:
+    if from_wh == to_wh:
+        return
+    conn.execute("UPDATE product_units SET warehouse_id = ? WHERE id = ?", (to_wh, unit_id))
+    sale_row = conn.execute("SELECT sale_id FROM product_units WHERE id = ?", (unit_id,)).fetchone()
+    if sale_row and sale_row["sale_id"]:
+        conn.execute("UPDATE sales SET warehouse_id = ? WHERE id = ?", (to_wh, sale_row["sale_id"]))
+    adjust_warehouse_stock(conn, from_wh, product_id, -1, "transfer", target_warehouse_id=to_wh, notes="Перенос по типу NEW/БУ")
+    adjust_warehouse_stock(conn, to_wh, product_id, 1, "transfer", target_warehouse_id=from_wh, notes="Перенос по типу NEW/БУ")
+
+
+def _fix_z_register_warehouse_split(conn: sqlite3.Connection) -> None:
+    if not _table_exists(conn, "product_units") or not _table_exists(conn, "warehouses"):
+        return
+    try:
+        bu_id = resolve_bu_warehouse_id(conn)
+        main_id = get_default_warehouse_id(conn)
+    except HTTPException:
+        return
+    if bu_id == main_id:
+        return
+    for u in conn.execute(
+        """
+        SELECT u.id, u.product_id FROM product_units u
+        JOIN products p ON p.id = u.product_id
+        WHERE u.warehouse_id = ? AND COALESCE(p.condition, 'new') != 'new'
+        """,
+        (main_id,),
+    ).fetchall():
+        _transfer_unit_between_warehouses(conn, int(u["id"]), int(u["product_id"]), main_id, bu_id)
+    for u in conn.execute(
+        """
+        SELECT u.id, u.product_id FROM product_units u
+        JOIN products p ON p.id = u.product_id
+        WHERE u.warehouse_id = ? AND COALESCE(p.condition, 'new') = 'new'
+        """,
+        (bu_id,),
+    ).fetchall():
+        _transfer_unit_between_warehouses(conn, int(u["id"]), int(u["product_id"]), bu_id, main_id)
+
+
+def _z_register_condition_clause(conn: sqlite3.Connection, warehouse_id: int) -> str:
+    if get_warehouse_receipt_kind(conn, warehouse_id) == "used":
+        return " AND COALESCE(p.condition, 'used') IN ('used', 'refurbished')"
+    return " AND COALESCE(p.condition, 'new') = 'new'"
 
 
 def _z_register_lines(
@@ -1707,7 +1811,7 @@ def _z_register_lines(
         LEFT JOIN sale_item_units siu ON siu.unit_id = u.id
         LEFT JOIN sale_items si ON si.id = siu.sale_item_id
         LEFT JOIN sales s ON s.id = si.sale_id AND s.status = 'completed'
-        WHERE u.warehouse_id = ?
+        WHERE u.warehouse_id = ?{_z_register_condition_clause(conn, warehouse_id)}
         ORDER BY COALESCE(u.arrival_date, u.created_at), p.name, u.id
         """,
         (warehouse_id,),
@@ -2421,21 +2525,6 @@ def _accessories_finance_report(
         "net_profit": profit - exp,
         "expenses_by_category": [{"category": r["category"], "amount": float(r["total"])} for r in exp_by_cat],
     }
-
-
-def get_warehouse_receipt_kind(conn: sqlite3.Connection, warehouse_id: int) -> str:
-    row = conn.execute("SELECT name, warehouse_type FROM warehouses WHERE id = ?", (warehouse_id,)).fetchone()
-    if not row:
-        return "new"
-    wt = (row["warehouse_type"] or "").strip().lower()
-    if wt == "used":
-        return "used"
-    if wt == "new":
-        return "new"
-    name = (row["name"] or "").lower()
-    if "бу" in name or "б/у" in name or "б у" in name:
-        return "used"
-    return "new"
 
 
 def sync_product_stock(conn: sqlite3.Connection, product_id: int) -> int:
@@ -4184,12 +4273,14 @@ async def warehouse_z_report(
         resolve_warehouse_id(conn, warehouse_id)
         if year and month:
             reg = _z_register_lines(conn, warehouse_id, year, month)
+            currency = get_warehouse_currency(conn, warehouse_id)
             return {
                 "warehouse_id": warehouse_id,
                 "period": "custom",
                 "period_label": reg["period_label"],
                 "year": year,
                 "month": month,
+                "currency": currency,
                 "sales_count": reg["sold_count"],
                 "revenue": reg["revenue"],
                 "discounts": 0.0,
@@ -4234,11 +4325,13 @@ async def warehouse_z_report(
             (warehouse_id, since),
         ).fetchall()
         reg = _z_register_lines(conn, warehouse_id, None, None)
+        currency = get_warehouse_currency(conn, warehouse_id)
         period_labels = {"day": "Сегодня", "week": "Неделя", "month": "Месяц", "all": "Всё время"}
     return {
         "warehouse_id": warehouse_id,
         "period": period,
         "period_label": period_labels.get(period, period),
+        "currency": currency,
         "sales_count": int(agg["sales_count"] or 0),
         "revenue": float(agg["revenue"] or 0),
         "discounts": float(agg["discounts"] or 0),

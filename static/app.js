@@ -56,6 +56,15 @@ const fmt = (n) => {
     return `${Number(n).toFixed(digits)} ${storeConfig.currency?.symbol || code}`;
   }
 };
+const fmtCurrency = (n, cur) => {
+  const code = cur?.code || "TJS";
+  const digits = 2;
+  try {
+    return new Intl.NumberFormat("ru-RU", { style: "currency", currency: code, maximumFractionDigits: digits }).format(n);
+  } catch {
+    return `${Number(n).toFixed(digits)} ${cur?.symbol || code}`;
+  }
+};
 const pct = (a, b) => b ? Math.round((a / b) * 100) : 0;
 const catLabel = (c) => ({ phone: "Телефон", accessory: "Аксессуар" }[c] || c);
 const ownLabel = (o) => ({ own: "Собственный", consignment: "Реализация" }[o] || o);
@@ -1841,8 +1850,10 @@ async function loadWhZReport() {
   const month = +document.getElementById("wh-z-month")?.value || defaultMonth;
   const r = await api(`/api/warehouses/${selectedWarehouseId}/z-report?period=custom&year=${year}&month=${month}`);
   const isUsed = kind === "used";
+  const whFmt = (n) => fmtCurrency(n, r.currency || storeConfig.currency);
+  const curLabel = r.currency?.code === "USD" ? "$" : (r.currency?.symbol || "смн");
   const zRow = (l, sold) => {
-    const profit = l.profit != null ? fmt(l.profit) : (sold ? "—" : fmt(-(l.purchase_price + l.extra_cost)));
+    const profit = l.profit != null ? whFmt(l.profit) : (sold ? "—" : whFmt(-(l.purchase_price + l.extra_cost)));
     if (isUsed) {
       return `<tr>
         <td>${esc(l.arrival_date)}</td>
@@ -1851,9 +1862,9 @@ async function loadWhZReport() {
         <td>${esc(l.imei)}</td>
         <td>${esc(l.memory)}</td>
         <td>${esc(l.color)}</td>
-        <td>${fmt(l.purchase_price)}</td>
-        <td>${l.extra_cost ? fmt(l.extra_cost) : "—"}</td>
-        <td>${l.sale_price ? fmt(l.sale_price) : "—"}</td>
+        <td>${whFmt(l.purchase_price)}</td>
+        <td>${l.extra_cost ? whFmt(l.extra_cost) : "—"}</td>
+        <td>${l.sale_price ? whFmt(l.sale_price) : "—"}</td>
         <td>${esc(l.sale_date || "—")}</td>
         <td><strong>${profit}</strong></td>
         <td style="font-size:.75rem">${esc(l.comments || "")}</td>
@@ -1867,9 +1878,9 @@ async function loadWhZReport() {
       <td>${esc(l.imei)}</td>
       <td>${esc(l.memory)}</td>
       <td>${esc(l.color)}</td>
-      <td>${fmt(l.purchase_price)}</td>
-      <td>${l.extra_cost ? fmt(l.extra_cost) : "—"}</td>
-      <td>${l.sale_price ? fmt(l.sale_price) : "—"}</td>
+      <td>${whFmt(l.purchase_price)}</td>
+      <td>${l.extra_cost ? whFmt(l.extra_cost) : "—"}</td>
+      <td>${l.sale_price ? whFmt(l.sale_price) : "—"}</td>
       <td>${esc(l.sale_date || "—")}</td>
       <td><strong>${profit}</strong></td>
       <td style="font-size:.75rem">${esc(l.comments || "")}</td>
@@ -1881,9 +1892,9 @@ async function loadWhZReport() {
   const cols = isUsed ? 12 : 13;
   document.getElementById("wh-z-content").innerHTML = `
     <div class="kpi-grid" style="margin-bottom:1rem">
-      <div class="kpi accent-blue"><div class="label">Продаж за ${esc(r.period_label)}</div><div class="value">${r.sales_count}</div><div class="sub">${fmt(r.revenue)}</div></div>
-      <div class="kpi accent-green"><div class="label">Прибыль</div><div class="value">${fmt(r.profit)}</div></div>
-      <div class="kpi"><div class="label">Остатков</div><div class="value">${r.stock_count || 0}</div><div class="sub">${fmt(r.stock_value || 0)} себест.</div></div>
+      <div class="kpi accent-blue"><div class="label">Продаж за ${esc(r.period_label)}</div><div class="value">${r.sales_count}</div><div class="sub">${whFmt(r.revenue)} (${curLabel})</div></div>
+      <div class="kpi accent-green"><div class="label">Прибыль</div><div class="value">${whFmt(r.profit)}</div></div>
+      <div class="kpi"><div class="label">Остатков</div><div class="value">${r.stock_count || 0}</div><div class="sub">${whFmt(r.stock_value || 0)} себест.</div></div>
     </div>
     <h4 class="sub-heading">Продажи за период</h4>
     <div class="table-wrap z-report-table" style="max-height:320px;overflow:auto;margin-bottom:1rem">
