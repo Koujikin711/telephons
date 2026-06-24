@@ -1350,6 +1350,373 @@ def _import_sales_rows(
     }
 
 
+def _z_cell_float(val: Any) -> float | None:
+    if val is None or val == "":
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    s = str(val).strip().replace(" ", "").replace(",", ".").replace("$", "").replace("смн", "")
+    if not s:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _z_cell_date(val: Any) -> str | None:
+    if val is None or val == "":
+        return None
+    if isinstance(val, datetime):
+        return val.strftime("%Y-%m-%d %H:%M:%S")
+    s = str(val).strip()
+    if not s:
+        return None
+    for fmt in ("%d.%m.%Y", "%Y-%m-%d", "%d.%m.%Y %H:%M:%S"):
+        try:
+            return datetime.strptime(s[:19], fmt).strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+    return None
+
+
+def _z_battery_int(val: Any) -> int | None:
+    if val is None or val == "":
+        return None
+    if isinstance(val, (int, float)):
+        v = int(val)
+        return v if 0 <= v <= 100 else None
+    s = str(val).strip().lower()
+    if s in ("new", "usto", "id", "none"):
+        return None
+    try:
+        v = int(float(s))
+        return v if 0 <= v <= 100 else None
+    except ValueError:
+        return None
+
+
+def resolve_bu_warehouse_id(conn: sqlite3.Connection) -> int:
+    row = conn.execute(
+        """
+        SELECT id FROM warehouses
+        WHERE LOWER(name) LIKE '%бу%' OR LOWER(name) LIKE '%б/у%'
+        ORDER BY id LIMIT 1
+        """
+    ).fetchone()
+    if row:
+        return int(row["id"])
+    cur = conn.execute(
+        """
+        INSERT INTO warehouses (name, address, notes, is_default, created_at, warehouse_type)
+        VALUES ('БУ', '', 'Б/у устройства', 0, ?, 'used')
+        """,
+        (utc_now(),),
+    )
+    return int(cur.lastrowid)
+
+
+def _parse_z_register_sheet(ws: Any, sheet_kind: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for r in range(2, ws.max_row + 1):
+        if sheet_kind == "used":
+            arrival = ws.cell(r, 1).value
+            name = ws.cell(r, 2).value
+            battery = ws.cell(r, 3).value
+            imei = ws.cell(r, 4).value
+            memory = ws.cell(r, 5).value
+            color = ws.cell(r, 6).value
+            purchase = ws.cell(r, 7).value
+            extra = ws.cell(r, 8).value
+            sale_price = ws.cell(r, 9).value
+            sale_date = ws.cell(r, 10).value
+            profit = ws.cell(r, 11).value
+            comments = ws.cell(r, 12).value
+            region = ""
+            condition = "used"
+        else:
+            arrival = ws.cell(r, 1).value
+            name = ws.cell(r, 2).value
+            battery = ws.cell(r, 3).value
+            region = ws.cell(r, 4).value
+            imei = ws.cell(r, 5).value
+            memory = ws.cell(r, 6).value
+            color = ws.cell(r, 7).value
+            purchase = ws.cell(r, 8).value
+            extra = ws.cell(r, 9).value
+            sale_price = ws.cell(r, 10).value
+            sale_date = ws.cell(r, 11).value
+            profit = ws.cell(r, 12).value
+            comments = ws.cell(r, 13).value
+            condition = "new" if str(battery or "").strip().lower() == "new" else "used"
+        if not name or str(name).strip().lower() in ("", "none"):
+            continue
+        rows.append({
+            "row_num": r,
+            "arrival_date": _z_cell_date(arrival),
+            "name": str(name).strip(),
+            "battery": _z_battery_int(battery),
+            "region": str(region or "").strip(),
+            "imei": str(imei or "").strip(),
+            "memory": str(memory or "").strip(),
+            "color": str(color or "").strip(),
+            "purchase_price": _z_cell_float(purchase) or 0.0,
+            "extra_cost": _z_cell_float(extra) or 0.0,
+            "sale_price": _z_cell_float(sale_price),
+            "sale_date": _z_cell_date(sale_date),
+            "profit": _z_cell_float(profit),
+            "comments": str(comments or "").strip(),
+            "condition": condition,
+        })
+    return rows
+
+
+def _import_z_register_rows(
+    conn: sqlite3.Connection,
+    rows: list[dict[str, Any]],
+    warehouse_id: int,
+) -> dict[str, Any]:
+    created_units = sold = skipped = 0
+    errors: list[str] = []
+    for row in rows:
+        name = row["name"]
+        imei = row["imei"]
+        if imei.lower() in ("id", "none", "n/a", ""):
+            imei = ""
+        if imei:
+            dup = conn.execute(
+                "SELECT id FROM product_units WHERE imei = ? AND imei != ''", (imei,)
+            ).fetchone()
+            if dup:
+                skipped += 1
+                continue
+        purchase = float(row["purchase_price"])
+        extra = float(row["extra_cost"])
+        sale_price = row["sale_price"]
+        sale_date = row["sale_date"]
+        profit = row["profit"]
+        condition = row["condition"]
+        memory = row["memory"]
+        color = row["color"]
+        serial = imei if imei else f"Z{row['row_num']}-{warehouse_id}"
+
+        existing = conn.execute(
+            """
+            SELECT id FROM products
+            WHERE category = 'phone' AND LOWER(TRIM(name)) = LOWER(TRIM(?))
+              AND LOWER(TRIM(COALESCE(model, ''))) = LOWER(TRIM(?))
+              AND LOWER(TRIM(COALESCE(memory, ''))) = LOWER(TRIM(?))
+              AND LOWER(TRIM(COALESCE(color, ''))) = LOWER(TRIM(?))
+            LIMIT 1
+            """,
+            (name, name, memory, color),
+        ).fetchone()
+        if existing:
+            product_id = int(existing["id"])
+            conn.execute(
+                "UPDATE products SET purchase_price = ?, sale_price = COALESCE(?, sale_price) WHERE id = ?",
+                (purchase, sale_price, product_id),
+            )
+        else:
+            sp = sale_price if sale_price and sale_price > 0 else round(purchase * 1.15, 2)
+            cur = conn.execute(
+                """
+                INSERT INTO products
+                (name, category, ownership_type, supplier_name, brand, sku, barcode,
+                 purchase_price, sale_price, stock, min_stock, created_at,
+                 model, color, size, memory, ram, customs_cleared, customs_price, specs_extra,
+                 condition, track_units, image_url)
+                VALUES (?, 'phone', 'own', '', '', '', '', ?, ?, 0, 0, ?,
+                        ?, '', '', ?, '', 0, 0, '', ?, 1, '')
+                """,
+                (name, purchase, sp, utc_now(), name, color, memory, condition),
+            )
+            product_id = int(cur.lastrowid)
+
+        arrival = row["arrival_date"] or utc_now()
+        cur_u = conn.execute(
+            """
+            INSERT INTO product_units
+            (product_id, warehouse_id, imei, serial, status, notes, created_at,
+             customs_status, customs_cleared, customs_price, battery_capacity,
+             client_name, region, arrival_date)
+            VALUES (?, ?, ?, ?, 'in_stock', ?, ?, 'none', 0, ?, ?, ?, ?, ?)
+            """,
+            (
+                product_id, warehouse_id, imei, serial, row["comments"] or "",
+                utc_now(), extra, row["battery"], row["comments"] or "", row["region"] or "",
+                (row["arrival_date"] or "")[:10],
+            ),
+        )
+        unit_id = int(cur_u.lastrowid)
+        adjust_warehouse_stock(conn, warehouse_id, product_id, 1, "inbound", notes=f"Z-импорт: {name}")
+        created_units += 1
+
+        if sale_price and sale_price > 0 and sale_date:
+            shop_profit = profit if profit is not None else (sale_price - purchase - extra)
+            total = float(sale_price)
+            cur_s = conn.execute(
+                """
+                INSERT INTO sales
+                (total, discount, payment_method, status, notes, created_at,
+                 warehouse_id, cash_amount, card_amount, trade_in_value, shift_id, user_id, user_name,
+                 amount_paid, amount_due)
+                VALUES (?, 0, 'cash', 'completed', ?, ?, ?, ?, 0, 0, NULL, NULL, 'Z-импорт', ?, 0)
+                """,
+                (total, row["comments"] or "Z-импорт Excel", sale_date, warehouse_id, total, total),
+            )
+            sale_id = int(cur_s.lastrowid)
+            insert_sale_payments(conn, sale_id, [{"method_code": "cash", "amount": total}])
+            cur_item = conn.execute(
+                """
+                INSERT INTO sale_items
+                (sale_id, product_id, product_name, ownership_type, supplier_name, quantity,
+                 unit_price, purchase_price, supplier_due, shop_profit, subtotal)
+                VALUES (?, ?, ?, 'own', '', 1, ?, ?, 0, ?, ?)
+                """,
+                (sale_id, product_id, name, total, purchase, shop_profit, total),
+            )
+            sale_item_id = int(cur_item.lastrowid)
+            conn.execute(
+                """
+                INSERT INTO sale_item_units
+                (sale_item_id, unit_id, imei, serial, customs_cleared, customs_price, imei_pending)
+                VALUES (?, ?, ?, ?, 0, ?, 0)
+                """,
+                (sale_item_id, unit_id, imei, serial, extra),
+            )
+            mark_unit_sold_full(conn, unit_id, sale_id, imei, 0, extra)
+            adjust_warehouse_stock(conn, warehouse_id, product_id, -1, "sale", reference_id=sale_id)
+            sold += 1
+
+    return {
+        "created_units": created_units,
+        "sold_units": sold,
+        "skipped_duplicates": skipped,
+        "errors": errors,
+        "total_rows": len(rows),
+    }
+
+
+def import_z_register_excel(
+    conn: sqlite3.Connection, raw: bytes, filename: str, sheet: str = ""
+) -> dict[str, Any]:
+    from openpyxl import load_workbook
+
+    wb = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+    results: dict[str, Any] = {"sheets": {}}
+    targets: list[tuple[str, str, int]] = []
+    if sheet and sheet in wb.sheetnames:
+        kind = "used" if sheet.lower() in ("бу", "bu", "б/у") else "new"
+        wh = resolve_bu_warehouse_id(conn) if kind == "used" else get_default_warehouse_id(conn)
+        targets = [(sheet, kind, wh)]
+    else:
+        for sn in wb.sheetnames:
+            low = sn.lower()
+            if low in ("бу", "bu", "б/у"):
+                targets.append((sn, "used", resolve_bu_warehouse_id(conn)))
+            elif "доллар" in low or low == "new":
+                targets.append((sn, "new", get_default_warehouse_id(conn)))
+    if not targets:
+        sn = wb.sheetnames[0]
+        targets = [(sn, "used", resolve_bu_warehouse_id(conn))]
+    for sn, kind, wh_id in targets:
+        ws = wb[sn]
+        rows = _parse_z_register_sheet(ws, kind)
+        results["sheets"][sn] = _import_z_register_rows(conn, rows, wh_id) | {"warehouse_id": wh_id, "kind": kind}
+    return results
+
+
+def _z_register_lines(
+    conn: sqlite3.Connection,
+    warehouse_id: int,
+    year: int | None = None,
+    month: int | None = None,
+) -> dict[str, Any]:
+    rows = conn.execute(
+        """
+        SELECT u.id AS unit_id, u.arrival_date, u.imei, u.serial, u.battery_capacity,
+               u.client_name, u.region, u.customs_price AS extra_cost, u.status, u.notes,
+               p.name AS product_name, p.model, p.memory, p.color, p.purchase_price, p.condition,
+               si.subtotal AS sale_price, si.shop_profit,
+               s.created_at AS sale_date, s.id AS sale_id
+        FROM product_units u
+        JOIN products p ON p.id = u.product_id
+        LEFT JOIN sale_item_units siu ON siu.unit_id = u.id
+        LEFT JOIN sale_items si ON si.id = siu.sale_item_id
+        LEFT JOIN sales s ON s.id = si.sale_id AND s.status = 'completed'
+        WHERE u.warehouse_id = ?
+        ORDER BY COALESCE(u.arrival_date, u.created_at), p.name, u.id
+        """,
+        (warehouse_id,),
+    ).fetchall()
+    all_lines: list[dict[str, Any]] = []
+    sold_period: list[dict[str, Any]] = []
+    stock_lines: list[dict[str, Any]] = []
+    period_profit = period_revenue = 0.0
+    period_count = 0
+
+    for r in rows:
+        d = row_to_dict(r) or {}
+        sd = d.get("sale_date") or ""
+        in_period = False
+        if year and month and sd:
+            try:
+                dt = datetime.strptime(sd[:10], "%Y-%m-%d")
+                in_period = dt.year == year and dt.month == month
+            except ValueError:
+                pass
+        elif year and month and not sd:
+            in_period = False
+        elif not year and not month:
+            in_period = bool(sd)
+
+        line = {
+            "arrival_date": (d.get("arrival_date") or "")[:10] or "—",
+            "product_name": d.get("product_name") or "",
+            "condition": d.get("condition") or "",
+            "region": d.get("region") or "",
+            "imei": d.get("imei") or d.get("serial") or "—",
+            "memory": d.get("memory") or "",
+            "color": d.get("color") or "",
+            "purchase_price": float(d.get("purchase_price") or 0),
+            "extra_cost": float(d.get("extra_cost") or 0),
+            "sale_price": float(d.get("sale_price") or 0) if d.get("sale_price") else None,
+            "sale_date": sd[:10] if sd else "",
+            "profit": float(d.get("shop_profit") or 0) if d.get("shop_profit") is not None and sd else None,
+            "comments": d.get("notes") or d.get("client_name") or "",
+            "battery": d.get("battery_capacity"),
+            "status": d.get("status") or "",
+        }
+        if not line["profit"] and line["sale_price"] and sd:
+            line["profit"] = line["sale_price"] - line["purchase_price"] - line["extra_cost"]
+        all_lines.append(line)
+        if d.get("status") == "in_stock":
+            stock_lines.append(line)
+        if in_period and sd:
+            sold_period.append(line)
+            period_profit += float(line["profit"] or 0)
+            period_revenue += float(line["sale_price"] or 0)
+            period_count += 1
+
+    month_names = ["", "январь", "февраль", "март", "апрель", "май", "июнь",
+                   "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь"]
+    period_label = f"{month_names[month]} {year}" if year and month else "Все данные"
+    return {
+        "period_label": period_label,
+        "year": year,
+        "month": month,
+        "sold_count": period_count,
+        "revenue": period_revenue,
+        "profit": period_profit,
+        "stock_count": len(stock_lines),
+        "stock_value": sum(l["purchase_price"] + l["extra_cost"] for l in stock_lines),
+        "sold_lines": sold_period,
+        "stock_lines": stock_lines,
+        "all_lines": all_lines,
+    }
+
+
 def get_currency_config(conn: sqlite3.Connection) -> dict[str, str]:
     return {
         "code": get_setting(conn, "base_currency", "TJS"),
@@ -3741,13 +4108,34 @@ async def warehouse_devices(warehouse_id: int, x_pin: str | None = Header(defaul
 @app.get("/api/warehouses/{warehouse_id}/z-report")
 async def warehouse_z_report(
     warehouse_id: int,
-    period: str = Query(default="day", pattern="^(day|week|month)$"),
+    period: str = Query(default="day", pattern="^(day|week|month|all|custom)$"),
+    year: int | None = Query(default=None, ge=2020, le=2035),
+    month: int | None = Query(default=None, ge=1, le=12),
     x_pin: str | None = Header(default=None, alias="X-Pin"),
 ):
     check_pin(x_pin)
     with db() as conn:
         resolve_warehouse_id(conn, warehouse_id)
-        since = period_start(period)
+        if year and month:
+            reg = _z_register_lines(conn, warehouse_id, year, month)
+            return {
+                "warehouse_id": warehouse_id,
+                "period": "custom",
+                "period_label": reg["period_label"],
+                "year": year,
+                "month": month,
+                "sales_count": reg["sold_count"],
+                "revenue": reg["revenue"],
+                "discounts": 0.0,
+                "profit": reg["profit"],
+                "stock_count": reg["stock_count"],
+                "stock_value": reg["stock_value"],
+                "by_payment": [],
+                "lines": reg["sold_lines"],
+                "stock_lines": reg["stock_lines"],
+                "all_lines": reg["all_lines"],
+            }
+        since = period_start(period) if period not in ("all", "custom") else "1970-01-01"
         agg = conn.execute(
             """
             SELECT COUNT(DISTINCT s.id) AS sales_count,
@@ -3779,22 +4167,8 @@ async def warehouse_z_report(
             """,
             (warehouse_id, since),
         ).fetchall()
-        lines = conn.execute(
-            """
-            SELECT s.id AS sale_id, s.created_at, s.user_name, si.product_name, si.quantity,
-                   si.subtotal, si.shop_profit, si.unit_price,
-                   GROUP_CONCAT(siu.imei, ', ') AS imeis
-            FROM sale_items si
-            JOIN sales s ON s.id = si.sale_id
-            LEFT JOIN sale_item_units siu ON siu.sale_item_id = si.id
-            WHERE s.status = 'completed' AND s.warehouse_id = ? AND s.created_at >= ?
-            GROUP BY si.id
-            ORDER BY s.created_at DESC
-            LIMIT 200
-            """,
-            (warehouse_id, since),
-        ).fetchall()
-        period_labels = {"day": "Сегодня", "week": "Неделя", "month": "Месяц"}
+        reg = _z_register_lines(conn, warehouse_id, None, None)
+        period_labels = {"day": "Сегодня", "week": "Неделя", "month": "Месяц", "all": "Всё время"}
     return {
         "warehouse_id": warehouse_id,
         "period": period,
@@ -3803,9 +4177,28 @@ async def warehouse_z_report(
         "revenue": float(agg["revenue"] or 0),
         "discounts": float(agg["discounts"] or 0),
         "profit": float(profit_row[0] or 0),
+        "stock_count": reg["stock_count"],
+        "stock_value": reg["stock_value"],
         "by_payment": [row_to_dict(r) for r in by_payment],
-        "lines": [row_to_dict(r) for r in lines],
+        "lines": reg["sold_lines"][:200],
+        "stock_lines": reg["stock_lines"],
+        "all_lines": reg["all_lines"],
     }
+
+
+@app.post("/api/import/z-register")
+async def import_z_register_file(
+    file: UploadFile = File(...),
+    sheet: str = Query(default=""),
+    x_pin: str | None = Header(default=None, alias="X-Pin"),
+):
+    check_pin(x_pin, min_role="warehouse")
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Пустой файл")
+    with db() as conn:
+        result = import_z_register_excel(conn, raw, file.filename or "import.xlsx", sheet)
+    return result
 
 
 @app.post("/api/warehouse/quick-sell")

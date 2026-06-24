@@ -665,7 +665,8 @@ body {
 .form-row-inline { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; margin-bottom: 0.5rem; }
 .form-row-inline .input { width: 5rem; }
 .wh-view-tabs { margin: 0 1.15rem 0.75rem; }
-.acc-view-tabs { margin-bottom: 1rem; }
+.z-report-table { font-size: 0.78rem; }
+.z-report-table th, .z-report-table td { white-space: nowrap; padding: 0.35rem 0.5rem; }
 @media (max-width: 1200px) {
   .pos-layout-3 { grid-template-columns: 1fr; }
 }

@@ -1760,10 +1760,11 @@ async function loadWarehouseStock() {
   const wh = warehouses.find((w) => w.id === selectedWarehouseId);
   const kind = warehouseKind(selectedWarehouseId);
   title.textContent = wh ? `Остатки: ${wh.name}` : "Остатки склада";
-  tabs?.classList.toggle("hidden", kind === "used");
-  if (kind !== "used") tabs?.querySelector('[data-wh-view="stock"]')?.classList.add("active");
+  tabs?.classList.toggle("hidden", !hasWh);
+  const stockTab = document.getElementById("wh-tab-stock");
+  if (stockTab) stockTab.textContent = kind === "used" ? "Остатки" : "Новые товары";
 
-  if (whViewMode === "zreport" && kind !== "used") {
+  if (whViewMode === "zreport" && hasWh) {
     tableWrap?.classList.add("hidden");
     zEl?.classList.remove("hidden");
     await loadWhZReport();
@@ -1814,23 +1815,110 @@ async function loadWarehouseStock() {
 async function loadWhZReport() {
   const el = document.getElementById("wh-z-report");
   if (!el || !selectedWarehouseId) return;
-  const r = await api(`/api/warehouses/${selectedWarehouseId}/z-report?period=day`);
-  el.innerHTML = `
+  const kind = warehouseKind(selectedWarehouseId);
+  const now = new Date();
+  const defaultYear = now.getFullYear();
+  const defaultMonth = now.getMonth() + 1;
+  if (!el.dataset.inited) {
+    el.dataset.inited = "1";
+    el.innerHTML = `
+      <div class="toolbar" style="margin-bottom:0.75rem;flex-wrap:wrap">
+        <label>Месяц<select id="wh-z-month" class="select sm-select">
+          ${[1,2,3,4,5,6,7,8,9,10,11,12].map((m)=>`<option value="${m}"${m===5?' selected':''}>${['','Янв','Фев','Мар','Апр','Май','Июн','Июл','Авг','Сен','Окт','Ноя','Дек'].m]}</option>`).join('')}
+        </select></label>
+        <label>Год<input type="number" id="wh-z-year" class="input sm" value="${defaultYear}" min="2020" max="2035" style="width:5rem"></label>
+        <button type="button" id="wh-z-refresh" class="btn btn-secondary btn-sm">Показать</button>
+        <label class="import-file-label" style="margin-left:auto">
+          <span class="btn btn-ghost btn-sm">Импорт Excel (May)</span>
+          <input type="file" id="wh-z-import-file" accept=".xlsx" hidden>
+        </label>
+      </div>
+      <div id="wh-z-content"></div>`;
+    document.getElementById("wh-z-refresh")?.addEventListener("click", loadWhZReport);
+    document.getElementById("wh-z-import-file")?.addEventListener("change", importWhZExcel);
+  }
+  const year = +document.getElementById("wh-z-year")?.value || defaultYear;
+  const month = +document.getElementById("wh-z-month")?.value || defaultMonth;
+  const r = await api(`/api/warehouses/${selectedWarehouseId}/z-report?period=custom&year=${year}&month=${month}`);
+  const isUsed = kind === "used";
+  const zRow = (l, sold) => {
+    const profit = l.profit != null ? fmt(l.profit) : (sold ? "—" : fmt(-(l.purchase_price + l.extra_cost)));
+    if (isUsed) {
+      return `<tr>
+        <td>${esc(l.arrival_date)}</td>
+        <td><strong>${esc(l.product_name)}</strong></td>
+        <td>${l.battery != null ? l.battery + "%" : "—"}</td>
+        <td>${esc(l.imei)}</td>
+        <td>${esc(l.memory)}</td>
+        <td>${esc(l.color)}</td>
+        <td>${fmt(l.purchase_price)}</td>
+        <td>${l.extra_cost ? fmt(l.extra_cost) : "—"}</td>
+        <td>${l.sale_price ? fmt(l.sale_price) : "—"}</td>
+        <td>${esc(l.sale_date || "—")}</td>
+        <td><strong>${profit}</strong></td>
+        <td style="font-size:.75rem">${esc(l.comments || "")}</td>
+      </tr>`;
+    }
+    return `<tr>
+      <td>${esc(l.arrival_date)}</td>
+      <td><strong>${esc(l.product_name)}</strong></td>
+      <td>${esc(l.condition || "new")}</td>
+      <td>${esc(l.region || "—")}</td>
+      <td>${esc(l.imei)}</td>
+      <td>${esc(l.memory)}</td>
+      <td>${esc(l.color)}</td>
+      <td>${fmt(l.purchase_price)}</td>
+      <td>${l.extra_cost ? fmt(l.extra_cost) : "—"}</td>
+      <td>${l.sale_price ? fmt(l.sale_price) : "—"}</td>
+      <td>${esc(l.sale_date || "—")}</td>
+      <td><strong>${profit}</strong></td>
+      <td style="font-size:.75rem">${esc(l.comments || "")}</td>
+    </tr>`;
+  };
+  const head = isUsed
+    ? "<tr><th>Приход</th><th>Наименование</th><th>Батар.</th><th>IMEI</th><th>Память</th><th>Цвет</th><th>Себест.</th><th>Расходы</th><th>Продажа</th><th>Дата прод.</th><th>Прибыль</th><th>Коммент.</th></tr>"
+    : "<tr><th>Приход</th><th>Наименование</th><th>Сост.</th><th>Регион</th><th>IMEI</th><th>Память</th><th>Цвет</th><th>Себест.</th><th>Расходы</th><th>Продажа</th><th>Дата прод.</th><th>Прибыль</th><th>Коммент.</th></tr>";
+  const cols = isUsed ? 12 : 13;
+  document.getElementById("wh-z-content").innerHTML = `
     <div class="kpi-grid" style="margin-bottom:1rem">
-      <div class="kpi accent-blue"><div class="label">Выручка</div><div class="value">${fmt(r.revenue)}</div><div class="sub">${r.sales_count} чеков</div></div>
+      <div class="kpi accent-blue"><div class="label">Продаж за ${esc(r.period_label)}</div><div class="value">${r.sales_count}</div><div class="sub">${fmt(r.revenue)}</div></div>
       <div class="kpi accent-green"><div class="label">Прибыль</div><div class="value">${fmt(r.profit)}</div></div>
+      <div class="kpi"><div class="label">Остатков</div><div class="value">${r.stock_count || 0}</div><div class="sub">${fmt(r.stock_value || 0)} себест.</div></div>
     </div>
-    <h4 class="sub-heading">По способам оплаты</h4>
-    <table class="data-table"><thead><tr><th>Оплата</th><th>Сумма</th></tr></thead><tbody>
-      ${(r.by_payment || []).map((p) => `<tr><td>${esc(p.name || p.method_code)}</td><td><strong>${fmt(p.amount)}</strong></td></tr>`).join("") || "<tr><td colspan=2>Нет данных</td></tr>"}
-    </tbody></table>
-    <h4 class="sub-heading" style="margin-top:1rem">Продажи</h4>
-    <div class="table-wrap" style="max-height:280px;overflow:auto"><table class="data-table">
-      <thead><tr><th>Дата</th><th>Товар</th><th>IMEI</th><th>Сумма</th><th>Прибыль</th></tr></thead>
-      <tbody>${(r.lines || []).map((l) => `<tr>
-        <td>${esc(l.created_at)}</td><td>${esc(l.product_name)}</td><td>${esc(l.imeis || "—")}</td>
-        <td>${fmt(l.subtotal)}</td><td><strong>${fmt(l.shop_profit)}</strong></td></tr>`).join("") || '<tr><td colspan="5">Нет продаж</td></tr>'}
-      </tbody></table></div>`;
+    <h4 class="sub-heading">Продажи за период</h4>
+    <div class="table-wrap z-report-table" style="max-height:320px;overflow:auto;margin-bottom:1rem">
+      <table class="data-table"><thead>${head}</thead>
+      <tbody>${(r.lines || []).map((l) => zRow(l, true)).join("") || `<tr><td colspan="${cols}">Нет продаж за период</td></tr>`}</tbody></table>
+    </div>
+    <h4 class="sub-heading">Остатки на складе</h4>
+    <div class="table-wrap z-report-table" style="max-height:280px;overflow:auto">
+      <table class="data-table"><thead>${head}</thead>
+      <tbody>${(r.stock_lines || []).map((l) => zRow(l, false)).join("") || `<tr><td colspan="${cols}">Нет остатков</td></tr>`}</tbody></table>
+    </div>`;
+}
+
+async function importWhZExcel(e) {
+  const file = e.target.files?.[0];
+  if (!file) return;
+  try {
+    const fd = new FormData();
+    fd.append("file", file);
+    const headers = {};
+    if (pin) headers["X-Pin"] = pin;
+    const res = await fetch("/api/import/z-register", { method: "POST", headers, body: fd });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || `Ошибка ${res.status}`);
+    }
+    const r = await res.json();
+    const summary = Object.entries(r.sheets || {}).map(([k, v]) =>
+      `${k}: ${v.created_units} шт, продано ${v.sold_units}`
+    ).join("; ");
+    toast(`Импорт: ${summary}`);
+    e.target.value = "";
+    loadWhZReport();
+    if (whViewMode !== "zreport") loadWarehouseStock();
+  } catch (err) { toast(err.message, "error"); }
 }
 
 window.openWarehouseModal = (wh = null) => {
