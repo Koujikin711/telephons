@@ -1448,7 +1448,7 @@ def _merge_duplicate_accessories_warehouses(conn: sqlite3.Connection) -> None:
         primary_id = int(rows[0]["id"])
         conn.execute(
             """
-            UPDATE warehouses SET warehouse_type = 'accessories', currency_code = 'TJS',
+            UPDATE warehouses SET warehouse_type = 'accessories', currency_code = 'USD',
                    notes = COALESCE(NULLIF(notes, ''), 'Склад аксессуаров')
             WHERE id = ?
             """,
@@ -1478,7 +1478,7 @@ def _merge_duplicate_accessories_warehouses(conn: sqlite3.Connection) -> None:
         conn.execute("DELETE FROM warehouses WHERE id = ?", (dup_id,))
     conn.execute(
         """
-        UPDATE warehouses SET warehouse_type = 'accessories', currency_code = 'TJS',
+        UPDATE warehouses SET warehouse_type = 'accessories', currency_code = 'USD',
                notes = COALESCE(NULLIF(notes, ''), 'Склад аксессуаров')
         WHERE id = ?
         """,
@@ -1487,14 +1487,25 @@ def _merge_duplicate_accessories_warehouses(conn: sqlite3.Connection) -> None:
 
 
 PHONE_NAME_HINTS = (
-    "iphone", "samsung", "xiaomi", "huawei", "pixel", "oneplus", "redmi", "ipad",
-    "macbook", "apple watch", "aw ultra", "airpods", "honor", "oppo", "vivo",
-    "realme", "poco", "nokia", "sony", "google", "tecno", "infinix", "meizu",
+    "iphone", "samsung", "xiaomi", "huawei", "pixel", "oneplus", "redmi",
+    "honor", "oppo", "vivo", "realme", "poco", "nokia", "sony", "google", "tecno", "infinix", "meizu",
+)
+
+ACCESSORY_NAME_HINTS = (
+    "dyson", "whoop", "pencil", "чехол", "case", "cover", "стекл", "glass",
+    "наушник", "headphone", "earphone", "air pod", "airpod", "pods max", "pods pro", "pods ",
+    "apple watch", " watch", "watch ultra", "watch se", " aw ",
+    "powerbank", "power bank", "заряд", "charger", "кабель", "cable",
+    "ipad", "macbook", "magic", "keyboard", "клавиатур",
+    "аксессуар", "accessory", "holder", "подставк", "stand", "band", "ремеш",
 )
 
 
 def _z_row_is_phone(row: dict[str, Any]) -> bool:
-    name = (row.get("name") or "").lower()
+    name = (row.get("name") or "").lower().strip()
+    nm = f" {name} "
+    if name.startswith("aw ") or any(h in name or h in nm for h in ACCESSORY_NAME_HINTS):
+        return False
     memory = (row.get("memory") or "").strip().lower().replace("gb", "").replace("tb", "").strip()
     if memory and memory.isdigit():
         return True
@@ -2091,7 +2102,7 @@ def get_warehouse_receipt_kind(conn: sqlite3.Connection, warehouse_id: int) -> s
 
 
 def _fix_misclassified_accessories(conn: sqlite3.Connection) -> None:
-    if not _table_exists(conn, "product_units"):
+    if not _table_exists(conn, "warehouse_stock"):
         return
     try:
         acc_wh = resolve_accessories_warehouse_id(conn)
@@ -2099,28 +2110,77 @@ def _fix_misclassified_accessories(conn: sqlite3.Connection) -> None:
         bu_id = resolve_bu_warehouse_id(conn)
     except HTTPException:
         return
-    rows = conn.execute(
-        """
-        SELECT u.id, u.product_id, p.name, p.memory
-        FROM product_units u
-        JOIN products p ON p.id = u.product_id
-        WHERE u.warehouse_id IN (?, ?) AND u.status = 'in_stock' AND p.category = 'phone'
-        """,
-        (main_id, bu_id),
-    ).fetchall()
+    phone_wh_ids = (main_id, bu_id)
     moved = False
-    for r in rows:
-        if _z_row_is_phone({"name": r["name"], "memory": r["memory"] or ""}):
+
+    def move_qty_to_acc(product_id: int, from_wh: int, qty: int, note: str) -> None:
+        nonlocal moved
+        if qty <= 0:
+            return
+        adjust_warehouse_stock(conn, from_wh, product_id, -qty, "transfer", notes=note)
+        adjust_warehouse_stock(conn, acc_wh, product_id, qty, "transfer", notes=note)
+        moved = True
+
+    if _table_exists(conn, "product_units"):
+        rows = conn.execute(
+            """
+            SELECT u.id, u.product_id, p.name, p.memory, p.category
+            FROM product_units u
+            JOIN products p ON p.id = u.product_id
+            WHERE u.warehouse_id IN (?, ?) AND u.status = 'in_stock'
+            """,
+            phone_wh_ids,
+        ).fetchall()
+        for r in rows:
+            is_acc = r["category"] == "accessory" or (
+                r["category"] == "phone"
+                and not _z_row_is_phone({"name": r["name"], "memory": r["memory"] or ""})
+            )
+            if not is_acc:
+                continue
+            pid = int(r["product_id"])
+            uid = int(r["id"])
+            wh_id = int(conn.execute(
+                "SELECT warehouse_id FROM product_units WHERE id = ?", (uid,)
+            ).fetchone()["warehouse_id"])
+            conn.execute("UPDATE products SET category = 'accessory', track_units = 0 WHERE id = ?", (pid,))
+            conn.execute("DELETE FROM product_units WHERE id = ?", (uid,))
+            move_qty_to_acc(pid, wh_id, 1, "Перенос аксессуара со склада телефонов")
+
+    ws_rows = conn.execute(
+        """
+        SELECT ws.product_id, ws.warehouse_id, ws.quantity, p.name, p.memory, p.category
+        FROM warehouse_stock ws
+        JOIN products p ON p.id = ws.product_id
+        WHERE ws.warehouse_id IN (?, ?) AND ws.quantity > 0
+        """,
+        phone_wh_ids,
+    ).fetchall()
+    for r in ws_rows:
+        is_acc = r["category"] == "accessory" or (
+            r["category"] == "phone"
+            and not _z_row_is_phone({"name": r["name"], "memory": r["memory"] or ""})
+        )
+        if not is_acc:
             continue
         pid = int(r["product_id"])
-        uid = int(r["id"])
+        wh_id = int(r["warehouse_id"])
+        qty = int(r["quantity"])
         conn.execute("UPDATE products SET category = 'accessory', track_units = 0 WHERE id = ?", (pid,))
-        conn.execute("DELETE FROM product_units WHERE id = ?", (uid,))
-        adjust_warehouse_stock(conn, acc_wh, pid, 1, "transfer", notes="Перенос аксессуара со склада телефонов")
-        sync_product_stock(conn, pid)
-        moved = True
+        move_qty_to_acc(pid, wh_id, qty, "Перенос аксессуара со склада телефонов")
+
+    conn.execute(
+        """
+        UPDATE sales SET currency_code = 'USD'
+        WHERE warehouse_id = ? AND COALESCE(NULLIF(TRIM(currency_code), ''), 'TJS') = 'TJS'
+        """,
+        (acc_wh,),
+    )
+
     if moved:
         _rebuild_all_warehouse_stock(conn)
+    for pid_row in conn.execute("SELECT id FROM products WHERE category = 'accessory'").fetchall():
+        sync_product_stock(conn, int(pid_row["id"]))
 
 
 CURRENCY_META: dict[str, dict[str, str]] = {
@@ -2153,7 +2213,7 @@ def _set_warehouse_currencies(conn: sqlite3.Connection) -> None:
         if kind == "used":
             expected = "TJS"
         elif kind == "accessories":
-            expected = "TJS"
+            expected = "USD"
         elif int(row["is_default"] or 0):
             expected = "USD"
         else:
@@ -4708,17 +4768,23 @@ async def warehouse_devices(warehouse_id: int, x_pin: str | None = Header(defaul
             d["supplier_name"] = r["supplier_name"] or ""
             d["ownership_type"] = r["ownership_type"] or "own"
             items.append(d)
-        acc = conn.execute(
-            """
-            SELECT p.*, ws.quantity AS warehouse_quantity
-            FROM warehouse_stock ws
-            JOIN products p ON p.id = ws.product_id
-            WHERE ws.warehouse_id = ? AND ws.quantity > 0 AND IFNULL(p.track_units, 0) = 0
-            ORDER BY p.name
-            """,
-            (warehouse_id,),
-        ).fetchall()
-        accessories = [enrich_product(conn, r) | {"warehouse_quantity": r["warehouse_quantity"]} for r in acc]
+        acc = []
+        accessories: list[dict[str, Any]] = []
+        if kind == "accessories":
+            acc = conn.execute(
+                """
+                SELECT p.*, ws.quantity AS warehouse_quantity
+                FROM warehouse_stock ws
+                JOIN products p ON p.id = ws.product_id
+                WHERE ws.warehouse_id = ? AND ws.quantity > 0
+                  AND p.category = 'accessory' AND IFNULL(p.track_units, 0) = 0
+                ORDER BY p.name
+                """,
+                (warehouse_id,),
+            ).fetchall()
+            accessories = [
+                enrich_product(conn, r) | {"warehouse_quantity": r["warehouse_quantity"]} for r in acc
+            ]
     return {"kind": kind, "items": items, "accessories": accessories}
 
 
@@ -5351,7 +5417,7 @@ async def accessories_warehouse(x_pin: str | None = Header(default=None, alias="
     with db() as conn:
         wh_id = resolve_accessories_warehouse_id(conn)
         row = conn.execute("SELECT * FROM warehouses WHERE id = ?", (wh_id,)).fetchone()
-    return row_to_dict(row)
+        return row_to_dict(row) | {"currency": get_warehouse_currency(conn, wh_id)}
 
 
 @app.get("/api/accessories/stock")

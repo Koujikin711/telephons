@@ -75,7 +75,12 @@ const currency_meta = (code) => {
 function warehouseCurrency(whId) {
   const w = warehouses.find((x) => x.id === whId);
   if (w?.currency) return w.currency;
+  if (isAccessoriesWarehouse(w)) return currency_meta("USD");
   return currency_meta(warehouseKind(whId) === "used" ? "TJS" : "USD");
+}
+function accMoney(n) {
+  const w = warehouses.find((x) => x.id === accWarehouseId);
+  return fmtCurrency(n, w?.currency?.code === "USD" ? w.currency : currency_meta("USD"));
 }
 function isAccessoriesWarehouse(w) {
   if (!w) return false;
@@ -3518,7 +3523,7 @@ async function loadAccStock() {
       <td><strong>${esc(p.name)}</strong></td>
       <td>${dash(p.model)}</td>
       <td>${esc(p.supplier_name || "—")}</td>
-      <td>${fmt(p.purchase_price)}</td>
+      <td>${accMoney(p.purchase_price)}</td>
       <td><input type="number" class="input sm acc-price-inp" data-id="${p.id}" value="${p.sale_price}" min="0.01" step="0.01"></td>
       <td><strong>${qty}</strong></td>
       <td><button class="btn btn-ghost btn-sm" onclick="saveAccPrice(${p.id})">✓</button></td>
@@ -3580,7 +3585,7 @@ async function loadAccProducts() {
     return `<div class="product-card ${out ? "out" : ""}" data-id="${p.id}">
       <div class="name">${esc(p.name)}</div>
       <div class="meta">${dash(p.model)} · ${esc(p.supplier_name || "")}</div>
-      <div class="price">${fmt(p.sale_price)}</div>
+      <div class="price">${accMoney(p.sale_price)}</div>
       <div class="meta">${out ? "Нет" : `Ост: ${stock}`}</div>
     </div>`;
   }).join("");
@@ -3630,11 +3635,11 @@ function collectAccPayments() {
 function updateAccSplitSummary() {
   const total = accCartTotal();
   const paid = collectAccPayments().reduce((s, p) => s + p.amount, 0);
-  document.getElementById("acc-split-paid").textContent = fmt(paid);
+  document.getElementById("acc-split-paid").textContent = accMoney(paid);
   const rem = document.getElementById("acc-split-remain-wrap");
   if (rem) {
     rem.classList.toggle("hidden", Math.abs(total - paid) < 0.01);
-    document.getElementById("acc-split-remain").textContent = fmt(Math.max(0, total - paid));
+    document.getElementById("acc-split-remain").textContent = accMoney(Math.max(0, total - paid));
   }
 }
 
@@ -3647,8 +3652,8 @@ function renderAccCart() {
     box.innerHTML = "";
     empty.classList.remove("hidden");
     document.getElementById("acc-checkout-btn").disabled = true;
-    document.getElementById("acc-cart-subtotal").textContent = fmt(0);
-    document.getElementById("acc-cart-total").textContent = fmt(0);
+    document.getElementById("acc-cart-subtotal").textContent = accMoney(0);
+    document.getElementById("acc-cart-total").textContent = accMoney(0);
     return;
   }
   empty.classList.add("hidden");
@@ -3659,12 +3664,12 @@ function renderAccCart() {
     return `<div class="cart-item">
       <div><div class="ci-name">${esc(c.product.name)}</div></div>
       <div class="ci-qty"><button type="button" onclick="accChangeQty(${idx},-1)">−</button>${c.quantity}<button type="button" onclick="accChangeQty(${idx},1)">+</button></div>
-      <strong>${fmt(line)}</strong>
+      <strong>${accMoney(line)}</strong>
       <button class="btn btn-ghost btn-sm" onclick="accRemoveLine(${idx})">×</button>
     </div>`;
   }).join("");
-  document.getElementById("acc-cart-subtotal").textContent = fmt(sub);
-  document.getElementById("acc-cart-total").textContent = fmt(sub);
+  document.getElementById("acc-cart-subtotal").textContent = accMoney(sub);
+  document.getElementById("acc-cart-total").textContent = accMoney(sub);
   renderAccSplitPayments();
   updateAccSplitSummary();
   document.getElementById("acc-checkout-btn").disabled = false;
@@ -3719,20 +3724,20 @@ async function loadAccCashRegister() {
   try {
     const r = await api("/api/accessories/cash-register?period=day");
     kpi.innerHTML = `
-      <div class="kpi accent-blue"><div class="label">Приход</div><div class="value">${fmt(r.total_inflows)}</div></div>
-      <div class="kpi accent-warn"><div class="label">Расход</div><div class="value">${fmt(r.total_outflows)}</div></div>
-      <div class="kpi accent-green"><div class="label">Чистыми</div><div class="value">${fmt(r.net_cash)}</div></div>
-      <div class="kpi"><div class="label">Прибыль</div><div class="value">${fmt(r.profit)}</div></div>`;
+      <div class="kpi accent-blue"><div class="label">Приход</div><div class="value">${accMoney(r.total_inflows)}</div></div>
+      <div class="kpi accent-warn"><div class="label">Расход</div><div class="value">${accMoney(r.total_outflows)}</div></div>
+      <div class="kpi accent-green"><div class="label">Чистыми</div><div class="value">${accMoney(r.net_cash)}</div></div>
+      <div class="kpi"><div class="label">Прибыль</div><div class="value">${accMoney(r.profit)}</div></div>`;
     const bal = document.getElementById("acc-balances");
     if (bal) {
       bal.innerHTML = (r.inflows || []).map((b) =>
-        `<div class="pos-balance-row"><span>${esc(b.name)}</span><strong>${fmt(b.amount)}</strong></div>`
+        `<div class="pos-balance-row"><span>${esc(b.name)}</span><strong>${accMoney(b.amount)}</strong></div>`
       ).join("") || "";
     }
     const tb = document.getElementById("acc-expenses-tbody");
     if (tb) {
       tb.innerHTML = (r.expense_lines || []).map((e) =>
-        `<tr><td>${esc(e.expense_date)}</td><td>${esc(e.category)}</td><td>${fmt(e.amount)}</td></tr>`
+        `<tr><td>${esc(e.expense_date)}</td><td>${esc(e.category)}</td><td>${accMoney(e.amount)}</td></tr>`
       ).join("") || '<tr><td colspan="3">Нет расходов</td></tr>';
     }
   } catch (err) {
@@ -3746,15 +3751,15 @@ async function loadAccReport() {
   document.getElementById("acc-report-content").innerHTML = `
     <div class="report-header"><h3>Аксессуары — финансы</h3><p>${r.period_label}</p></div>
     <div class="report-kpi">
-      <div class="report-box"><div class="lbl">Выручка</div><div class="val">${fmt(r.revenue)}</div><div class="sub">${r.sales_count} чеков · ${r.items_sold} шт</div></div>
-      <div class="report-box"><div class="lbl">Себестоимость</div><div class="val">${fmt(r.cogs)}</div></div>
-      <div class="report-box"><div class="lbl">Прибыль продаж</div><div class="val">${fmt(r.shop_profit)}</div></div>
-      <div class="report-box"><div class="lbl">Расходы</div><div class="val">${fmt(r.expenses)}</div></div>
-      <div class="report-box"><div class="lbl">Чистая прибыль</div><div class="val" style="color:var(--success)">${fmt(r.net_profit)}</div></div>
+      <div class="report-box"><div class="lbl">Выручка</div><div class="val">${accMoney(r.revenue)}</div><div class="sub">${r.sales_count} чеков · ${r.items_sold} шт</div></div>
+      <div class="report-box"><div class="lbl">Себестоимость</div><div class="val">${accMoney(r.cogs)}</div></div>
+      <div class="report-box"><div class="lbl">Прибыль продаж</div><div class="val">${accMoney(r.shop_profit)}</div></div>
+      <div class="report-box"><div class="lbl">Расходы</div><div class="val">${accMoney(r.expenses)}</div></div>
+      <div class="report-box"><div class="lbl">Чистая прибыль</div><div class="val" style="color:var(--success)">${accMoney(r.net_profit)}</div></div>
     </div>
     ${(r.expenses_by_category || []).length ? `<div class="card"><div class="card-header"><h3>Расходы по категориям</h3></div>
       <div class="card-body table-wrap"><table class="data-table"><thead><tr><th>Категория</th><th>Сумма</th></tr></thead><tbody>
-        ${r.expenses_by_category.map((e) => `<tr><td>${esc(e.category)}</td><td>${fmt(e.amount)}</td></tr>`).join("")}
+        ${r.expenses_by_category.map((e) => `<tr><td>${esc(e.category)}</td><td>${accMoney(e.amount)}</td></tr>`).join("")}
       </tbody></table></div></div>` : ""}
     <div class="card" style="margin-top:1rem"><div class="card-header"><h3>Последние продажи</h3></div>
       <div class="table-wrap card-body"><table class="data-table">
@@ -3762,7 +3767,7 @@ async function loadAccReport() {
         <tbody>${(r.recent_sales || []).map((s) => `<tr>
           <td>${esc(s.created_at?.slice(0, 16) || "")}</td><td>#${s.id}</td>
           <td>${esc(s.product_name)}</td><td>${s.quantity}</td>
-          <td>${fmt(s.subtotal)}</td><td><strong>${fmt(s.shop_profit)}</strong></td>
+          <td>${accMoney(s.subtotal)}</td><td><strong>${accMoney(s.shop_profit)}</strong></td>
         </tr>`).join("") || '<tr><td colspan="6">Нет продаж</td></tr>'}
         </tbody></table></div></div>`;
 }
