@@ -324,7 +324,10 @@ def migrate_db(conn: sqlite3.Connection) -> None:
         _set_warehouse_currencies(conn)
         _fix_z_register_warehouse_split(conn)
         _reclassify_phones_from_accessories(conn)
-        _dedupe_accessory_products(conn)
+        try:
+            _dedupe_accessory_products(conn)
+        except Exception as exc:
+            logger.warning("Accessory dedupe migration skipped: %s", exc)
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS unit_reservations (
@@ -2701,7 +2704,14 @@ def get_expense_warehouse_split(conn: sqlite3.Connection) -> list[dict[str, Any]
             {"warehouse_id": r["warehouse_id"], "warehouse_name": r["warehouse_name"], "pct": float(r["pct"])}
             for r in rows
         ]
-    whs = conn.execute("SELECT id, name FROM warehouses ORDER BY id").fetchall()
+    whs = conn.execute(
+        """
+        SELECT id, name FROM warehouses
+        WHERE COALESCE(warehouse_type, '') != 'accessories'
+          AND LOWER(name) NOT LIKE '%аксесс%'
+        ORDER BY id
+        """
+    ).fetchall()
     if not whs:
         return []
     pct = round(100.0 / len(whs), 4)
@@ -3916,8 +3926,21 @@ async def save_expense_allocation(body: ExpenseAllocationIn, x_pin: str | None =
     if body.rules and abs(total - 100) > 0.5:
         raise HTTPException(status_code=400, detail=f"Сумма процентов должна быть 100% (сейчас {total:.1f}%)")
     with db() as conn:
+        allowed = {
+            int(r["id"]) for r in conn.execute(
+                """
+                SELECT id FROM warehouses
+                WHERE COALESCE(warehouse_type, '') != 'accessories'
+                  AND LOWER(name) NOT LIKE '%аксесс%'
+                """
+            ).fetchall()
+        }
         conn.execute("DELETE FROM expense_warehouse_split")
         for r in body.rules:
+            if r.warehouse_id not in allowed:
+                continue
+            if r.pct <= 0:
+                continue
             conn.execute(
                 "INSERT INTO expense_warehouse_split (warehouse_id, pct) VALUES (?, ?)",
                 (r.warehouse_id, r.pct),
@@ -6435,6 +6458,8 @@ def _report_opiu(conn: sqlite3.Connection, period: str, date_from: str, date_to:
     multi = len(by_currency) > 1
     gross_profit = fin["gross_revenue"] - fin["own_cogs"] - fin["supplier_due"]
     operating_profit = gross_profit - total_expenses if not multi else None
+    split = get_expense_warehouse_split(conn)
+    expenses_by_warehouse = allocate_expense_amount(total_expenses, split)
     return {
         "period_label": label,
         "revenue": fin["gross_revenue"],
@@ -6446,6 +6471,8 @@ def _report_opiu(conn: sqlite3.Connection, period: str, date_from: str, date_to:
         "operating_expenses": total_expenses,
         "main_operating_expenses": main_expenses,
         "expenses_by_category": [{"category": r["category"], "amount": float(r["total"]), "department": r["department"] or "main"} for r in expenses],
+        "expenses_by_warehouse": expenses_by_warehouse,
+        "expense_allocation": split,
         "operating_profit": operating_profit,
         "shop_profit": fin["shop_profit"],
         "net_profit": operating_profit,

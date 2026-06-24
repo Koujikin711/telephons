@@ -3966,17 +3966,30 @@ async function loadExpenseAllocationSettings() {
   const box = document.getElementById("expense-allocation-rows");
   if (!box) return;
   if (!warehouses.length) await loadWarehouses();
+  const whList = phoneWarehouses();
   let rules = [];
   try {
     const data = await api("/api/settings/expense-allocation");
     rules = data.rules || [];
   } catch { /* empty */ }
   const byWh = Object.fromEntries(rules.map((r) => [r.warehouse_id, r.pct]));
-  box.innerHTML = warehouses.map((w) => `
+  const defaultPct = whList.length ? Math.round(100 / whList.length) : 0;
+  box.innerHTML = whList.map((w) => `
     <label class="form-row-inline">${esc(w.name)}
       <input type="number" class="input sm exp-alloc-pct" data-wh-id="${w.id}" min="0" max="100" step="0.1"
-        value="${byWh[w.id] ?? Math.round(100 / warehouses.length)}"> %
+        value="${byWh[w.id] ?? defaultPct}"> %
     </label>`).join("");
+  box.querySelectorAll(".exp-alloc-pct").forEach((inp) => inp.addEventListener("input", updateExpenseAllocationSum));
+  updateExpenseAllocationSum();
+}
+
+function updateExpenseAllocationSum() {
+  const el = document.getElementById("expense-allocation-sum");
+  if (!el) return;
+  const sum = [...document.querySelectorAll(".exp-alloc-pct")].reduce((s, inp) => s + (+inp.value || 0), 0);
+  const ok = Math.abs(sum - 100) < 0.5;
+  el.textContent = `Сумма: ${sum.toFixed(1)}%${ok ? "" : " — должно быть 100%"}`;
+  el.style.color = ok ? "var(--muted)" : "var(--danger)";
 }
 
 async function saveExpenseAllocation(e) {
@@ -4040,6 +4053,26 @@ function renderCurrencyBreakdown(byCurrency) {
         ${c.gross_profit != null ? `<div class="sub">валовая ${fmtCurrency(c.gross_profit, c)}</div>` : ""}
       </div>`).join("")}
   </div></div></div>`;
+}
+
+function renderExpensesByWarehouse(total, rows) {
+  if (!total && !(rows || []).length) return "";
+  const tjs = currency_meta("TJS");
+  const whRows = (rows || []).filter((w) => w.amount > 0 || w.pct > 0);
+  return `<div class="card"><div class="card-header"><h3>Расходы по складам</h3></div>
+    <div class="card-body table-wrap"><table class="data-table">
+      <thead><tr><th>Склад</th><th>Доля</th><th>Расход</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Общий расход</strong></td><td>100%</td><td><strong>${fmtCurrency(total, tjs)}</strong></td></tr>
+        ${whRows.map((w) => `<tr>
+          <td>${esc(w.warehouse_name)}</td>
+          <td>${w.pct}%</td>
+          <td>${fmtCurrency(w.amount, tjs)}</td>
+        </tr>`).join("")}
+      </tbody>
+    </table>
+    <p class="hint muted" style="margin-top:.65rem">Доли задаются в <strong>Настройки → Расходы по складам (%)</strong>.</p>
+  </div></div>`;
 }
 
 function renderReportBlock(r, title) {
@@ -4107,7 +4140,8 @@ async function loadReport() {
       </div>
       ${(r.expenses_by_category || []).length ? `<div class="card"><div class="card-header"><h3>Расходы по категориям</h3></div><div class="card-body table-wrap"><table class="data-table"><thead><tr><th>Категория</th><th>Отдел</th><th>Сумма</th></tr></thead><tbody>
         ${r.expenses_by_category.map((e) => `<tr><td>${esc(e.category)}</td><td>${e.department === "accessories" ? "Аксессуары" : "Основной"}</td><td>${fmtCurrency(e.amount, currency_meta("TJS"))}</td></tr>`).join("")}
-      </tbody></table></div></div>` : ""}`;
+      </tbody></table></div></div>` : ""}
+      ${renderExpensesByWarehouse(r.operating_expenses, r.expenses_by_warehouse)}`;
     return;
   }
   if (reportType === "dds") {

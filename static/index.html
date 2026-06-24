@@ -596,31 +596,32 @@
                 <tbody id="paymethods-tbody"></tbody>
               </table></div>
             </div>
-            <div class="card hidden" id="settings-expense-card">
-              <div class="card-header"><h3>Расходы (для ОПиУ / ДДС)</h3></div>
-              <form id="expense-form" class="form-stack card-body">
-                <label>Категория<input id="exp-category" class="input" required placeholder="Аренда"></label>
-                <label>Сумма<input type="number" id="exp-amount" class="input" min="0.01" step="0.01" required></label>
-                <label>Дата<input type="date" id="exp-date" class="input"></label>
-                <label>Описание<input id="exp-desc" class="input"></label>
-                <label>Оплата<select id="exp-pay" class="select"></select></label>
-                <button type="submit" class="btn btn-primary">Добавить расход</button>
-              </form>
-              <div class="table-wrap card-body"><table class="data-table">
-                <thead><tr><th>Дата</th><th>Категория</th><th>Сумма</th><th></th></tr></thead>
-                <tbody id="expenses-tbody"></tbody>
-              </table></div>
+            <div class="card" id="expense-allocation-card">
+              <div class="card-header"><h3>Расходы по складам (%)</h3></div>
+              <div class="card-body">
+                <p class="hint">Укажите долю общих расходов для каждого склада. Сумма должна быть <strong>100%</strong>. В отчёте ОПиУ расходы распределятся по этим долям.</p>
+                <form id="expense-allocation-form" class="form-stack">
+                  <div id="expense-allocation-rows"></div>
+                  <p id="expense-allocation-sum" class="muted" style="font-size:.9rem"></p>
+                  <button type="submit" class="btn btn-primary">Сохранить распределение</button>
+                </form>
+              </div>
             </div>
           </div>
-          <div class="card" style="margin-top:1rem" id="expense-allocation-card">
-            <div class="card-header"><h3>Распределение расходов по складам</h3></div>
-            <div class="card-body">
-              <p class="hint">Укажите % для каждого склада (сумма = 100). Расходы в отчётах распределятся пропорционально.</p>
-              <form id="expense-allocation-form" class="form-stack">
-                <div id="expense-allocation-rows"></div>
-                <button type="submit" class="btn btn-primary">Сохранить распределение</button>
-              </form>
-            </div>
+          <div class="card hidden" id="settings-expense-card" style="margin-top:1rem">
+            <div class="card-header"><h3>Расходы (для ОПиУ / ДДС)</h3></div>
+            <form id="expense-form" class="form-stack card-body">
+              <label>Категория<input id="exp-category" class="input" required placeholder="Аренда"></label>
+              <label>Сумма<input type="number" id="exp-amount" class="input" min="0.01" step="0.01" required></label>
+              <label>Дата<input type="date" id="exp-date" class="input"></label>
+              <label>Описание<input id="exp-desc" class="input"></label>
+              <label>Оплата<select id="exp-pay" class="select"></select></label>
+              <button type="submit" class="btn btn-primary">Добавить расход</button>
+            </form>
+            <div class="table-wrap card-body"><table class="data-table">
+              <thead><tr><th>Дата</th><th>Категория</th><th>Сумма</th><th></th></tr></thead>
+              <tbody id="expenses-tbody"></tbody>
+            </table></div>
           </div>
           <div class="card catalog-wipe-card hidden" id="catalog-wipe-card">
             <div class="card-header"><h3>Начать с чистого каталога</h3></div>
@@ -1121,6 +1122,6 @@
   </dialog>
 
   <div id="toast" class="toast"></div>
-  <script src="/static/app.js?v=37"></script>
+  <script src="/static/app.js?v=39"></script>
 </body>
 </html>
