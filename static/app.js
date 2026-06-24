@@ -25,8 +25,10 @@ function warehouseKind(whId) {
   if (!w) return "new";
   if (isAccessoriesWarehouse(w)) return "accessories";
   if ((w.warehouse_type || "").toLowerCase() === "used") return "used";
+  if ((w.warehouse_type || "").toLowerCase() === "partnership") return "partnership";
   const n = (w.name || "").toLowerCase();
   if (n.includes("бу") || n.includes("б/у") || n.includes("б у")) return "used";
+  if (n.includes("артнер") || n.includes("partner")) return "partnership";
   return "new";
 }
 
@@ -1904,7 +1906,9 @@ async function loadWarehouseStock() {
   title.textContent = wh ? `Остатки: ${wh.name} (${wh.currency?.symbol || curTag.trim()})` : "Остатки склада";
   tabs?.classList.toggle("hidden", !hasWh);
   const stockTab = document.getElementById("wh-tab-stock");
-  if (stockTab) stockTab.textContent = kind === "used" ? "Остатки" : "Новые товары";
+  if (stockTab) {
+    stockTab.textContent = kind === "used" ? "Остатки" : kind === "partnership" ? "Партнерство" : "Новые товары";
+  }
 
   if (whViewMode === "zreport" && hasWh) {
     tableWrap?.classList.add("hidden");
@@ -2044,7 +2048,7 @@ async function loadWhZReport() {
 async function importWhZExcel(e) {
   const file = e.target.files?.[0];
   if (!file) return;
-  if (!confirm("Перезаписать Z-отчёт из Excel? Импортированные строки складов (БУ и основной) будут заменены. Склад «Аксессуары» не затрагивается.")) {
+  if (!confirm("Перезаписать Z-отчёт из Excel? Импортированные строки складов (БУ, основной, партнерство) будут заменены. Склад «Аксессуары» не затрагивается.")) {
     e.target.value = "";
     return;
   }
@@ -2289,7 +2293,7 @@ async function submitInboundReceipt(e) {
       supplier_name: document.getElementById("ib-supplier").value.trim(),
       color: kind === "used" ? document.getElementById("ib-color-used").value.trim() : document.getElementById("ib-color").value.trim(),
       memory: kind === "used" ? document.getElementById("ib-memory-used").value.trim() : document.getElementById("ib-memory").value.trim(),
-      condition: kind === "used" ? "used" : "new",
+      condition: kind === "used" ? "used" : kind === "partnership" ? "partnership" : "new",
       purchase_price: purchase,
       sale_price: Math.max(purchase, 1),
     },

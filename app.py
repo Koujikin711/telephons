@@ -33,7 +33,7 @@ MAX_IMAGE_BYTES = 5 * 1024 * 1024
 
 OwnershipType = Literal["own", "consignment"]
 ReportScope = Literal["all", "own", "consignment"]
-ProductCondition = Literal["new", "used", "refurbished"]
+ProductCondition = Literal["new", "used", "refurbished", "partnership"]
 UserRole = Literal["owner", "warehouse", "cashier", "accessories"]
 DEFAULT_WAREHOUSE_NAME = "Основной склад"
 
@@ -321,6 +321,10 @@ def migrate_db(conn: sqlite3.Connection) -> None:
         )
         _merge_duplicate_bu_warehouses(conn)
         _merge_duplicate_accessories_warehouses(conn)
+        try:
+            resolve_partnership_warehouse_id(conn)
+        except Exception as exc:
+            logger.warning("Partnership warehouse setup skipped: %s", exc)
         _set_warehouse_currencies(conn)
         _fix_z_register_warehouse_split(conn)
         _reclassify_phones_from_accessories(conn)
@@ -1575,6 +1579,42 @@ def resolve_bu_warehouse_id(conn: sqlite3.Connection) -> int:
     return int(cur.lastrowid)
 
 
+def _partnership_warehouse_clause(col: str = "name") -> str:
+    return (
+        f"({col} LIKE '%артнер%' OR {col} LIKE '%ARTNER%' OR {col} LIKE '%artner%' "
+        f"OR warehouse_type = 'partnership')"
+    )
+
+
+def resolve_partnership_warehouse_id(conn: sqlite3.Connection) -> int:
+    row = conn.execute(
+        f"""
+        SELECT id FROM warehouses
+        WHERE {_partnership_warehouse_clause()}
+        ORDER BY id LIMIT 1
+        """
+    ).fetchone()
+    if row:
+        wh_id = int(row["id"])
+        conn.execute(
+            """
+            UPDATE warehouses SET warehouse_type = 'partnership', currency_code = 'USD',
+                   notes = COALESCE(NULLIF(notes, ''), 'Склад партнерство')
+            WHERE id = ?
+            """,
+            (wh_id,),
+        )
+        return wh_id
+    cur = conn.execute(
+        """
+        INSERT INTO warehouses (name, address, notes, is_default, warehouse_type, currency_code, created_at)
+        VALUES ('Партнерство', '', 'Склад партнерство', 0, 'partnership', 'USD', ?)
+        """,
+        (utc_now(),),
+    )
+    return int(cur.lastrowid)
+
+
 def _parse_z_register_sheet(ws: Any, sheet_kind: str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for r in range(2, ws.max_row + 1):
@@ -1607,7 +1647,7 @@ def _parse_z_register_sheet(ws: Any, sheet_kind: str) -> list[dict[str, Any]]:
             sale_date = ws.cell(r, 11).value
             profit = ws.cell(r, 12).value
             comments = ws.cell(r, 13).value
-            condition = "new"
+            condition = "partnership" if sheet_kind == "partnership" else "new"
         if not name or str(name).strip().lower() in ("", "none"):
             continue
         rows.append({
@@ -1654,9 +1694,11 @@ def reset_z_register_import(conn: sqlite3.Connection) -> dict[str, int]:
     try:
         bu_id = resolve_bu_warehouse_id(conn)
         main_id = get_default_warehouse_id(conn)
+        partnership_id = resolve_partnership_warehouse_id(conn)
     except HTTPException:
         return {"deleted_sales": 0, "deleted_units": 0}
-    for wh_id in (main_id, bu_id):
+    wh_ids = [main_id, bu_id, partnership_id]
+    for wh_id in wh_ids:
         for r in conn.execute("SELECT id FROM product_units WHERE warehouse_id = ?", (wh_id,)).fetchall():
             unit_ids.add(int(r["id"]))
     sale_ids = [int(r["id"]) for r in conn.execute(
@@ -1696,7 +1738,11 @@ def _import_z_register_rows(
 ) -> dict[str, Any]:
     created_units = sold = skipped = 0
     errors: list[str] = []
-    expected_condition = "new" if sheet_kind == "new" else "used"
+    expected_condition = (
+        "used" if sheet_kind == "used"
+        else "partnership" if sheet_kind == "partnership"
+        else "new"
+    )
     currency_code = get_warehouse_currency(conn, warehouse_id)["code"]
 
     def record_sale(
@@ -2102,14 +2148,21 @@ def import_z_register_excel(
     wb = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
     targets: list[tuple[str, str, int]] = []
     if sheet and sheet in wb.sheetnames:
-        kind = "used" if sheet.lower() in ("бу", "bu", "б/у") else "new"
-        wh = resolve_bu_warehouse_id(conn) if kind == "used" else get_default_warehouse_id(conn)
+        low = sheet.lower()
+        if low in ("бу", "bu", "б/у"):
+            kind, wh = "used", resolve_bu_warehouse_id(conn)
+        elif "партнер" in low or low == "partnership":
+            kind, wh = "partnership", resolve_partnership_warehouse_id(conn)
+        else:
+            kind, wh = "new", get_default_warehouse_id(conn)
         targets = [(sheet, kind, wh)]
     else:
         for sn in wb.sheetnames:
             low = sn.lower()
             if low in ("бу", "bu", "б/у"):
                 targets.append((sn, "used", resolve_bu_warehouse_id(conn)))
+            elif "партнер" in low or low == "partnership":
+                targets.append((sn, "partnership", resolve_partnership_warehouse_id(conn)))
             elif "доллар" in low or low == "new":
                 targets.append((sn, "new", get_default_warehouse_id(conn)))
     if not targets:
@@ -2144,6 +2197,8 @@ def get_warehouse_receipt_kind(conn: sqlite3.Connection, warehouse_id: int) -> s
         return "accessories"
     if wt == "used":
         return "used"
+    if wt == "partnership" or "артнер" in name:
+        return "partnership"
     if wt == "new":
         return "new"
     if "бу" in name or "б/у" in name or "б у" in name:
@@ -2274,9 +2329,10 @@ def _fix_misclassified_accessories(conn: sqlite3.Connection) -> None:
         acc_wh = resolve_accessories_warehouse_id(conn)
         main_id = get_default_warehouse_id(conn)
         bu_id = resolve_bu_warehouse_id(conn)
+        partnership_id = resolve_partnership_warehouse_id(conn)
     except HTTPException:
         return
-    phone_wh_ids = (main_id, bu_id)
+    phone_wh_ids = (main_id, bu_id, partnership_id)
     moved = False
 
     def move_qty_to_acc(product_id: int, from_wh: int, qty: int, note: str) -> None:
@@ -2380,6 +2436,8 @@ def _set_warehouse_currencies(conn: sqlite3.Connection) -> None:
             expected = "TJS"
         elif kind == "accessories":
             expected = "USD"
+        elif kind == "partnership":
+            expected = "USD"
         elif int(row["is_default"] or 0):
             expected = "USD"
         else:
@@ -2451,8 +2509,11 @@ def _fix_z_register_warehouse_split(conn: sqlite3.Connection) -> None:
 
 
 def _z_register_condition_clause(conn: sqlite3.Connection, warehouse_id: int) -> str:
-    if get_warehouse_receipt_kind(conn, warehouse_id) == "used":
+    kind = get_warehouse_receipt_kind(conn, warehouse_id)
+    if kind == "used":
         return " AND COALESCE(p.condition, 'used') IN ('used', 'refurbished')"
+    if kind == "partnership":
+        return " AND COALESCE(p.condition, 'new') = 'partnership'"
     return " AND COALESCE(p.condition, 'new') = 'new'"
 
 
