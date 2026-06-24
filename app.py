@@ -390,8 +390,6 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     _add_column(conn, "sales", "amount_due", "REAL NOT NULL DEFAULT 0")
     _add_column(conn, "sales", "currency_code", "TEXT NOT NULL DEFAULT 'TJS'")
     _add_column(conn, "expenses", "department", "TEXT NOT NULL DEFAULT 'main'")
-    if _table_exists(conn, "warehouses"):
-        _merge_duplicate_accessories_warehouses(conn)
 
     conn.executescript(
         """
@@ -1423,8 +1421,9 @@ def _bu_warehouse_clause(alias: str = "") -> str:
 
 def _accessories_warehouse_clause(col: str = "name") -> str:
     return (
-        f"(LOWER({col}) LIKE '%аксесс%' OR LOWER({col}) LIKE '%accessory%' "
-        f"OR LOWER({col}) LIKE '%accessories%')"
+        f"({col} LIKE '%аксесс%' OR {col} LIKE '%Аксесс%' OR {col} LIKE '%АКСЕСС%' "
+        f"OR {col} LIKE '%accessory%' OR {col} LIKE '%Accessory%' OR {col} LIKE '%accessories%' "
+        f"OR warehouse_type = 'accessories')"
     )
 
 
@@ -1441,8 +1440,10 @@ def _merge_duplicate_accessories_warehouses(conn: sqlite3.Connection) -> None:
             (utc_now(),),
         )
         rows = conn.execute(
-            f"SELECT id FROM warehouses WHERE {_accessories_warehouse_clause()} ORDER BY id"
+            "SELECT id FROM warehouses WHERE warehouse_type = 'accessories' ORDER BY id"
         ).fetchall()
+    if not rows:
+        return
     if len(rows) < 2:
         primary_id = int(rows[0]["id"])
         conn.execute(
