@@ -327,6 +327,7 @@ def migrate_db(conn: sqlite3.Connection) -> None:
             logger.warning("Partnership warehouse setup skipped: %s", exc)
         _set_warehouse_currencies(conn)
         _fix_z_register_warehouse_split(conn)
+        _sync_product_purchase_from_sales(conn)
         _reclassify_phones_from_accessories(conn)
         try:
             _dedupe_accessory_products(conn)
@@ -359,6 +360,7 @@ def migrate_db(conn: sqlite3.Connection) -> None:
         UPDATE sale_items
         SET shop_profit = subtotal - purchase_price * quantity
         WHERE shop_profit = 0 AND subtotal != 0
+          AND ABS(subtotal - purchase_price * quantity) > 0.001
         """
     )
     conn.executescript(
@@ -2508,6 +2510,60 @@ def _fix_z_register_warehouse_split(conn: sqlite3.Connection) -> None:
         logger.warning("Z-register warehouse split fix skipped: %s", exc)
 
 
+def _unit_line_profit(
+    *,
+    shop_profit: float | None,
+    has_sale: bool,
+    sale_price: float | None,
+    item_purchase_price: float | None,
+    product_purchase_price: float,
+    extra_cost: float,
+) -> float | None:
+    """Прибыль строки Z-отчёта. shop_profit=0 — валидное значение (продажа в ноль), не пересчитывать."""
+    if not has_sale:
+        return None
+    if shop_profit is not None:
+        return float(shop_profit)
+    if sale_price:
+        purchase = float(
+            item_purchase_price if item_purchase_price is not None else product_purchase_price
+        )
+        return float(sale_price) - purchase - float(extra_cost or 0)
+    return None
+
+
+def _sync_product_purchase_from_sales(conn: sqlite3.Connection) -> None:
+    """Подтянуть себестоимость в карточку товара из последней продажи (если в карточке 0)."""
+    try:
+        conn.execute(
+            """
+            UPDATE products
+            SET purchase_price = (
+                SELECT si.purchase_price
+                FROM product_units u
+                JOIN sale_item_units siu ON siu.unit_id = u.id
+                JOIN sale_items si ON si.id = siu.sale_item_id
+                JOIN sales s ON s.id = si.sale_id AND s.status = 'completed'
+                WHERE u.product_id = products.id AND si.purchase_price > 0
+                ORDER BY s.created_at DESC
+                LIMIT 1
+            )
+            WHERE purchase_price = 0
+              AND category = 'phone'
+              AND id IN (
+                  SELECT DISTINCT u.product_id
+                  FROM product_units u
+                  JOIN sale_item_units siu ON siu.unit_id = u.id
+                  JOIN sale_items si ON si.id = siu.sale_item_id
+                  JOIN sales s ON s.id = si.sale_id AND s.status = 'completed'
+                  WHERE si.purchase_price > 0
+              )
+            """
+        )
+    except Exception as exc:
+        logger.warning("Product purchase sync from sales skipped: %s", exc)
+
+
 def _z_register_condition_clause(conn: sqlite3.Connection, warehouse_id: int) -> str:
     kind = get_warehouse_receipt_kind(conn, warehouse_id)
     if kind == "used":
@@ -2529,7 +2585,7 @@ def _z_register_lines(
         SELECT u.id AS unit_id, u.arrival_date, u.imei, u.serial, u.battery_capacity,
                u.client_name, u.region, u.customs_price AS extra_cost, u.status, u.notes,
                p.name AS product_name, p.model, p.memory, p.color, p.purchase_price, p.condition,
-               si.subtotal AS sale_price, si.shop_profit,
+               si.subtotal AS sale_price, si.shop_profit, si.purchase_price AS item_purchase_price,
                s.created_at AS sale_date, s.id AS sale_id
         FROM product_units u
         JOIN products p ON p.id = u.product_id
@@ -2562,6 +2618,14 @@ def _z_register_lines(
         elif not year and not month:
             in_period = bool(sd)
 
+        product_purchase = float(d.get("purchase_price") or 0)
+        item_purchase_raw = d.get("item_purchase_price")
+        item_purchase = float(item_purchase_raw) if item_purchase_raw is not None else None
+        extra_cost = float(d.get("extra_cost") or 0)
+        sale_price = float(d.get("sale_price") or 0) if d.get("sale_price") else None
+        shop_profit_raw = d.get("shop_profit")
+        shop_profit = float(shop_profit_raw) if shop_profit_raw is not None else None
+        display_purchase = item_purchase if sd and item_purchase is not None else product_purchase
         line = {
             "arrival_date": (d.get("arrival_date") or "")[:10] or "—",
             "product_name": d.get("product_name") or "",
@@ -2570,17 +2634,22 @@ def _z_register_lines(
             "imei": d.get("imei") or d.get("serial") or "—",
             "memory": d.get("memory") or "",
             "color": d.get("color") or "",
-            "purchase_price": float(d.get("purchase_price") or 0),
-            "extra_cost": float(d.get("extra_cost") or 0),
-            "sale_price": float(d.get("sale_price") or 0) if d.get("sale_price") else None,
+            "purchase_price": display_purchase,
+            "extra_cost": extra_cost,
+            "sale_price": sale_price,
             "sale_date": sd[:10] if sd else "",
-            "profit": float(d.get("shop_profit") or 0) if d.get("shop_profit") is not None and sd else None,
+            "profit": _unit_line_profit(
+                shop_profit=shop_profit,
+                has_sale=bool(sd),
+                sale_price=sale_price,
+                item_purchase_price=item_purchase,
+                product_purchase_price=product_purchase,
+                extra_cost=extra_cost,
+            ),
             "comments": d.get("notes") or d.get("client_name") or "",
             "battery": d.get("battery_capacity"),
             "status": d.get("status") or "",
         }
-        if not line["profit"] and line["sale_price"] and sd:
-            line["profit"] = line["sale_price"] - line["purchase_price"] - line["extra_cost"]
         all_lines.append(line)
         if d.get("status") == "in_stock":
             stock_lines.append(line)
