@@ -315,9 +315,10 @@ def migrate_db(conn: sqlite3.Connection) -> None:
         conn.execute(
             """
             UPDATE warehouses SET warehouse_type = 'used'
-            WHERE LOWER(name) LIKE '%бу%' OR LOWER(name) LIKE '%б/у%' OR LOWER(name) LIKE '%б у%'
+            WHERE name LIKE '%БУ%' OR name LIKE '%бу%' OR name LIKE '%Б/У%' OR name LIKE '%б/у%'
             """
         )
+        _merge_duplicate_bu_warehouses(conn)
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS unit_reservations (
@@ -1414,12 +1415,54 @@ def _z_battery_int(val: Any) -> int | None:
         return None
 
 
+def _bu_warehouse_clause(alias: str = "") -> str:
+    col = f"{alias}name" if alias else "name"
+    return (
+        f"({col} LIKE '%БУ%' OR {col} LIKE '%бу%' OR {col} LIKE '%Б/У%' OR {col} LIKE '%б/у%' "
+        f"OR LOWER({col}) LIKE '%bu%')"
+    )
+
+
+def _merge_duplicate_bu_warehouses(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
+        f"SELECT id FROM warehouses WHERE {_bu_warehouse_clause()} ORDER BY id"
+    ).fetchall()
+    if len(rows) < 2:
+        return
+    primary_id = int(rows[0]["id"])
+    for row in rows[1:]:
+        dup_id = int(row["id"])
+        conn.execute(
+            "UPDATE product_units SET warehouse_id = ? WHERE warehouse_id = ?",
+            (primary_id, dup_id),
+        )
+        conn.execute(
+            "UPDATE sales SET warehouse_id = ? WHERE warehouse_id = ?",
+            (primary_id, dup_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO warehouse_stock (warehouse_id, product_id, quantity)
+            SELECT ?, product_id, quantity FROM warehouse_stock WHERE warehouse_id = ?
+            ON CONFLICT(warehouse_id, product_id) DO UPDATE SET
+                quantity = warehouse_stock.quantity + excluded.quantity
+            """,
+            (primary_id, dup_id),
+        )
+        conn.execute("DELETE FROM warehouse_stock WHERE warehouse_id = ?", (dup_id,))
+        conn.execute("DELETE FROM stock_movements WHERE warehouse_id = ?", (dup_id,))
+        conn.execute("DELETE FROM warehouses WHERE id = ?", (dup_id,))
+    conn.execute(
+        "UPDATE warehouses SET warehouse_type = 'used', notes = COALESCE(NULLIF(notes, ''), 'Б/у устройства') WHERE id = ?",
+        (primary_id,),
+    )
+
+
 def resolve_bu_warehouse_id(conn: sqlite3.Connection) -> int:
     row = conn.execute(
-        """
+        f"""
         SELECT id FROM warehouses
-        WHERE name LIKE '%БУ%' OR name LIKE '%бу%' OR name LIKE '%Б/У%' OR name LIKE '%б/у%'
-           OR LOWER(name) LIKE '%bu%'
+        WHERE {_bu_warehouse_clause()}
         ORDER BY id LIMIT 1
         """
     ).fetchone()
