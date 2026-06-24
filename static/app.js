@@ -11,7 +11,7 @@ let currentPage = "dashboard";
 let reportScope = "all";
 let analyticsScope = "all";
 let selectedWarehouseId = null;
-let whStockViewTotal = false;
+let whStockViewTotal = true;
 let tiGivenProducts = [];
 let currentUser = null;
 let allowedPages = null;
@@ -541,6 +541,7 @@ async function init() {
     bindGlobalActions();
     bindPos();
     bindSales();
+    bindDashboard();
     bindProducts();
     bindCatalog();
     bindWarehouses();
@@ -587,11 +588,18 @@ document.getElementById("pin-input").addEventListener("keydown", (e) => {
 async function loadDashboard() {
   const d = await api("/api/dashboard");
   document.getElementById("dash-kpi").innerHTML = `
-    <div class="kpi accent-blue"><div class="label">Выручка сегодня</div><div class="value">${fmt(d.today.gross_revenue)}</div><div class="sub">${d.today.sales_count} продаж</div></div>
-    <div class="kpi accent-green"><div class="label">Прибыль сегодня</div><div class="value">${fmt(d.today.shop_profit)}</div><div class="sub">маржа ${d.today.margin_pct}%</div></div>
-    <div class="kpi accent-blue"><div class="label">Выручка за месяц</div><div class="value">${fmt(d.month.gross_revenue)}</div><div class="sub">${d.month.sales_count} продаж</div></div>
-    <div class="kpi accent-warn"><div class="label">Мало на складе</div><div class="value">${d.low_stock_count}</div><div class="sub">позиций</div></div>
+    <div class="kpi accent-blue kpi-clickable" data-kpi="revenue_today" title="Нажмите для детализации">
+      <div class="label">Выручка сегодня</div><div class="value">${fmt(d.today.gross_revenue)}</div><div class="sub">${d.today.sales_count} продаж · подробнее →</div></div>
+    <div class="kpi accent-green kpi-clickable" data-kpi="profit_today" title="Нажмите для детализации">
+      <div class="label">Прибыль сегодня</div><div class="value">${fmt(d.today.shop_profit)}</div><div class="sub">маржа ${d.today.margin_pct}% · подробнее →</div></div>
+    <div class="kpi accent-blue kpi-clickable" data-kpi="revenue_month" title="Нажмите для детализации">
+      <div class="label">Выручка за месяц</div><div class="value">${fmt(d.month.gross_revenue)}</div><div class="sub">${d.month.sales_count} продаж · подробнее →</div></div>
+    <div class="kpi accent-warn kpi-clickable" data-kpi="low_stock" title="Нажмите для списка">
+      <div class="label">Мало на складе</div><div class="value">${d.low_stock_count}</div><div class="sub">позиций · подробнее →</div></div>
   `;
+  document.querySelectorAll("#dash-kpi .kpi-clickable").forEach((el) => {
+    el.addEventListener("click", () => openKpiDetail(el.dataset.kpi));
+  });
   document.getElementById("dash-today").innerHTML = `
     <div class="metric-row"><span>Выручка</span><strong>${fmt(d.today.gross_revenue)}</strong></div>
     <div class="metric-row"><span>Прибыль магазина</span><strong>${fmt(d.today.shop_profit)}</strong></div>
@@ -642,6 +650,70 @@ async function loadDashboard() {
     }
     alertBody.innerHTML = rows.join("");
   }
+}
+
+async function openKpiDetail(metric) {
+  try {
+    const data = await api(`/api/dashboard/kpi-detail?metric=${encodeURIComponent(metric)}`);
+    document.getElementById("kpi-detail-title").textContent = data.title || "Отчёт";
+    const summaryEl = document.getElementById("kpi-detail-summary");
+    const byWhEl = document.getElementById("kpi-detail-by-wh");
+    const thead = document.getElementById("kpi-detail-thead");
+    const tbody = document.getElementById("kpi-detail-tbody");
+
+    if (metric === "low_stock") {
+      summaryEl.innerHTML = `Позиций с низким остатком: <strong>${data.total}</strong>`;
+      byWhEl.classList.add("hidden");
+      thead.innerHTML = "<tr><th>Склад</th><th>Товар</th><th>Остаток</th><th>Мин.</th></tr>";
+      tbody.innerHTML = (data.items || []).map((r) => `
+        <tr>
+          <td>${esc(r.warehouse_name)}</td>
+          <td><strong>${esc(r.product_name)}</strong></td>
+          <td><strong>${r.quantity}</strong></td>
+          <td>${r.min_stock}</td>
+        </tr>`).join("") || '<tr><td colspan="4" style="text-align:center;color:var(--muted)">Всё в норме</td></tr>';
+    } else {
+      const isProfit = metric === "profit_today";
+      summaryEl.innerHTML = `Итого: <strong>${fmt(isProfit ? data.total_profit : data.total_revenue)}</strong>`;
+      if (data.by_warehouse?.length) {
+        byWhEl.classList.remove("hidden");
+        byWhEl.innerHTML = `
+          <h4>По складам</h4>
+          <table class="data-table"><thead><tr><th>Склад</th><th>Чеков</th><th>Выручка</th><th>Прибыль</th></tr></thead><tbody>
+            ${data.by_warehouse.map((w) => `
+              <tr>
+                <td><strong>${esc(w.warehouse_name)}</strong></td>
+                <td>${w.sales_count}</td>
+                <td>${fmt(w.revenue)}</td>
+                <td>${fmt(w.profit)}</td>
+              </tr>`).join("")}
+          </tbody></table>`;
+      } else {
+        byWhEl.classList.add("hidden");
+        byWhEl.innerHTML = "";
+      }
+      thead.innerHTML = `<tr><th>Дата</th><th>Чек</th><th>Склад</th><th>Товар</th><th>Кол-во</th><th>${isProfit ? "Прибыль" : "Сумма"}</th><th>Кассир</th></tr>`;
+      tbody.innerHTML = (data.items || []).map((r) => `
+        <tr>
+          <td>${esc(r.created_at)}</td>
+          <td>#${r.sale_id}</td>
+          <td><strong>${esc(r.warehouse_name)}</strong></td>
+          <td>${esc(r.product_name)}</td>
+          <td>${r.quantity}</td>
+          <td><strong>${fmt(isProfit ? r.shop_profit : r.subtotal)}</strong></td>
+          <td>${esc(r.cashier || "—")}</td>
+        </tr>`).join("") || '<tr><td colspan="7" style="text-align:center;color:var(--muted)">Нет продаж за период</td></tr>';
+    }
+    document.getElementById("kpi-detail-modal").showModal();
+  } catch (err) {
+    toast(err.message, "error");
+  }
+}
+
+function bindDashboard() {
+  document.getElementById("kpi-detail-close")?.addEventListener("click", () => {
+    document.getElementById("kpi-detail-modal")?.close();
+  });
 }
 
 /* ── POS ── */
@@ -1367,10 +1439,8 @@ function bindWarehouses() {
   });
   document.getElementById("ib-existing-product")?.addEventListener("change", onInboundExistingSelect);
   document.getElementById("wh-show-total").onclick = () => {
-    whStockViewTotal = !whStockViewTotal;
-    document.getElementById("wh-show-total").textContent = whStockViewTotal
-      ? "Показать выбранный склад" : "Сводка по всем складам";
-    loadWarehouseStock();
+    if (!whStockViewTotal) showAllWarehousesStock();
+    else loadWarehouseStock();
   };
   document.getElementById("wh-refresh-movements").onclick = loadWarehouseMovements;
   document.getElementById("transfer-doc-close").onclick = () => document.getElementById("transfer-doc-modal").close();
@@ -1383,17 +1453,35 @@ function bindWarehouses() {
 async function loadWarehousesPage() {
   if (!warehouses.length) await loadWarehouses();
   renderWarehouseList();
-  if (!selectedWarehouseId) selectedWarehouseId = defaultWarehouseId();
   populateImportWarehouseSelect();
-  await loadWarehouseStock();
+  if (whStockViewTotal) {
+    await loadWarehouseStock();
+  } else if (!selectedWarehouseId) {
+    showAllWarehousesStock();
+  } else {
+    await loadWarehouseStock();
+  }
   await loadWarehouseMovements();
 }
+
+window.showAllWarehousesStock = () => {
+  whStockViewTotal = true;
+  selectedWarehouseId = null;
+  const btn = document.getElementById("wh-show-total");
+  if (btn) {
+    btn.textContent = "Сводка по всем складам";
+    btn.classList.add("active");
+  }
+  renderWarehouseList();
+  loadWarehouseStock();
+};
 
 function populateImportWarehouseSelect() {
   const sel = document.getElementById("wh-import-warehouse");
   if (!sel) return;
+  const pickId = selectedWarehouseId || defaultWarehouseId();
   sel.innerHTML = warehouses.map((w) =>
-    `<option value="${w.id}"${w.id === selectedWarehouseId ? " selected" : ""}>${esc(w.name)}</option>`
+    `<option value="${w.id}"${w.id === pickId ? " selected" : ""}>${esc(w.name)}</option>`
   ).join("");
 }
 
@@ -1498,12 +1586,19 @@ async function submitProductsImport(e) {
 
 function renderWarehouseList() {
   const tb = document.getElementById("wh-list-tbody");
-  tb.innerHTML = warehouses.map((w) => `
-    <tr class="wh-row${w.id === selectedWarehouseId ? " wh-row-active" : ""}" data-id="${w.id}">
+  const allActive = whStockViewTotal ? " wh-row-active" : "";
+  const allRow = warehouses.length > 1 ? `
+    <tr class="wh-row wh-row-all${allActive}" onclick="showAllWarehousesStock()">
+      <td><strong>Все склады</strong></td>
+      <td><span class="muted">Общая сводка</span></td>
+      <td colspan="2"></td>
+    </tr>` : "";
+  tb.innerHTML = allRow + warehouses.map((w) => `
+    <tr class="wh-row${!whStockViewTotal && w.id === selectedWarehouseId ? " wh-row-active" : ""}" data-id="${w.id}" onclick="selectWarehouse(${w.id})">
       <td><strong>${esc(w.name)}</strong>${w.is_default ? ' <span class="tag tag-own" style="font-size:.6rem">по умолч.</span>' : ""}</td>
       <td>${dash(w.address)}</td>
-      <td><button class="btn btn-ghost btn-sm" onclick="selectWarehouse(${w.id})">Остатки</button></td>
-      <td>
+      <td><button type="button" class="btn btn-ghost btn-sm" onclick="event.stopPropagation(); selectWarehouse(${w.id})">Остатки</button></td>
+      <td onclick="event.stopPropagation()">
         <button class="btn btn-ghost btn-sm" onclick="editWarehouse(${w.id})">✎</button>
         <button class="btn btn-danger" onclick="deleteWarehouse(${w.id})">✕</button>
       </td>
@@ -1513,7 +1608,11 @@ function renderWarehouseList() {
 window.selectWarehouse = (id) => {
   selectedWarehouseId = id;
   whStockViewTotal = false;
-  document.getElementById("wh-show-total").textContent = "Сводка по всем складам";
+  const btn = document.getElementById("wh-show-total");
+  if (btn) {
+    btn.textContent = "← Все склады";
+    btn.classList.remove("active");
+  }
   renderWarehouseList();
   loadWarehouseStock();
 };
@@ -1535,8 +1634,10 @@ async function loadWarehouseStock() {
         <td>${dash(p.model)}</td>
         <td>${dash(p.color)}</td>
         <td><span class="tag tag-${p.category}">${catLabel(p.category)}</span></td>
+        <td>${fmt(p.purchase_price)}</td>
         <td><strong>${p.stock}</strong></td>
-      </tr>`).join("") || '<tr><td colspan="5" style="text-align:center;color:var(--muted)">Нет остатков</td></tr>';
+        <td>—</td>
+      </tr>`).join("") || '<tr><td colspan="7" style="text-align:center;color:var(--muted)">Нет остатков</td></tr>';
     return;
   }
 

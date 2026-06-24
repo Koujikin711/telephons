@@ -4974,6 +4974,115 @@ async def dashboard(x_pin: str | None = Header(default=None, alias="X-Pin")):
     }
 
 
+def _kpi_since_clause(metric: str) -> tuple[str, list[Any], str]:
+    titles = {
+        "revenue_today": "Выручка сегодня",
+        "profit_today": "Прибыль сегодня",
+        "revenue_month": "Выручка за месяц",
+        "low_stock": "Мало на складе",
+    }
+    if metric not in titles:
+        raise HTTPException(status_code=400, detail="Неизвестный показатель")
+    if metric == "low_stock":
+        return "", [], titles[metric]
+    period = "day" if metric.endswith("_today") else "month"
+    since = period_start(period)
+    return " AND s.created_at >= ?", [since], titles[metric]
+
+
+@app.get("/api/dashboard/kpi-detail")
+async def dashboard_kpi_detail(
+    metric: str = Query(..., pattern="^(revenue_today|profit_today|revenue_month|low_stock)$"),
+    warehouse_id: int | None = Query(default=None),
+    x_pin: str | None = Header(default=None, alias="X-Pin"),
+):
+    check_pin(x_pin)
+    since_clause, since_params, title = _kpi_since_clause(metric)
+
+    with db() as conn:
+        if metric == "low_stock":
+            wh_filter = ""
+            wh_params: list[Any] = []
+            if warehouse_id is not None:
+                resolve_warehouse_id(conn, warehouse_id)
+                wh_filter = " AND ws.warehouse_id = ?"
+                wh_params = [warehouse_id]
+            rows = conn.execute(
+                f"""
+                SELECT p.id AS product_id, p.name AS product_name, p.min_stock,
+                       w.id AS warehouse_id, w.name AS warehouse_name,
+                       ws.quantity
+                FROM warehouse_stock ws
+                JOIN products p ON p.id = ws.product_id
+                JOIN warehouses w ON w.id = ws.warehouse_id
+                WHERE ws.quantity <= p.min_stock {wh_filter}
+                ORDER BY w.name, p.name
+                """,
+                wh_params,
+            ).fetchall()
+            items = [row_to_dict(r) for r in rows]
+            return {
+                "metric": metric,
+                "title": title,
+                "total": len(items),
+                "by_warehouse": [],
+                "items": items,
+            }
+
+        wh_filter = ""
+        wh_params: list[Any] = []
+        if warehouse_id is not None:
+            resolve_warehouse_id(conn, warehouse_id)
+            wh_filter = " AND s.warehouse_id = ?"
+            wh_params = [warehouse_id]
+
+        by_wh = conn.execute(
+            f"""
+            SELECT COALESCE(w.name, '—') AS warehouse_name,
+                   s.warehouse_id,
+                   COUNT(DISTINCT s.id) AS sales_count,
+                   COALESCE(SUM(si.subtotal), 0) AS revenue,
+                   COALESCE(SUM(si.shop_profit), 0) AS profit
+            FROM sale_items si
+            JOIN sales s ON s.id = si.sale_id
+            LEFT JOIN warehouses w ON w.id = s.warehouse_id
+            WHERE s.status = 'completed' {since_clause} {wh_filter}
+            GROUP BY s.warehouse_id
+            ORDER BY revenue DESC
+            """,
+            since_params + wh_params,
+        ).fetchall()
+
+        lines = conn.execute(
+            f"""
+            SELECT s.id AS sale_id, s.created_at, s.user_name AS cashier,
+                   COALESCE(w.name, '—') AS warehouse_name,
+                   si.product_name, si.quantity, si.subtotal, si.shop_profit,
+                   si.ownership_type
+            FROM sale_items si
+            JOIN sales s ON s.id = si.sale_id
+            LEFT JOIN warehouses w ON w.id = s.warehouse_id
+            WHERE s.status = 'completed' {since_clause} {wh_filter}
+            ORDER BY s.created_at DESC, s.id DESC
+            LIMIT 500
+            """,
+            since_params + wh_params,
+        ).fetchall()
+
+        total_revenue = sum(float(r["revenue"]) for r in by_wh)
+        total_profit = sum(float(r["profit"]) for r in by_wh)
+        total = total_profit if metric == "profit_today" else total_revenue
+
+        return {
+            "metric": metric,
+            "title": title,
+            "total": total,
+            "total_revenue": total_revenue,
+            "total_profit": total_profit,
+            "by_warehouse": [row_to_dict(r) for r in by_wh],
+            "items": [row_to_dict(r) for r in lines],
+        }
+
 
 class StocktakeStartIn(BaseModel):
     warehouse_id: int

@@ -919,6 +919,19 @@
     </div>
   </dialog>
 
+  <dialog id="kpi-detail-modal" class="modal modal-lg">
+    <h3 id="kpi-detail-title">Отчёт</h3>
+    <div id="kpi-detail-summary" class="kpi-detail-summary"></div>
+    <div id="kpi-detail-by-wh" class="kpi-detail-block hidden"></div>
+    <div class="table-wrap kpi-detail-table"><table class="data-table">
+      <thead id="kpi-detail-thead"></thead>
+      <tbody id="kpi-detail-tbody"></tbody>
+    </table></div>
+    <div class="modal-actions">
+      <button type="button" class="btn btn-ghost" id="kpi-detail-close">Закрыть</button>
+    </div>
+  </dialog>
+
   <dialog id="sale-detail-modal" class="modal modal-lg">
     <div id="sale-detail-content"></div>
     <div class="modal-actions">
@@ -989,6 +1002,6 @@
   </dialog>
 
   <div id="toast" class="toast"></div>
-  <script src="/static/app.js?v=18"></script>
+  <script src="/static/app.js?v=19"></script>
 </body>
 </html>

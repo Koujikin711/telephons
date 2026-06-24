@@ -637,6 +637,13 @@ body {
   background-clip: text;
 }
 .kpi.accent-warn .value { color: var(--warning); }
+.kpi-clickable { cursor: pointer; }
+.kpi-clickable:active { transform: translateY(-2px); }
+.kpi-detail-summary { margin: 0.75rem 0 1rem; font-size: 0.95rem; color: var(--text-secondary); }
+.kpi-detail-block { margin-bottom: 1rem; }
+.kpi-detail-block h4 { margin: 0 0 0.5rem; font-size: 0.9rem; }
+.kpi-detail-table { max-height: 420px; overflow: auto; margin-bottom: 0.5rem; }
+.wh-row-all .muted { font-size: 0.82rem; color: var(--muted); }
 
 .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1.25rem; }
 .grid-3 { display: grid; grid-template-columns: repeat(3, minmax(280px, 1fr)); gap: 1.25rem; }
