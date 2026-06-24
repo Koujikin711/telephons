@@ -12,6 +12,29 @@ let reportScope = "all";
 let analyticsScope = "all";
 let selectedWarehouseId = null;
 let whStockViewTotal = true;
+let whViewMode = "stock";
+let accCart = [];
+let accProducts = [];
+let accWarehouseId = null;
+let accViewMode = "intake";
+let whDevicesCache = [];
+let sellUnitTarget = null;
+
+function warehouseKind(whId) {
+  const w = warehouses.find((x) => x.id === whId);
+  if (!w) return "new";
+  if ((w.warehouse_type || "").toLowerCase() === "used") return "used";
+  const n = (w.name || "").toLowerCase();
+  if (n.includes("бу") || n.includes("б/у") || n.includes("б у")) return "used";
+  return "new";
+}
+
+function whStockColumns(kind) {
+  if (kind === "used") {
+    return ["Модель", "Цвет", "Память", "Аккум.", "IMEI", "Себест.", "Клиент", ""];
+  }
+  return ["Дата", "Модель", "Цвет", "Память", "Регион", "IMEI", "Себест.", "Поставщик", ""];
+}
 let tiGivenProducts = [];
 let currentUser = null;
 let allowedPages = null;
@@ -299,17 +322,15 @@ const PAGE_TITLES = {
   sales: "Продажи",
   warehouses: "Склады",
   "products-own": "Собственные товары",
-  "products-consignment": "Товары под реализацию",
-  suppliers: "Поставщики",
-  "trade-in": "Обмен",
-  shifts: "Смена",
+  "products-consignment": "Под реализацию",
+  accessories: "Аксессуары",
   imei: "IMEI / Серийники",
   users: "Пользователи",
   reports: "Финансовые отчёты",
+  debtors: "Дебиторка",
   analytics: "Аналитика",
   settings: "Настройки",
   stocktake: "Инвентаризация",
-  reservations: "Резервы",
 };
 
 function defaultWarehouseId() {
@@ -332,6 +353,7 @@ function canAccess(page) {
 
 function firstAllowedPage() {
   if (!allowedPages?.length) return "dashboard";
+  if (currentUser?.role === "accessories" && allowedPages.includes("accessories")) return "accessories";
   return allowedPages.includes("dashboard") ? "dashboard" : allowedPages[0];
 }
 
@@ -354,13 +376,10 @@ async function refreshSession() {
 function updateTopbar() {
   const actions = document.getElementById("topbar-actions");
   if (!actions) return;
-  const shiftBadge = openShift
-    ? `<span class="badge badge-ok">Смена #${openShift.id}</span>`
-    : `<span class="badge badge-warn">Смена закрыта</span>`;
   const userBadge = currentUser
     ? `<span class="topbar-user">${esc(currentUser.name)} · ${ROLE_LABELS[currentUser.role] || currentUser.role}</span>`
     : "";
-  actions.innerHTML = `${userBadge}${shiftBadge}<button class="btn btn-ghost btn-sm" id="btn-logout">Выход</button>`;
+  actions.innerHTML = `${userBadge}<button class="btn btn-ghost btn-sm" id="btn-logout">Выход</button>`;
   document.getElementById("btn-logout")?.addEventListener("click", () => {
     pin = "";
     localStorage.removeItem(PIN_KEY);
@@ -458,15 +477,14 @@ function navigate(page) {
     warehouses: loadWarehousesPage,
     "products-own": loadOwnProducts,
     "products-consignment": loadConsProducts,
-    suppliers: loadSuppliers,
-    "trade-in": loadTradeInPage,
-    shifts: loadShiftsPage,
+    accessories: loadAccessoriesPage,
     imei: loadImeiPage,
     reservations: loadReservationsPage,
     users: loadUsersPage,
     settings: loadSettingsPage,
     stocktake: loadStocktakePage,
     reports: loadReport,
+    debtors: loadDebtorsPage,
     analytics: loadAnalytics,
   };
   loaders[page]?.();
@@ -505,8 +523,6 @@ async function loadWarehouses() {
   warehouses = await api("/api/warehouses");
   fillWarehouseSelect(document.getElementById("pos-warehouse"), defaultWarehouseId());
   fillWarehouseSelect(document.getElementById("pf-warehouse"), defaultWarehouseId());
-  fillWarehouseSelect(document.getElementById("ti-given-warehouse"), defaultWarehouseId());
-  fillWarehouseSelect(document.getElementById("ti-received-warehouse"), defaultWarehouseId());
   fillWarehouseSelect(document.getElementById("sm-to-warehouse"), null, { empty: true });
 }
 
@@ -545,13 +561,12 @@ async function init() {
     bindProducts();
     bindCatalog();
     bindWarehouses();
-    bindTradeIn();
     bindSuppliers();
+    bindAccessories();
+    bindDebtors();
     bindReports();
     bindAnalytics();
-    bindShifts();
     bindImei();
-    bindReservations();
     bindUsers();
     bindSettings();
     bindStocktake();
@@ -770,6 +785,54 @@ function bindPos() {
   document.getElementById("cart-discount").addEventListener("input", renderCart);
   document.getElementById("checkout-btn").addEventListener("click", checkout);
   document.getElementById("clear-cart-btn").addEventListener("click", () => { cart = []; renderCart(); });
+  document.getElementById("pos-cash-refresh")?.addEventListener("click", loadPosCashRegister);
+  fillPaySelect(document.getElementById("pos-exp-pay"));
+  document.getElementById("pos-expense-form")?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    try {
+      await api("/api/expenses", { method: "POST", body: JSON.stringify({
+        category: document.getElementById("pos-exp-category").value.trim(),
+        amount: +document.getElementById("pos-exp-amount").value,
+        expense_date: new Date().toISOString().slice(0, 10),
+        description: document.getElementById("pos-exp-desc").value,
+        payment_method_code: document.getElementById("pos-exp-pay").value,
+      }) });
+      toast("Расход добавлен");
+      document.getElementById("pos-expense-form").reset();
+      loadPosCashRegister();
+    } catch (err) { toast(err.message, "error"); }
+  });
+  bindDebtorCheckout();
+}
+
+async function loadPosCashRegister() {
+  const kpi = document.getElementById("pos-cash-kpi");
+  const tb = document.getElementById("pos-expenses-tbody");
+  if (!kpi) return;
+  try {
+    const r = await api("/api/pos/cash-register?period=day");
+    kpi.innerHTML = `
+      <div class="kpi accent-blue"><div class="label">Приход</div><div class="value">${fmt(r.total_inflows)}</div></div>
+      <div class="kpi accent-warn"><div class="label">Расход</div><div class="value">${fmt(r.total_outflows)}</div></div>
+      <div class="kpi accent-green"><div class="label">Чистыми</div><div class="value">${fmt(r.net_cash)}</div></div>
+      <div class="kpi"><div class="label">Прибыль</div><div class="value">${fmt(r.profit)}</div></div>`;
+    const balBox = document.getElementById("pos-balances");
+    if (balBox) {
+      balBox.innerHTML = (r.balances || []).map((b) => `
+        <div class="pos-balance-row">
+          <span>${esc(b.name)}</span>
+          <strong>${fmt(b.net)}</strong>
+          <small class="muted">+${fmt(b.inflow)} / −${fmt(b.outflow)}</small>
+        </div>`).join("") || '<p class="muted">Нет данных</p>';
+    }
+    if (tb) {
+      tb.innerHTML = (r.expenses || []).map((e) =>
+        `<tr><td>${esc(e.expense_date)}</td><td>${esc(e.category)}</td><td><strong>${fmt(e.amount)}</strong></td></tr>`
+      ).join("") || '<tr><td colspan="3" style="text-align:center;color:var(--muted)">Нет расходов</td></tr>';
+    }
+  } catch (err) {
+    kpi.innerHTML = `<p class="muted">${esc(err.message)}</p>`;
+  }
 }
 
 async function loadPos() {
@@ -779,6 +842,7 @@ async function loadPos() {
   const catEl = document.getElementById("pos-category");
   if (catEl) catEl.closest(".toolbar")?.classList.toggle("hidden", currentUser?.role === "accessories");
   await loadProducts();
+  await loadPosCashRegister();
   focusScanInput("pos-search");
 }
 
@@ -1020,17 +1084,7 @@ function renderCart() {
   document.getElementById("cart-total").textContent = fmt(Math.max(0, sub - disc));
   renderSplitPayments();
   updateSplitSummary();
-  const shiftHint = document.getElementById("pos-shift-hint");
-  if (shiftHint) {
-    if (!openShift) {
-      shiftHint.textContent = "Смена не открыта — откройте в разделе «Смена»";
-      shiftHint.classList.remove("hidden");
-      document.getElementById("checkout-btn").disabled = true;
-    } else {
-      shiftHint.classList.add("hidden");
-      document.getElementById("checkout-btn").disabled = false;
-    }
-  }
+  document.getElementById("checkout-btn").disabled = false;
 }
 
 window.removeCartLine = (idx) => {
@@ -1050,16 +1104,56 @@ window.changeQty = (id, d) => {
   renderCart();
 };
 
+let debtorModalResolve = null;
+
+function promptDebtorModal(total, paid) {
+  return new Promise((resolve) => {
+    debtorModalResolve = resolve;
+    const due = Math.max(0, total - paid);
+    document.getElementById("debtor-modal-hint").textContent =
+      `К оплате ${fmt(total)}, оплачено ${fmt(paid)}. В долг: ${fmt(due)}. Укажите клиента.`;
+    document.getElementById("debtor-name").value = "";
+    document.getElementById("debtor-phone").value = "";
+    document.getElementById("debtor-modal").showModal();
+  });
+}
+
+function bindDebtorCheckout() {
+  document.getElementById("debtor-cancel")?.addEventListener("click", () => {
+    document.getElementById("debtor-modal").close();
+    debtorModalResolve?.(null);
+    debtorModalResolve = null;
+  });
+  document.getElementById("debtor-form")?.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const name = document.getElementById("debtor-name").value.trim();
+    const phone = document.getElementById("debtor-phone").value.trim();
+    if (!name) { toast("Укажите имя клиента", "error"); return; }
+    document.getElementById("debtor-modal").close();
+    debtorModalResolve?.({ name, phone });
+    debtorModalResolve = null;
+  });
+}
+
 async function checkout() {
-  if (!openShift) {
-    toast("Сначала откройте смену", "error");
-    return;
-  }
   const discount = +document.getElementById("cart-discount").value || 0;
   const warehouse_id = +document.getElementById("pos-warehouse").value;
+  const total = cartTotalDue();
   try {
     const payments = collectSplitPayments();
-    if (!payments.length) { toast("Укажите суммы оплаты", "error"); return; }
+    const paid = payments.reduce((s, p) => s + p.amount, 0);
+    if (paid <= 0 && total > 0) { toast("Укажите суммы оплаты", "error"); return; }
+    let debtor_name = "";
+    let debtor_phone = "";
+    if (total - paid > 0.01) {
+      const debtor = await promptDebtorModal(total, paid);
+      if (!debtor) return;
+      debtor_name = debtor.name;
+      debtor_phone = debtor.phone;
+    } else if (Math.abs(total - paid) > 0.01) {
+      toast("Сумма оплат не совпадает с итогом", "error");
+      return;
+    }
     const sale = await api("/api/sales", {
       method: "POST",
       body: JSON.stringify({
@@ -1075,7 +1169,7 @@ async function checkout() {
             customs_price: m.customs_price || 0,
           })),
         })),
-        discount, payments, warehouse_id,
+        discount, payments, warehouse_id, debtor_name, debtor_phone,
       }),
     });
     cart = [];
@@ -1084,6 +1178,8 @@ async function checkout() {
     await loadProducts();
     await refreshSession();
     showReceipt(sale);
+    loadPosCashRegister();
+    if (total - paid > 0.01) loadDebtorsPage();
     toast("Продажа проведена");
   } catch (e) { toast(e.message, "error"); }
 }
@@ -1448,6 +1544,18 @@ function bindWarehouses() {
   document.getElementById("wh-download-template")?.addEventListener("click", downloadImportTemplate);
   document.getElementById("wh-import-file")?.addEventListener("change", onImportFileSelected);
   document.getElementById("wh-import-form")?.addEventListener("submit", submitProductsImport);
+  document.querySelectorAll("#wh-main-tabs .seg").forEach((b) => {
+    b.addEventListener("click", () => {
+      document.querySelectorAll("#wh-main-tabs .seg").forEach((x) => x.classList.remove("active"));
+      b.classList.add("active");
+      whViewMode = b.dataset.whView;
+      loadWarehouseStock();
+    });
+  });
+  document.getElementById("wh-sell-cancel")?.addEventListener("click", () => document.getElementById("wh-sell-modal").close());
+  document.getElementById("wh-sell-form")?.addEventListener("submit", submitWhSell);
+  document.getElementById("wh-sell-price")?.addEventListener("input", updateWhSellProfit);
+  document.getElementById("wh-sell-paid")?.addEventListener("input", updateWhSellProfit);
 }
 
 async function loadWarehousesPage() {
@@ -1497,9 +1605,11 @@ function onImportFileSelected(e) {
 
 async function downloadImportTemplate() {
   try {
+    const whId = document.getElementById("wh-import-warehouse")?.value || selectedWarehouseId || "";
     const headers = {};
     if (pin) headers["X-Pin"] = pin;
-    const res = await fetch("/api/import/products/template", { headers });
+    const qs = whId ? `?warehouse_id=${encodeURIComponent(whId)}` : "";
+    const res = await fetch(`/api/import/products/template${qs}`, { headers });
     if (res.status === 401) {
       pin = "";
       localStorage.removeItem(PIN_KEY);
@@ -1608,6 +1718,7 @@ function renderWarehouseList() {
 window.selectWarehouse = (id) => {
   selectedWarehouseId = id;
   whStockViewTotal = false;
+  whViewMode = "stock";
   const btn = document.getElementById("wh-show-total");
   if (btn) {
     btn.textContent = "← Все склады";
@@ -1620,6 +1731,10 @@ window.selectWarehouse = (id) => {
 async function loadWarehouseStock() {
   const tb = document.getElementById("wh-stock-tbody");
   const title = document.getElementById("wh-stock-title");
+  const thead = document.getElementById("wh-stock-thead");
+  const tableWrap = document.getElementById("wh-stock-table-wrap");
+  const zEl = document.getElementById("wh-z-report");
+  const tabs = document.getElementById("wh-main-tabs");
   const hasWh = selectedWarehouseId && !whStockViewTotal;
   document.getElementById("wh-btn-inbound").disabled = !hasWh;
   document.getElementById("wh-btn-outbound").disabled = !hasWh;
@@ -1627,43 +1742,95 @@ async function loadWarehouseStock() {
 
   if (whStockViewTotal) {
     title.textContent = "Сводка по всем складам";
+    tabs?.classList.add("hidden");
+    zEl?.classList.add("hidden");
+    tableWrap?.classList.remove("hidden");
+    if (thead) thead.innerHTML = "<tr><th>Модель</th><th>Цвет</th><th>Кол-во</th><th>Себест.</th></tr>";
     const items = await api("/api/stock/total");
     tb.innerHTML = items.map((p) => `
       <tr>
         <td><strong>${esc(p.name)}</strong></td>
-        <td>${dash(p.model)}</td>
         <td>${dash(p.color)}</td>
-        <td><span class="tag tag-${p.category}">${catLabel(p.category)}</span></td>
-        <td>${fmt(p.purchase_price)}</td>
         <td><strong>${p.stock}</strong></td>
-        <td>—</td>
-      </tr>`).join("") || '<tr><td colspan="7" style="text-align:center;color:var(--muted)">Нет остатков</td></tr>';
+        <td>${fmt(p.purchase_price)}</td>
+      </tr>`).join("") || '<tr><td colspan="4" style="text-align:center;color:var(--muted)">Нет остатков</td></tr>';
     return;
   }
 
   const wh = warehouses.find((w) => w.id === selectedWarehouseId);
+  const kind = warehouseKind(selectedWarehouseId);
   title.textContent = wh ? `Остатки: ${wh.name}` : "Остатки склада";
-  if (!selectedWarehouseId) {
-    tb.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--muted)">Выберите склад</td></tr>';
+  tabs?.classList.toggle("hidden", kind === "used");
+  if (kind !== "used") tabs?.querySelector('[data-wh-view="stock"]')?.classList.add("active");
+
+  if (whViewMode === "zreport" && kind !== "used") {
+    tableWrap?.classList.add("hidden");
+    zEl?.classList.remove("hidden");
+    await loadWhZReport();
     return;
   }
-  const items = await api(`/api/warehouses/${selectedWarehouseId}/stock`);
-  tb.innerHTML = items.map((p) => {
-    const unitsHtml = p.units?.length
-      ? `<details class="units-details"><summary>${p.units.length} шт.</summary><div class="units-list">${p.units.map((u) =>
-          `<div class="unit-chip ${u.has_imei === false ? "unit-no-imei" : ""}${u.display_status === "pending_customs" ? " unit-pending-customs" : ""}${u.display_status === "reserved" ? " unit-reserved" : ""}">${u.imei ? esc(u.imei) : esc(u.serial || "—")}${u.battery_capacity != null ? ` · 🔋${u.battery_capacity}%` : ""}${u.product_color || p.color ? ` · ${esc(u.product_color || p.color)}` : ""}${unitStatusBadge(u)}</div>`
-        ).join("")}</div></details>`
-      : "—";
+  zEl?.classList.add("hidden");
+  tableWrap?.classList.remove("hidden");
+
+  if (!selectedWarehouseId) {
+    tb.innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--muted)">Выберите склад</td></tr>';
+    return;
+  }
+
+  const cols = whStockColumns(kind);
+  if (thead) thead.innerHTML = `<tr>${cols.map((c) => `<th>${c}</th>`).join("")}</tr>`;
+
+  const data = await api(`/api/warehouses/${selectedWarehouseId}/devices`);
+  whDevicesCache = data.items || [];
+  tb.innerHTML = whDevicesCache.map((u) => {
+    const profitHint = u.sale_price > u.purchase_price ? fmt(u.sale_price - u.purchase_price) : "—";
+    const sellBtn = `<button class="btn btn-primary btn-sm" onclick="openWhSellModal(${u.id})">Продать</button>`;
+    if (kind === "used") {
+      return `<tr>
+        <td><strong>${esc(u.model)}</strong></td>
+        <td>${dash(u.color)}</td>
+        <td>${dash(u.memory)}</td>
+        <td>${u.battery_capacity != null ? u.battery_capacity + "%" : "—"}</td>
+        <td>${esc(u.imei || u.serial || "—")}</td>
+        <td>${fmt(u.purchase_price)}</td>
+        <td>${esc(u.client_name || "—")}</td>
+        <td>${sellBtn}</td>
+      </tr>`;
+    }
     return `<tr>
-      <td><strong>${esc(p.name)}</strong></td>
-      <td>${dash(p.model)}</td>
-      <td>${dash(p.color)}</td>
-      <td><span class="tag tag-${p.category}">${catLabel(p.category)}</span></td>
-      <td>${fmt(p.purchase_price)}</td>
-      <td><strong>${p.warehouse_quantity}</strong></td>
-      <td>${unitsHtml}</td>
+      <td>${esc(u.arrival_date || u.created_at?.slice(0, 10) || "—")}</td>
+      <td><strong>${esc(u.model)}</strong></td>
+      <td>${dash(u.color)}</td>
+      <td>${dash(u.memory)}</td>
+      <td>${esc(u.region || "—")}</td>
+      <td>${esc(u.imei || "—")}</td>
+      <td>${fmt(u.purchase_price)}</td>
+      <td>${esc(u.supplier_name || "—")}</td>
+      <td>${sellBtn}</td>
     </tr>`;
-  }).join("") || '<tr><td colspan="7" style="text-align:center;color:var(--muted)">Нет остатков</td></tr>';
+  }).join("") || '<tr><td colspan="9" style="text-align:center;color:var(--muted)">Нет остатков</td></tr>';
+}
+
+async function loadWhZReport() {
+  const el = document.getElementById("wh-z-report");
+  if (!el || !selectedWarehouseId) return;
+  const r = await api(`/api/warehouses/${selectedWarehouseId}/z-report?period=day`);
+  el.innerHTML = `
+    <div class="kpi-grid" style="margin-bottom:1rem">
+      <div class="kpi accent-blue"><div class="label">Выручка</div><div class="value">${fmt(r.revenue)}</div><div class="sub">${r.sales_count} чеков</div></div>
+      <div class="kpi accent-green"><div class="label">Прибыль</div><div class="value">${fmt(r.profit)}</div></div>
+    </div>
+    <h4 class="sub-heading">По способам оплаты</h4>
+    <table class="data-table"><thead><tr><th>Оплата</th><th>Сумма</th></tr></thead><tbody>
+      ${(r.by_payment || []).map((p) => `<tr><td>${esc(p.name || p.method_code)}</td><td><strong>${fmt(p.amount)}</strong></td></tr>`).join("") || "<tr><td colspan=2>Нет данных</td></tr>"}
+    </tbody></table>
+    <h4 class="sub-heading" style="margin-top:1rem">Продажи</h4>
+    <div class="table-wrap" style="max-height:280px;overflow:auto"><table class="data-table">
+      <thead><tr><th>Дата</th><th>Товар</th><th>IMEI</th><th>Сумма</th><th>Прибыль</th></tr></thead>
+      <tbody>${(r.lines || []).map((l) => `<tr>
+        <td>${esc(l.created_at)}</td><td>${esc(l.product_name)}</td><td>${esc(l.imeis || "—")}</td>
+        <td>${fmt(l.subtotal)}</td><td><strong>${fmt(l.shop_profit)}</strong></td></tr>`).join("") || '<tr><td colspan="5">Нет продаж</td></tr>'}
+      </tbody></table></div>`;
 }
 
 window.openWarehouseModal = (wh = null) => {
@@ -1722,22 +1889,93 @@ function isUsedCondition(c) {
   return c === "used" || c === "refurbished";
 }
 
+function updateInboundFieldsForWarehouse() {
+  const kind = warehouseKind(selectedWarehouseId);
+  document.getElementById("ib-receipt-kind").value = kind;
+  document.getElementById("ib-new-fields")?.classList.toggle("hidden", kind === "used");
+  document.getElementById("ib-used-fields")?.classList.toggle("hidden", kind !== "used");
+  document.getElementById("inbound-device-block")?.classList.remove("hidden");
+  document.getElementById("ib-battery-row")?.classList.toggle("hidden", kind !== "used");
+  document.getElementById("ib-qty-row")?.classList.add("hidden");
+  document.getElementById("ib-existing-qty-row")?.classList.add("hidden");
+}
+
 function updateInboundFields() {
-  const isNew = inboundMode === "new";
-  let track = false;
-  let cond = "new";
-  if (isNew) {
-    track = document.getElementById("ib-category")?.value === "phone";
-    cond = document.getElementById("ib-condition")?.value || "new";
-    document.getElementById("ib-supplier-row")?.classList.toggle("hidden", document.getElementById("ib-ownership")?.value !== "consignment");
-  } else {
-    track = !!inboundExistingProduct?.track_units;
-    cond = inboundExistingProduct?.condition || "new";
+  updateInboundFieldsForWarehouse();
+}
+
+window.openWhSellModal = (unitId) => {
+  sellUnitTarget = whDevicesCache.find((u) => u.id === unitId);
+  if (!sellUnitTarget) return;
+  document.getElementById("wh-sell-meta").innerHTML = `
+    <div class="metric-row"><span>${esc(sellUnitTarget.model)}</span><strong>${esc(sellUnitTarget.imei || "")}</strong></div>
+    <div class="metric-row"><span>Себестоимость</span><strong>${fmt(sellUnitTarget.purchase_price)}</strong></div>`;
+  document.getElementById("wh-sell-price").value = sellUnitTarget.sale_price > 0 ? sellUnitTarget.sale_price : "";
+  const paidEl = document.getElementById("wh-sell-paid");
+  if (paidEl) paidEl.value = sellUnitTarget.sale_price > 0 ? sellUnitTarget.sale_price : "";
+  document.getElementById("wh-sell-debtor-fields")?.classList.add("hidden");
+  document.getElementById("wh-sell-debtor-name").value = "";
+  document.getElementById("wh-sell-debtor-phone").value = "";
+  fillPaySelect(document.getElementById("wh-sell-pay"));
+  updateWhSellProfit();
+  document.getElementById("wh-sell-modal").showModal();
+};
+
+function updateWhSellProfit() {
+  if (!sellUnitTarget) return;
+  const price = +document.getElementById("wh-sell-price").value || 0;
+  const paid = +document.getElementById("wh-sell-paid")?.value || price;
+  const profit = price - (sellUnitTarget.purchase_price || 0);
+  const debtBlock = document.getElementById("wh-sell-debtor-fields");
+  if (debtBlock) debtBlock.classList.toggle("hidden", price - paid <= 0.01);
+  document.getElementById("wh-sell-profit").textContent = price > 0
+    ? `Прибыль: ${fmt(profit)}${price - paid > 0.01 ? ` · в долг ${fmt(price - paid)}` : ""}`
+    : "Укажите цену продажи";
+}
+
+async function submitWhSell(e) {
+  e.preventDefault();
+  if (!sellUnitTarget) return;
+  const sale_price = +document.getElementById("wh-sell-price").value;
+  const paid_amount = +document.getElementById("wh-sell-paid")?.value;
+  const paid = Number.isFinite(paid_amount) ? paid_amount : sale_price;
+  if (sale_price <= 0) { toast("Укажите цену продажи", "error"); return; }
+  const debtor_name = document.getElementById("wh-sell-debtor-name")?.value.trim() || "";
+  const debtor_phone = document.getElementById("wh-sell-debtor-phone")?.value.trim() || "";
+  if (sale_price - paid > 0.01 && !debtor_name) {
+    toast("Укажите имя и телефон должника", "error");
+    return;
   }
-  document.getElementById("inbound-device-block")?.classList.toggle("hidden", !track);
-  document.getElementById("ib-qty-row")?.classList.toggle("hidden", !isNew || track);
-  document.getElementById("ib-existing-qty-row")?.classList.toggle("hidden", isNew || track);
-  document.getElementById("ib-battery-row")?.classList.toggle("hidden", !isUsedCondition(cond));
+  try {
+    await api("/api/warehouse/quick-sell", {
+      method: "POST",
+      body: JSON.stringify({
+        unit_id: sellUnitTarget.id,
+        sale_price,
+        paid_amount: paid,
+        payment_method: document.getElementById("wh-sell-pay").value,
+        debtor_name,
+        debtor_phone,
+      }),
+    });
+    document.getElementById("wh-sell-modal").close();
+    toast(`Продано! Прибыль: ${fmt(sale_price - sellUnitTarget.purchase_price)}`);
+    loadWarehouseStock();
+    if (currentPage === "pos") loadPosCashRegister();
+    if (currentPage === "products-consignment") loadConsProducts();
+    if (currentPage === "dashboard") loadDashboard();
+    if (currentPage === "debtors") loadDebtorsPage();
+    if (whViewMode === "zreport") loadWhZReport();
+  } catch (err) {
+    toast(err.message, "error");
+  }
+}
+
+function fillPaySelect(sel) {
+  if (!sel) return;
+  sel.innerHTML = (storeConfig.payment_methods || []).map((m) =>
+    `<option value="${esc(m.code)}">${esc(m.name)}</option>`
+  ).join("") || '<option value="cash">Наличные</option>';
 }
 
 async function onInboundExistingSelect() {
@@ -1760,73 +1998,66 @@ async function onInboundExistingSelect() {
 async function openInboundModal() {
   if (!selectedWarehouseId) return;
   const wh = warehouses.find((w) => w.id === selectedWarehouseId);
-  document.getElementById("inbound-wh-label").textContent = `Склад: ${wh?.name || selectedWarehouseId}`;
+  const kind = warehouseKind(selectedWarehouseId);
+  document.getElementById("inbound-wh-label").textContent = `Склад: ${wh?.name || selectedWarehouseId} · ${kind === "used" ? "Б/У" : "Новые"}`;
   inboundMode = "new";
-  inboundExistingProduct = null;
-  document.querySelectorAll("#inbound-mode-tabs .seg").forEach((x) => x.classList.toggle("active", x.dataset.inboundMode === "new"));
   document.getElementById("inbound-panel-new").classList.remove("hidden");
   document.getElementById("inbound-panel-existing").classList.add("hidden");
-  ["ib-name", "ib-color", "ib-memory", "ib-imei", "ib-serial", "ib-notes", "ib-supplier"].forEach((id) => {
+  ["ib-name", "ib-color", "ib-memory", "ib-imei", "ib-serial", "ib-notes", "ib-supplier", "ib-region", "ib-client",
+    "ib-name-used", "ib-color-used", "ib-memory-used"].forEach((id) => {
     const el = document.getElementById(id);
     if (el) el.value = "";
   });
   document.getElementById("ib-purchase").value = "";
-  document.getElementById("ib-sale").value = "";
-  document.getElementById("ib-qty").value = "1";
+  document.getElementById("ib-purchase-used").value = "";
   document.getElementById("ib-battery").value = "";
-  document.getElementById("ib-category").value = "phone";
-  document.getElementById("ib-condition").value = "new";
-  document.getElementById("ib-ownership").value = "own";
-  const products = await api("/api/products");
-  document.getElementById("ib-existing-product").innerHTML = products.map((p) =>
-    `<option value="${p.id}">${esc(p.name)}${p.color ? ` · ${esc(p.color)}` : ""}${p.track_units ? " ★" : ""}</option>`
-  ).join("") || '<option value="">Нет товаров</option>';
-  document.getElementById("ib-existing-meta").innerHTML = "";
-  updateInboundFields();
+  document.getElementById("ib-arrival").value = new Date().toISOString().slice(0, 10);
+  document.getElementById("ib-ownership").value = kind === "used" ? "own" : "own";
+  updateInboundFieldsForWarehouse();
   document.getElementById("inbound-modal").showModal();
   focusScanInput("ib-imei");
 }
 
 async function submitInboundReceipt(e) {
   e.preventDefault();
+  const kind = warehouseKind(selectedWarehouseId);
   const batteryRaw = document.getElementById("ib-battery").value;
   const battery = batteryRaw === "" ? null : +batteryRaw;
+  const name = kind === "used"
+    ? document.getElementById("ib-name-used").value.trim()
+    : document.getElementById("ib-name").value.trim();
+  if (!name) { toast("Укажите модель", "error"); return; }
+  if (!document.getElementById("ib-imei").value.trim()) { toast("Укажите IMEI", "error"); return; }
+  if (kind === "used" && battery == null) { toast("Укажите ёмкость батареи", "error"); return; }
+  const purchase = kind === "used"
+    ? +document.getElementById("ib-purchase-used").value
+    : +document.getElementById("ib-purchase").value;
   const body = {
     warehouse_id: selectedWarehouseId,
-    mode: inboundMode,
+    mode: "new",
     imei: document.getElementById("ib-imei").value.trim(),
     serial: document.getElementById("ib-serial").value.trim(),
     battery_capacity: battery,
     notes: document.getElementById("ib-notes").value.trim(),
-    quantity: inboundMode === "existing" && !inboundExistingProduct?.track_units
-      ? (+document.getElementById("ib-existing-qty").value || 1)
-      : (+document.getElementById("ib-qty").value || 1),
-  };
-  if (inboundMode === "new") {
-    const name = document.getElementById("ib-name").value.trim();
-    if (!name) { toast("Укажите название", "error"); return; }
-    body.product = {
+    client_name: kind === "used" ? document.getElementById("ib-client").value.trim() : "",
+    region: kind === "new" ? document.getElementById("ib-region").value.trim() : "",
+    arrival_date: document.getElementById("ib-arrival").value,
+    quantity: 1,
+    product: {
       name,
-      category: document.getElementById("ib-category").value,
+      category: "phone",
       ownership_type: document.getElementById("ib-ownership").value,
       supplier_name: document.getElementById("ib-supplier").value.trim(),
-      color: document.getElementById("ib-color").value.trim(),
-      memory: document.getElementById("ib-memory").value.trim(),
-      condition: document.getElementById("ib-condition").value,
-      purchase_price: +document.getElementById("ib-purchase").value,
-      sale_price: +document.getElementById("ib-sale").value,
-    };
-    if (isUsedCondition(body.product.condition) && battery == null) {
-      toast("Для Б/у укажите ёмкость батареи", "error");
-      return;
-    }
-  } else {
-    body.product_id = +document.getElementById("ib-existing-product").value;
-    if (!body.product_id) { toast("Выберите товар", "error"); return; }
-    if (isUsedCondition(inboundExistingProduct?.condition) && battery == null) {
-      toast("Для Б/у укажите ёмкость батареи", "error");
-      return;
-    }
+      color: kind === "used" ? document.getElementById("ib-color-used").value.trim() : document.getElementById("ib-color").value.trim(),
+      memory: kind === "used" ? document.getElementById("ib-memory-used").value.trim() : document.getElementById("ib-memory").value.trim(),
+      condition: kind === "used" ? "used" : "new",
+      purchase_price: purchase,
+      sale_price: Math.max(purchase, 1),
+    },
+  };
+  if (body.product.ownership_type === "consignment" && !body.product.supplier_name) {
+    toast("Укажите поставщика", "error");
+    return;
   }
   try {
     await api("/api/stock/inbound-receipt", { method: "POST", body: JSON.stringify(body) });
@@ -2757,34 +2988,40 @@ async function loadOwnProducts() {
 }
 
 async function loadConsProducts() {
-  const q = document.getElementById("cons-search").value;
-  const sup = document.getElementById("cons-supplier-filter").value;
-  let url = `/api/products?ownership_type=consignment&q=${encodeURIComponent(q)}`;
-  if (sup) url += `&supplier=${encodeURIComponent(sup)}`;
-  const items = await api(url);
-  const suppliers = [...new Set(items.map((p) => p.supplier_name).filter(Boolean))];
+  await loadSuppliers();
+  const q = (document.getElementById("cons-search")?.value || "").toLowerCase();
+  const sup = document.getElementById("cons-supplier-filter")?.value || "";
+  if (!warehouses.length) await loadWarehouses();
+  let items = [];
+  try {
+    const batches = await Promise.all(
+      warehouses.map((w) => api(`/api/warehouses/${w.id}/devices`).catch(() => ({ items: [] })))
+    );
+    items = batches.flatMap((d) => (d.items || []).filter((u) => u.ownership_type === "consignment"));
+  } catch { /* empty */ }
+  if (sup) items = items.filter((u) => u.supplier_name === sup);
+  if (q) items = items.filter((u) =>
+    [u.model, u.color, u.memory, u.imei, u.supplier_name].some((x) => String(x || "").toLowerCase().includes(q))
+  );
+  const suppliers = [...new Set(items.map((u) => u.supplier_name).filter(Boolean))];
   const sel = document.getElementById("cons-supplier-filter");
-  const cur = sel.value;
-  sel.innerHTML = '<option value="">Все поставщики</option>' + suppliers.map((s) => `<option value="${esc(s)}">${esc(s)}</option>`).join("");
-  sel.value = cur;
-  document.getElementById("cons-tbody").innerHTML = items.map((p) => {
-    const comm = p.sale_price - p.purchase_price;
-    return `<tr>
-      <td><strong>${esc(p.name)}</strong></td>
-      <td>${dash(p.model)}</td>
-      <td>${dash(p.color)}</td>
-      <td>${dash(p.memory)}</td>
-      <td>${esc(p.supplier_name)}</td>
-      <td><span class="tag tag-${p.category}">${catLabel(p.category)}</span></td>
-      <td>${fmt(p.purchase_price)}</td>
-      <td>${fmt(p.sale_price)}</td>
-      <td>${fmt(comm)} (${pct(comm, p.sale_price)}%)</td>
-      <td class="${p.stock <= p.min_stock ? "stock-low" : ""}">${p.stock}</td>
-      <td>
-        <button class="btn btn-ghost btn-sm" onclick="editProduct(${p.id})">✎</button>
-        <button class="btn btn-danger" onclick="deleteProduct(${p.id})">✕</button>
-      </td></tr>`;
-  }).join("") || '<tr><td colspan="11" style="text-align:center;color:var(--muted)">Нет товаров</td></tr>';
+  if (sel) {
+    const cur = sel.value;
+    sel.innerHTML = '<option value="">Все поставщики</option>' + suppliers.map((s) => `<option value="${esc(s)}">${esc(s)}</option>`).join("");
+    sel.value = cur;
+  }
+  document.getElementById("cons-tbody").innerHTML = items.map((u) => `
+    <tr>
+      <td><strong>${esc(u.model)}</strong></td>
+      <td>${dash(u.color)}</td>
+      <td>${dash(u.memory)}</td>
+      <td>${esc(u.imei || "—")}</td>
+      <td>${esc(u.supplier_name || "—")}</td>
+      <td>${fmt(u.purchase_price)}</td>
+      <td>${fmt(u.sale_price)}</td>
+      <td><button class="btn btn-primary btn-sm" onclick="openWhSellModal(${u.id})">Продать</button></td>
+    </tr>`).join("") || '<tr><td colspan="8" style="text-align:center;color:var(--muted)">Нет товаров под реализацию</td></tr>';
+  whDevicesCache = [...whDevicesCache.filter((x) => x.ownership_type !== "consignment"), ...items];
 }
 
 window.openProductModal = (ownership) => {
@@ -2942,6 +3179,330 @@ async function saveProduct(e) {
   }
 }
 
+/* ── Accessories ── */
+function bindAccessories() {
+  document.querySelectorAll("#acc-view-tabs .seg").forEach((b) => {
+    b.addEventListener("click", () => {
+      document.querySelectorAll("#acc-view-tabs .seg").forEach((x) => x.classList.remove("active"));
+      b.classList.add("active");
+      accViewMode = b.dataset.accView;
+      document.getElementById("acc-panel-intake").classList.toggle("hidden", accViewMode !== "intake");
+      document.getElementById("acc-panel-pos").classList.toggle("hidden", accViewMode !== "pos");
+      document.getElementById("acc-panel-report").classList.toggle("hidden", accViewMode !== "report");
+      if (accViewMode === "pos") loadAccPos();
+      else if (accViewMode === "report") loadAccReport();
+      else loadAccStock();
+    });
+  });
+  document.getElementById("acc-inbound-form")?.addEventListener("submit", submitAccInbound);
+  document.getElementById("acc-stock-search")?.addEventListener("input", debounce(loadAccStock, 300));
+  document.getElementById("acc-pos-search")?.addEventListener("input", debounce(loadAccProducts, 250));
+  document.getElementById("acc-checkout-btn")?.addEventListener("click", accCheckout);
+  document.getElementById("acc-clear-cart")?.addEventListener("click", () => { accCart = []; renderAccCart(); });
+  document.getElementById("acc-fill-cash")?.addEventListener("click", () => {
+    const t = accCartTotal();
+    document.querySelectorAll(".acc-split-pay-input").forEach((inp) => {
+      inp.value = inp.dataset.method === "cash" ? t : "";
+    });
+    updateAccSplitSummary();
+  });
+  document.getElementById("acc-split-payments")?.addEventListener("input", (e) => {
+    if (e.target.classList.contains("acc-split-pay-input")) updateAccSplitSummary();
+  });
+  document.getElementById("acc-cash-refresh")?.addEventListener("click", loadAccCashRegister);
+  document.getElementById("acc-report-refresh")?.addEventListener("click", loadAccReport);
+  document.getElementById("acc-report-period")?.addEventListener("change", loadAccReport);
+  fillPaySelect(document.getElementById("acc-exp-pay"));
+  document.getElementById("acc-expense-form")?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    try {
+      await api("/api/expenses", { method: "POST", body: JSON.stringify({
+        category: document.getElementById("acc-exp-category").value.trim(),
+        amount: +document.getElementById("acc-exp-amount").value,
+        expense_date: new Date().toISOString().slice(0, 10),
+        description: document.getElementById("acc-exp-desc").value,
+        payment_method_code: document.getElementById("acc-exp-pay").value,
+        department: "accessories",
+      }) });
+      toast("Расход добавлен");
+      document.getElementById("acc-expense-form").reset();
+      loadAccCashRegister();
+      if (accViewMode === "report") loadAccReport();
+    } catch (err) { toast(err.message, "error"); }
+  });
+}
+
+async function loadAccessoriesPage() {
+  if (!accWarehouseId) {
+    const wh = await api("/api/accessories/warehouse");
+    accWarehouseId = wh.id;
+  }
+  document.getElementById("acc-panel-intake").classList.toggle("hidden", accViewMode !== "intake");
+  document.getElementById("acc-panel-pos").classList.toggle("hidden", accViewMode !== "pos");
+  document.getElementById("acc-panel-report").classList.toggle("hidden", accViewMode !== "report");
+  if (accViewMode === "pos") await loadAccPos();
+  else if (accViewMode === "report") await loadAccReport();
+  else await loadAccStock();
+}
+
+async function loadAccStock() {
+  const q = document.getElementById("acc-stock-search")?.value || "";
+  const items = await api(`/api/accessories/stock?q=${encodeURIComponent(q)}`);
+  document.getElementById("acc-stock-tbody").innerHTML = items.map((p) => {
+    const qty = p.warehouse_quantity ?? p.stock ?? 0;
+    return `<tr>
+      <td><strong>${esc(p.name)}</strong></td>
+      <td>${dash(p.model)}</td>
+      <td>${esc(p.supplier_name || "—")}</td>
+      <td>${fmt(p.purchase_price)}</td>
+      <td><input type="number" class="input sm acc-price-inp" data-id="${p.id}" value="${p.sale_price}" min="0.01" step="0.01"></td>
+      <td><strong>${qty}</strong></td>
+      <td><button class="btn btn-ghost btn-sm" onclick="saveAccPrice(${p.id})">✓</button></td>
+    </tr>`;
+  }).join("") || '<tr><td colspan="7" style="text-align:center;color:var(--muted)">Нет товаров</td></tr>';
+}
+
+window.saveAccPrice = async (id) => {
+  const inp = document.querySelector(`.acc-price-inp[data-id="${id}"]`);
+  if (!inp) return;
+  try {
+    await api(`/api/accessories/products/${id}/price?sale_price=${+inp.value}`, { method: "PUT" });
+    toast("Цена сохранена");
+    loadAccProducts();
+  } catch (e) { toast(e.message, "error"); }
+};
+
+async function submitAccInbound(e) {
+  e.preventDefault();
+  const saleVal = document.getElementById("acc-ib-sale").value;
+  try {
+    await api("/api/accessories/inbound", { method: "POST", body: JSON.stringify({
+      name: document.getElementById("acc-ib-name").value.trim(),
+      model: document.getElementById("acc-ib-model").value.trim(),
+      quantity: +document.getElementById("acc-ib-qty").value,
+      supplier_name: document.getElementById("acc-ib-supplier").value.trim(),
+      purchase_price: +document.getElementById("acc-ib-purchase").value,
+      sale_price: saleVal ? +saleVal : null,
+    }) });
+    toast("Принято на склад");
+    document.getElementById("acc-inbound-form").reset();
+    document.getElementById("acc-ib-qty").value = "1";
+    loadAccStock();
+  } catch (err) { toast(err.message, "error"); }
+}
+
+async function loadAccPos() {
+  if (!accWarehouseId) {
+    const wh = await api("/api/accessories/warehouse");
+    accWarehouseId = wh.id;
+  }
+  renderAccSplitPayments();
+  await loadAccProducts();
+  await loadAccCashRegister();
+  focusScanInput("acc-pos-search");
+}
+
+async function loadAccProducts() {
+  const q = document.getElementById("acc-pos-search")?.value || "";
+  accProducts = await api(`/api/accessories/stock?q=${encodeURIComponent(q)}`);
+  const grid = document.getElementById("acc-pos-products");
+  if (!accProducts.length) {
+    grid.innerHTML = '<p style="padding:1rem;color:var(--muted)">Нет товаров</p>';
+    return;
+  }
+  grid.innerHTML = accProducts.map((p) => {
+    const stock = p.warehouse_quantity ?? 0;
+    const out = stock <= 0;
+    return `<div class="product-card ${out ? "out" : ""}" data-id="${p.id}">
+      <div class="name">${esc(p.name)}</div>
+      <div class="meta">${dash(p.model)} · ${esc(p.supplier_name || "")}</div>
+      <div class="price">${fmt(p.sale_price)}</div>
+      <div class="meta">${out ? "Нет" : `Ост: ${stock}`}</div>
+    </div>`;
+  }).join("");
+  grid.querySelectorAll(".product-card:not(.out)").forEach((c) => {
+    c.addEventListener("click", () => accAddToCart(+c.dataset.id));
+  });
+  renderAccCart();
+}
+
+function accAddToCart(id) {
+  const p = accProducts.find((x) => x.id === id);
+  const stock = p?.warehouse_quantity ?? 0;
+  if (!p || stock <= 0) return;
+  const item = accCart.find((c) => c.product_id === id);
+  if (item) {
+    if (item.quantity >= stock) { toast(`Макс. ${stock}`, "error"); return; }
+    item.quantity += 1;
+  } else {
+    accCart.push({ product_id: id, quantity: 1, product: p });
+  }
+  renderAccCart();
+}
+
+function accCartTotal() {
+  return accCart.reduce((s, c) => s + c.product.sale_price * c.quantity, 0);
+}
+
+function renderAccSplitPayments() {
+  const box = document.getElementById("acc-split-payments");
+  if (!box) return;
+  const methods = storeConfig.payment_methods?.length ? storeConfig.payment_methods : [
+    { code: "cash", name: "Наличные" }, { code: "card", name: "Карта" },
+  ];
+  box.innerHTML = methods.map((m) => `
+    <label class="split-pay-row">
+      <span>${esc(m.name)}</span>
+      <input type="number" class="input sm acc-split-pay-input" data-method="${esc(m.code)}" min="0" step="0.01" placeholder="0">
+    </label>`).join("");
+}
+
+function collectAccPayments() {
+  return [...document.querySelectorAll(".acc-split-pay-input")]
+    .map((inp) => ({ method_code: inp.dataset.method, amount: +inp.value || 0 }))
+    .filter((p) => p.amount > 0);
+}
+
+function updateAccSplitSummary() {
+  const total = accCartTotal();
+  const paid = collectAccPayments().reduce((s, p) => s + p.amount, 0);
+  document.getElementById("acc-split-paid").textContent = fmt(paid);
+  const rem = document.getElementById("acc-split-remain-wrap");
+  if (rem) {
+    rem.classList.toggle("hidden", Math.abs(total - paid) < 0.01);
+    document.getElementById("acc-split-remain").textContent = fmt(Math.max(0, total - paid));
+  }
+}
+
+function renderAccCart() {
+  const box = document.getElementById("acc-cart-items");
+  const empty = document.getElementById("acc-cart-empty");
+  const count = accCart.reduce((s, c) => s + c.quantity, 0);
+  document.getElementById("acc-cart-count").textContent = count;
+  if (!accCart.length) {
+    box.innerHTML = "";
+    empty.classList.remove("hidden");
+    document.getElementById("acc-checkout-btn").disabled = true;
+    document.getElementById("acc-cart-subtotal").textContent = fmt(0);
+    document.getElementById("acc-cart-total").textContent = fmt(0);
+    return;
+  }
+  empty.classList.add("hidden");
+  let sub = 0;
+  box.innerHTML = accCart.map((c, idx) => {
+    const line = c.product.sale_price * c.quantity;
+    sub += line;
+    return `<div class="cart-item">
+      <div><div class="ci-name">${esc(c.product.name)}</div></div>
+      <div class="ci-qty"><button type="button" onclick="accChangeQty(${idx},-1)">−</button>${c.quantity}<button type="button" onclick="accChangeQty(${idx},1)">+</button></div>
+      <strong>${fmt(line)}</strong>
+      <button class="btn btn-ghost btn-sm" onclick="accRemoveLine(${idx})">×</button>
+    </div>`;
+  }).join("");
+  document.getElementById("acc-cart-subtotal").textContent = fmt(sub);
+  document.getElementById("acc-cart-total").textContent = fmt(sub);
+  renderAccSplitPayments();
+  updateAccSplitSummary();
+  document.getElementById("acc-checkout-btn").disabled = false;
+}
+
+window.accChangeQty = (idx, d) => {
+  const c = accCart[idx];
+  if (!c) return;
+  c.quantity += d;
+  const stock = c.product.warehouse_quantity ?? 0;
+  if (c.quantity <= 0) accCart.splice(idx, 1);
+  else if (c.quantity > stock) { c.quantity = stock; toast(`Макс. ${stock}`, "error"); }
+  renderAccCart();
+};
+window.accRemoveLine = (idx) => { accCart.splice(idx, 1); renderAccCart(); };
+
+async function accCheckout() {
+  const total = accCartTotal();
+  const payments = collectAccPayments();
+  const paid = payments.reduce((s, p) => s + p.amount, 0);
+  if (paid <= 0 && total > 0) { toast("Укажите оплату", "error"); return; }
+  let debtor_name = "";
+  let debtor_phone = "";
+  if (total - paid > 0.01) {
+    const debtor = await promptDebtorModal(total, paid);
+    if (!debtor) return;
+    debtor_name = debtor.name;
+    debtor_phone = debtor.phone;
+  } else if (Math.abs(total - paid) > 0.01) {
+    toast("Сумма оплат не совпадает с итогом", "error");
+    return;
+  }
+  try {
+    await api("/api/sales", {
+      method: "POST",
+      body: JSON.stringify({
+        items: accCart.map((c) => ({ product_id: c.product_id, quantity: c.quantity })),
+        payments, warehouse_id: accWarehouseId, debtor_name, debtor_phone,
+      }),
+    });
+    accCart = [];
+    renderAccCart();
+    await loadAccProducts();
+    loadAccCashRegister();
+    toast("Продажа проведена");
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function loadAccCashRegister() {
+  const kpi = document.getElementById("acc-cash-kpi");
+  if (!kpi) return;
+  try {
+    const r = await api("/api/accessories/cash-register?period=day");
+    kpi.innerHTML = `
+      <div class="kpi accent-blue"><div class="label">Приход</div><div class="value">${fmt(r.total_inflows)}</div></div>
+      <div class="kpi accent-warn"><div class="label">Расход</div><div class="value">${fmt(r.total_outflows)}</div></div>
+      <div class="kpi accent-green"><div class="label">Чистыми</div><div class="value">${fmt(r.net_cash)}</div></div>
+      <div class="kpi"><div class="label">Прибыль</div><div class="value">${fmt(r.profit)}</div></div>`;
+    const bal = document.getElementById("acc-balances");
+    if (bal) {
+      bal.innerHTML = (r.inflows || []).map((b) =>
+        `<div class="pos-balance-row"><span>${esc(b.name)}</span><strong>${fmt(b.amount)}</strong></div>`
+      ).join("") || "";
+    }
+    const tb = document.getElementById("acc-expenses-tbody");
+    if (tb) {
+      tb.innerHTML = (r.expense_lines || []).map((e) =>
+        `<tr><td>${esc(e.expense_date)}</td><td>${esc(e.category)}</td><td>${fmt(e.amount)}</td></tr>`
+      ).join("") || '<tr><td colspan="3">Нет расходов</td></tr>';
+    }
+  } catch (err) {
+    kpi.innerHTML = `<p class="muted">${esc(err.message)}</p>`;
+  }
+}
+
+async function loadAccReport() {
+  const period = document.getElementById("acc-report-period")?.value || "month";
+  const r = await api(`/api/accessories/reports/finance?period=${period}`);
+  document.getElementById("acc-report-content").innerHTML = `
+    <div class="report-header"><h3>Аксессуары — финансы</h3><p>${r.period_label}</p></div>
+    <div class="report-kpi">
+      <div class="report-box"><div class="lbl">Выручка</div><div class="val">${fmt(r.revenue)}</div><div class="sub">${r.sales_count} чеков · ${r.items_sold} шт</div></div>
+      <div class="report-box"><div class="lbl">Себестоимость</div><div class="val">${fmt(r.cogs)}</div></div>
+      <div class="report-box"><div class="lbl">Прибыль продаж</div><div class="val">${fmt(r.shop_profit)}</div></div>
+      <div class="report-box"><div class="lbl">Расходы</div><div class="val">${fmt(r.expenses)}</div></div>
+      <div class="report-box"><div class="lbl">Чистая прибыль</div><div class="val" style="color:var(--success)">${fmt(r.net_profit)}</div></div>
+    </div>
+    ${(r.expenses_by_category || []).length ? `<div class="card"><div class="card-header"><h3>Расходы по категориям</h3></div>
+      <div class="card-body table-wrap"><table class="data-table"><thead><tr><th>Категория</th><th>Сумма</th></tr></thead><tbody>
+        ${r.expenses_by_category.map((e) => `<tr><td>${esc(e.category)}</td><td>${fmt(e.amount)}</td></tr>`).join("")}
+      </tbody></table></div></div>` : ""}
+    <div class="card" style="margin-top:1rem"><div class="card-header"><h3>Последние продажи</h3></div>
+      <div class="table-wrap card-body"><table class="data-table">
+        <thead><tr><th>Дата</th><th>Чек</th><th>Товар</th><th>Кол-во</th><th>Сумма</th><th>Прибыль</th></tr></thead>
+        <tbody>${(r.recent_sales || []).map((s) => `<tr>
+          <td>${esc(s.created_at?.slice(0, 16) || "")}</td><td>#${s.id}</td>
+          <td>${esc(s.product_name)}</td><td>${s.quantity}</td>
+          <td>${fmt(s.subtotal)}</td><td><strong>${fmt(s.shop_profit)}</strong></td>
+        </tr>`).join("") || '<tr><td colspan="6">Нет продаж</td></tr>'}
+        </tbody></table></div></div>`;
+}
+
 /* ── Suppliers ── */
 function bindSuppliers() {
   document.getElementById("payment-form").onsubmit = async (e) => {
@@ -3085,6 +3646,7 @@ function bindSettings() {
     } catch (err) { toast(err.message, "error"); }
   });
   document.getElementById("btn-wipe-catalog")?.addEventListener("click", wipeCatalogData);
+  document.getElementById("expense-allocation-form")?.addEventListener("submit", saveExpenseAllocation);
 }
 
 async function wipeCatalogData() {
@@ -3105,6 +3667,7 @@ async function wipeCatalogData() {
 async function loadSettingsPage() {
   const data = await api("/api/settings");
   document.getElementById("catalog-wipe-card")?.classList.toggle("hidden", currentUser?.role !== "owner");
+  document.getElementById("expense-allocation-card")?.classList.toggle("hidden", currentUser?.role !== "owner");
   storeConfig.currency = data.currency;
   storeConfig.payment_methods = data.payment_methods.filter((m) => m.is_active);
   document.getElementById("set-currency-code").value = data.currency.code || "";
@@ -3124,6 +3687,36 @@ async function loadSettingsPage() {
     `<tr><td>${esc(e.expense_date)}</td><td>${esc(e.category)}</td><td>${fmt(e.amount)}</td><td><button class="btn btn-danger btn-sm" onclick="deleteExpense(${e.id})">✕</button></td></tr>`
   ).join("") || '<tr><td colspan="4">Нет расходов</td></tr>';
   renderSplitPayments();
+  await loadExpenseAllocationSettings();
+}
+
+async function loadExpenseAllocationSettings() {
+  const box = document.getElementById("expense-allocation-rows");
+  if (!box) return;
+  if (!warehouses.length) await loadWarehouses();
+  let rules = [];
+  try {
+    const data = await api("/api/settings/expense-allocation");
+    rules = data.rules || [];
+  } catch { /* empty */ }
+  const byWh = Object.fromEntries(rules.map((r) => [r.warehouse_id, r.pct]));
+  box.innerHTML = warehouses.map((w) => `
+    <label class="form-row-inline">${esc(w.name)}
+      <input type="number" class="input sm exp-alloc-pct" data-wh-id="${w.id}" min="0" max="100" step="0.1"
+        value="${byWh[w.id] ?? Math.round(100 / warehouses.length)}"> %
+    </label>`).join("");
+}
+
+async function saveExpenseAllocation(e) {
+  e.preventDefault();
+  const rules = [...document.querySelectorAll(".exp-alloc-pct")].map((inp) => ({
+    warehouse_id: +inp.dataset.whId,
+    pct: +inp.value || 0,
+  }));
+  try {
+    await api("/api/settings/expense-allocation", { method: "PUT", body: JSON.stringify({ rules }) });
+    toast("Распределение сохранено");
+  } catch (err) { toast(err.message, "error"); }
 }
 
 window.deleteExpense = async (id) => {
@@ -3153,6 +3746,9 @@ function bindReports() {
     };
   });
   document.getElementById("load-report").onclick = loadReport;
+  document.getElementById("report-detail-btn").onclick = openReportDetail;
+  document.getElementById("report-detail-close")?.addEventListener("click", () => document.getElementById("report-detail-modal").close());
+  document.getElementById("report-detail-wh")?.addEventListener("change", openReportDetail);
   document.getElementById("report-period").onchange = loadReport;
   document.getElementById("print-report").onclick = () => {
     const w = window.open("", "_blank");
@@ -3209,7 +3805,10 @@ async function loadReport() {
         <div class="report-box"><div class="lbl">Валовая прибыль</div><div class="val">${fmt(r.gross_profit)}</div></div>
         <div class="report-box"><div class="lbl">Расходы</div><div class="val">${fmt(r.operating_expenses)}</div></div>
         <div class="report-box"><div class="lbl">Чистая прибыль</div><div class="val" style="color:var(--success)">${fmt(r.net_profit)}</div></div>
-      </div>`;
+      </div>
+      ${(r.expenses_by_category || []).length ? `<div class="card"><div class="card-header"><h3>Расходы по категориям</h3></div><div class="card-body table-wrap"><table class="data-table"><thead><tr><th>Категория</th><th>Сумма</th></tr></thead><tbody>
+        ${r.expenses_by_category.map((e) => `<tr><td>${esc(e.category)}</td><td>${fmt(e.amount)}</td></tr>`).join("")}
+      </tbody></table></div></div>` : ""}`;
     return;
   }
   if (reportType === "dds") {
@@ -3218,9 +3817,14 @@ async function loadReport() {
     document.getElementById("report-content").innerHTML = `
       <div class="report-header"><h3>ДДС</h3><p>${r.period_label || ""}</p></div>
       <div class="report-kpi">
+        <div class="report-box"><div class="lbl">Сальдо на начало</div><div class="val">${fmt(r.opening_balance)}</div></div>
         <div class="report-box"><div class="lbl">Поступления</div><div class="val">${fmt(r.total_inflows)}</div></div>
         <div class="report-box"><div class="lbl">Выплаты</div><div class="val">${fmt(r.total_outflows)}</div></div>
+        <div class="report-box"><div class="lbl">Сальдо на конец</div><div class="val" style="color:var(--success)">${fmt(r.closing_balance)}</div></div>
+      </div>
+      <div class="report-kpi" style="margin-top:0.5rem">
         <div class="report-box"><div class="lbl">Чистый поток</div><div class="val">${fmt(r.net_operating_cash)}</div></div>
+        ${r.receivable_collections > 0 ? `<div class="report-box"><div class="lbl">Погашение долгов</div><div class="val">${fmt(r.receivable_collections)}</div></div>` : ""}
       </div>
       <div class="card"><div class="card-body"><table class="data-table"><thead><tr><th>Способ</th><th>Сумма</th></tr></thead><tbody>${(r.operating_inflows||[]).map(p=>`<tr><td>${esc(p.name)}</td><td>${fmt(p.amount)}</td></tr>`).join("")}</tbody></table></div></div>`;
     return;
@@ -3231,6 +3835,7 @@ async function loadReport() {
     document.getElementById("report-content").innerHTML = `
       <div class="report-header"><h3>Баланс</h3></div>
       <div class="metric-row"><span>Денежные средства</span><strong>${fmt(r.assets.cash)}</strong></div>
+      <div class="metric-row"><span>Дебиторка</span><strong>${fmt(r.assets.receivables || 0)}</strong></div>
       <div class="metric-row"><span>Запасы</span><strong>${fmt(r.assets.inventory)}</strong></div>
       <div class="metric-row"><span>Долг поставщикам</span><strong>${fmt(r.liabilities.supplier_payables)}</strong></div>
       <div class="metric-row"><span>Капитал</span><strong>${fmt(r.equity)}</strong></div>`;
@@ -3321,6 +3926,127 @@ async function loadReport() {
     combinedEl.classList.add("hidden");
   }
 }
+
+async function openReportDetail() {
+  const period = document.getElementById("report-period").value;
+  const from = document.getElementById("report-from").value;
+  const to = document.getElementById("report-to").value;
+  const kind = reportType === "finance" ? "finance" : reportType;
+  if (!["opiu", "dds", "finance"].includes(kind)) {
+    toast("Детализация доступна для ОПиУ, ДДС и Финансов", "info");
+    return;
+  }
+  const whSel = document.getElementById("report-detail-wh");
+  if (whSel && whSel.options.length <= 1) {
+    whSel.innerHTML = '<option value="">Все склады</option>' +
+      warehouses.map((w) => `<option value="${w.id}">${esc(w.name)}</option>`).join("");
+  }
+  const whId = whSel?.value || "";
+  let url = `/api/reports/detail?kind=${kind}&period=${period}`;
+  if (from) url += `&date_from=${from}`;
+  if (to) url += `&date_to=${to}`;
+  if (whId) url += `&warehouse_id=${whId}`;
+  const r = await api(url);
+  document.getElementById("report-detail-title").textContent = `Детализация · ${r.period_label}`;
+  const whRows = (r.warehouses || []).map((w) => `<tr>
+    <td><strong>${esc(w.warehouse_name)}</strong></td>
+    <td>${fmt(w.revenue)}</td>
+    <td>${fmt(w.inflows)}</td>
+    <td>${fmt(w.expenses_allocated)} <small class="muted">(${w.pct}%)</small></td>
+    <td><strong>${fmt(w.profit)}</strong></td>
+  </tr>`).join("");
+  document.getElementById("report-detail-content").innerHTML = `
+    <div class="card" style="margin-bottom:1rem"><div class="card-header"><h3>По складам</h3></div>
+      <div class="table-wrap card-body"><table class="data-table">
+        <thead><tr><th>Склад</th><th>Выручка</th><th>Приход</th><th>Расход (доля)</th><th>Прибыль</th></tr></thead>
+        <tbody>${whRows || '<tr><td colspan="5">Нет данных</td></tr>'}</tbody>
+      </table></div>
+    </div>
+    <div class="grid-2">
+      <div class="card"><div class="card-header"><h3>Приходы (продажи)</h3></div>
+        <div class="table-wrap card-body" style="max-height:240px;overflow:auto"><table class="data-table">
+          <thead><tr><th>Дата</th><th>Чек</th><th>Способ</th><th>Сумма</th><th>Склад</th></tr></thead>
+          <tbody>${(r.inflow_lines||[]).map((l)=>`<tr><td>${esc(l.created_at?.slice(0,16)||"")}</td><td>#${l.sale_id}</td><td>${esc(l.name||l.method_code)}</td><td>${fmt(l.amount)}</td><td>${esc(l.warehouse_name)}</td></tr>`).join("")||'<tr><td colspan="5">Нет данных</td></tr>'}
+          </tbody></table></div>
+      </div>
+      <div class="card"><div class="card-header"><h3>Расходы</h3></div>
+        <div class="table-wrap card-body" style="max-height:240px;overflow:auto"><table class="data-table">
+          <thead><tr><th>Дата</th><th>Категория</th><th>Сумма</th></tr></thead>
+          <tbody>${(r.expense_lines||[]).map((e)=>`<tr><td>${esc(e.expense_date)}</td><td>${esc(e.category)}</td><td>${fmt(e.amount)}</td></tr>`).join("")||'<tr><td colspan="3">Нет данных</td></tr>'}
+          </tbody></table></div>
+      </div>
+    </div>
+    ${(r.receivable_collections||[]).length ? `<div class="card" style="margin-top:1rem"><div class="card-header"><h3>Погашение долгов</h3></div>
+      <div class="table-wrap card-body"><table class="data-table"><thead><tr><th>Дата</th><th>Клиент</th><th>Сумма</th></tr></thead><tbody>
+        ${r.receivable_collections.map((p)=>`<tr><td>${esc(p.created_at?.slice(0,16)||"")}</td><td>${esc(p.customer_name)}</td><td>${fmt(p.amount)}</td></tr>`).join("")}
+      </tbody></table></div></div>` : ""}`;
+  document.getElementById("report-detail-modal").showModal();
+}
+
+let payDebtorTarget = null;
+
+function bindDebtors() {
+  document.getElementById("debtors-filter")?.addEventListener("change", loadDebtorsPage);
+  document.getElementById("debtors-refresh")?.addEventListener("click", loadDebtorsPage);
+  document.getElementById("debtor-pay-cancel")?.addEventListener("click", () => {
+    document.getElementById("debtor-pay-modal").close();
+    payDebtorTarget = null;
+  });
+  document.getElementById("debtor-pay-form")?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    if (!payDebtorTarget) return;
+    try {
+      await api(`/api/receivables/${payDebtorTarget.id}/pay`, {
+        method: "POST",
+        body: JSON.stringify({
+          amount: +document.getElementById("debtor-pay-amount").value,
+          payment_method_code: document.getElementById("debtor-pay-method").value,
+          notes: document.getElementById("debtor-pay-notes").value,
+        }),
+      });
+      document.getElementById("debtor-pay-modal").close();
+      toast("Оплата принята");
+      loadDebtorsPage();
+      if (currentPage === "pos") loadPosCashRegister();
+    } catch (err) { toast(err.message, "error"); }
+  });
+}
+
+async function loadDebtorsPage() {
+  const status = document.getElementById("debtors-filter")?.value || "";
+  let url = "/api/receivables";
+  if (status) url += `?status=${status}`;
+  const items = await api(url);
+  document.getElementById("debtors-tbody").innerHTML = items.map((d) => `
+    <tr>
+      <td><strong>${esc(d.customer_name)}</strong></td>
+      <td>${esc(d.customer_phone || "—")}</td>
+      <td>${esc(d.products || "—")}</td>
+      <td>${esc(d.warehouse_name || "—")}</td>
+      <td>${fmt(d.total_amount)}</td>
+      <td>${fmt(d.paid_amount)}</td>
+      <td class="${d.amount_due > 0 ? "stock-low" : ""}"><strong>${fmt(d.amount_due)}</strong></td>
+      <td>${esc(d.created_at?.slice(0, 10) || "")}</td>
+      <td>${d.status === "open"
+        ? `<button class="btn btn-primary btn-sm" onclick="openDebtorPayModal(${d.id})">Принять оплату</button>`
+        : `<span class="tag">Закрыт</span>`}
+      </td>
+    </tr>`).join("") || '<tr><td colspan="9" style="text-align:center;color:var(--muted)">Нет долгов</td></tr>';
+}
+
+window.openDebtorPayModal = async (id) => {
+  const items = await api("/api/receivables?status=open");
+  payDebtorTarget = items.find((d) => d.id === id) || { id };
+  const full = await api("/api/receivables").then((all) => all.find((d) => d.id === id));
+  payDebtorTarget = full;
+  if (!full) return;
+  document.getElementById("debtor-pay-meta").innerHTML = `
+    <div class="metric-row"><span>${esc(full.customer_name)}</span><strong>Долг ${fmt(full.amount_due)}</strong></div>`;
+  document.getElementById("debtor-pay-amount").value = full.amount_due;
+  document.getElementById("debtor-pay-notes").value = "";
+  fillPaySelect(document.getElementById("debtor-pay-method"));
+  document.getElementById("debtor-pay-modal").showModal();
+};
 
 /* ── Analytics ── */
 function bindAnalytics() {

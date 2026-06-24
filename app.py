@@ -40,15 +40,15 @@ DEFAULT_WAREHOUSE_NAME = "Основной склад"
 ROLE_PAGES: dict[str, list[str]] = {
     "owner": [
         "dashboard", "pos", "sales", "warehouses", "products-own",
-        "products-consignment", "suppliers", "trade-in", "reports", "analytics",
-        "shifts", "users", "imei", "reservations", "stocktake", "settings",
+        "products-consignment", "accessories", "reports", "analytics", "debtors",
+        "imei", "stocktake", "settings",
     ],
     "warehouse": [
         "dashboard", "warehouses", "products-own", "products-consignment",
-        "trade-in", "imei", "reservations", "stocktake",
+        "accessories", "imei", "stocktake",
     ],
-    "cashier": ["dashboard", "pos", "sales", "trade-in", "shifts"],
-    "accessories": ["dashboard", "pos", "sales", "products-own"],
+    "cashier": ["dashboard", "pos", "sales", "debtors"],
+    "accessories": ["accessories"],
 }
 
 ROLE_LEVEL = {"cashier": 1, "accessories": 2, "warehouse": 2, "owner": 3}
@@ -178,7 +178,9 @@ def units_for_product_at_warehouse(
     rows = conn.execute(
         """
         SELECT u.id, u.imei, u.serial, u.status, u.notes, u.created_at,
-               p.color AS product_color, p.name AS product_name, p.model
+               u.battery_capacity, u.client_name, u.region, u.arrival_date,
+               p.color AS product_color, p.name AS product_name, p.model, p.memory,
+               p.purchase_price, p.supplier_name, p.sale_price, p.ownership_type
         FROM product_units u
         JOIN products p ON p.id = u.product_id
         WHERE u.product_id = ? AND u.warehouse_id = ? AND u.status = 'in_stock'
@@ -282,10 +284,20 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     _add_column(conn, "product_units", "box_image_url", "TEXT DEFAULT ''")
     _add_column(conn, "product_units", "customs_status", "TEXT NOT NULL DEFAULT 'none'")
     _add_column(conn, "product_units", "battery_capacity", "INTEGER")
+    _add_column(conn, "product_units", "client_name", "TEXT DEFAULT ''")
+    _add_column(conn, "product_units", "region", "TEXT DEFAULT ''")
+    _add_column(conn, "product_units", "arrival_date", "TEXT DEFAULT ''")
+    _add_column(conn, "warehouses", "warehouse_type", "TEXT NOT NULL DEFAULT 'new'")
     conn.execute(
         """
         UPDATE product_units SET customs_status = 'cleared'
         WHERE customs_cleared = 1 AND customs_status = 'none'
+        """
+    )
+    conn.execute(
+        """
+        UPDATE warehouses SET warehouse_type = 'used'
+        WHERE LOWER(name) LIKE '%бу%' OR LOWER(name) LIKE '%б/у%' OR LOWER(name) LIKE '%б у%'
         """
     )
     conn.executescript(
@@ -317,6 +329,52 @@ def migrate_db(conn: sqlite3.Connection) -> None:
         WHERE shop_profit = 0 AND subtotal != 0
         """
     )
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS receivables (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sale_id INTEGER,
+            customer_name TEXT NOT NULL,
+            customer_phone TEXT DEFAULT '',
+            total_amount REAL NOT NULL,
+            paid_amount REAL NOT NULL DEFAULT 0,
+            amount_due REAL NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open',
+            warehouse_id INTEGER,
+            notes TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            closed_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS receivable_payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            receivable_id INTEGER NOT NULL,
+            amount REAL NOT NULL,
+            payment_method_code TEXT DEFAULT 'cash',
+            notes TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (receivable_id) REFERENCES receivables(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS expense_warehouse_split (
+            warehouse_id INTEGER PRIMARY KEY,
+            pct REAL NOT NULL DEFAULT 0,
+            FOREIGN KEY (warehouse_id) REFERENCES warehouses(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_receivables_status ON receivables(status, created_at);
+        """
+    )
+    _add_column(conn, "sales", "amount_paid", "REAL")
+    _add_column(conn, "sales", "amount_due", "REAL NOT NULL DEFAULT 0")
+    _add_column(conn, "expenses", "department", "TEXT NOT NULL DEFAULT 'main'")
+    if not conn.execute(
+        "SELECT 1 FROM warehouses WHERE LOWER(name) LIKE '%аксесс%'"
+    ).fetchone():
+        conn.execute(
+            """
+            INSERT INTO warehouses (name, address, notes, is_default, warehouse_type, created_at)
+            VALUES ('Аксессуары', '', 'Склад аксессуаров', 0, 'new', ?)
+            """,
+            (utc_now(),),
+        )
 
     conn.executescript(
         """
@@ -702,21 +760,31 @@ def set_setting(conn: sqlite3.Connection, key: str, value: str) -> None:
     )
 
 
-IMPORT_PRODUCT_HEADERS = [
-    "название", "категория", "тип", "поставщик", "цвет", "память",
-    "состояние", "закупка", "цена", "количество", "мин_остаток",
-    "imei", "серийник", "батарея_%", "комментарий",
+IMPORT_USED_HEADERS = [
+    "модель", "цвет", "память", "аккумулятор_%", "imei", "себестоимость", "клиент", "комментарий",
 ]
 
+IMPORT_NEW_HEADERS = [
+    "дата_прихода", "модель", "цвет", "память", "регион", "imei", "себестоимость", "поставщик", "тип", "комментарий",
+]
+
+IMPORT_PRODUCT_HEADERS = IMPORT_NEW_HEADERS
+
 IMPORT_HEADER_ALIASES: dict[str, tuple[str, ...]] = {
-    "название": ("название", "name", "product_name", "товар"),
-    "категория": ("категория", "category"),
+    "название": ("название", "name", "product_name", "товар", "модель", "model"),
+    "модель": ("модель", "model", "название", "name"),
     "тип": ("тип", "ownership_type", "ownership"),
     "поставщик": ("поставщик", "supplier_name", "supplier"),
     "цвет": ("цвет", "color"),
     "память": ("память", "memory"),
     "состояние": ("состояние", "condition"),
-    "закупка": ("закупка", "purchase_price", "закупочная"),
+    "закупка": ("закупка", "purchase_price", "закупочная", "себестоимость"),
+    "себестоимость": ("себестоимость", "закупка", "purchase_price"),
+    "клиент": ("клиент", "client", "client_name"),
+    "регион": ("регион", "region"),
+    "дата_прихода": ("дата_прихода", "arrival_date", "дата", "date"),
+    "аккумулятор_%": ("аккумулятор_%", "батарея_%", "battery_capacity", "батарея", "battery"),
+    "категория": ("категория", "category"),
     "цена": ("цена", "sale_price", "продажа"),
     "количество": ("количество", "quantity", "qty", "кол-во"),
     "мин_остаток": ("мин_остаток", "min_stock"),
@@ -822,54 +890,39 @@ def _parse_import_file(raw: bytes, filename: str, sheet: str | None = None) -> l
     return [dict(r) for r in reader]
 
 
-def build_products_import_xlsx() -> bytes:
+def build_products_import_xlsx(kind: str = "new") -> bytes:
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill
 
+    headers = IMPORT_USED_HEADERS if kind == "used" else IMPORT_NEW_HEADERS
     wb = Workbook()
     ws = wb.active
     ws.title = "Товары"
     header_fill = PatternFill("solid", fgColor="E8E4FF")
-    for col, title in enumerate(IMPORT_PRODUCT_HEADERS, start=1):
+    for col, title in enumerate(headers, start=1):
         cell = ws.cell(row=1, column=col, value=title)
         cell.font = Font(bold=True)
         cell.fill = header_fill
-    examples = [
-        [
-            "iPhone 15 Pro 256GB Black", "телефон", "собственный", "", "Чёрный", "256GB",
-            "новый", 85000, 99990, 1, 2, "123456789012345", "SN-001", "", "пример — удалите строку",
-        ],
-        [
-            "Чехол силикон iPhone 15", "аксессуар", "собственный", "", "Чёрный", "",
-            "новый", 150, 590, 20, 5, "", "", "", "",
-        ],
-    ]
+    examples = (
+        [["iPhone 13 Pro", "Graphite", "256GB", 87, "123456789012345", 65000, "Иван", "пример — удалите"]]
+        if kind == "used"
+        else [["2025-06-01", "iPhone 15 Pro", "Black", "256GB", "EU", "123456789012345", 85000, "Поставщик А", "собственный", ""]]
+    )
     for r, ex in enumerate(examples, start=2):
         for c, val in enumerate(ex, start=1):
             ws.cell(row=r, column=c, value=val)
-    for col in range(1, len(IMPORT_PRODUCT_HEADERS) + 1):
+    for col in range(1, len(headers) + 1):
         from openpyxl.utils import get_column_letter
         ws.column_dimensions[get_column_letter(col)].width = 14
-
     help_ws = wb.create_sheet("Инструкция")
-    lines = [
-        "Как заполнять шаблон TeleStore",
-        "",
-        "• Одна строка = одна позиция на складе.",
-        "• Название — полное имя товара (бренд и модель в одном поле).",
-        "• Телефон: укажите IMEI или серийник (количество всегда 1).",
-        "• Аксессуар: IMEI не нужен — укажите количество.",
-        "• Б/у телефон: состояние «б/у» + обязательно батарея_% (например 87).",
-        "• тип: собственный или реализация (для реализации — поставщик).",
-        "• категория: телефон или аксессуар.",
-        "• Если товар с таким названием уже есть — добавится остаток / новое устройство.",
-        "",
-        "После загрузки: Склады → остатки, отчёты и касса обновятся автоматически.",
-    ]
+    lines = (
+        ["Шаблон Б/У", "• модель, imei, аккумулятор_%, себестоимость, клиент"]
+        if kind == "used"
+        else ["Шаблон новых товаров", "• дата_прихода, модель, регион, imei, себестоимость, поставщик", "• продажа — при продаже со склада"]
+    )
     for i, line in enumerate(lines, start=1):
         help_ws.cell(row=i, column=1, value=line)
     help_ws.column_dimensions["A"].width = 72
-
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
@@ -1006,6 +1059,7 @@ def _import_products_rows(
 ) -> dict[str, Any]:
     if not rows:
         raise HTTPException(status_code=400, detail="Нет строк для импорта")
+    kind = get_warehouse_receipt_kind(conn, default_wh_id)
     first = rows[0]
     fields = {str(k).strip().lower(): k for k in first.keys()}
     created_products = 0
@@ -1014,29 +1068,32 @@ def _import_products_rows(
     errors: list[str] = []
 
     for i, row in enumerate(rows, start=2):
-        name = _import_row_cell(row, fields, "название")
+        name = _import_row_cell(row, fields, "модель") or _import_row_cell(row, fields, "название")
         if not name:
             continue
-        category = _norm_category(_import_row_cell(row, fields, "категория") or "аксессуар")
+        category = "phone"
         ownership = _norm_ownership(_import_row_cell(row, fields, "тип") or "own")
         supplier = _import_row_cell(row, fields, "поставщик")
         color = _import_row_cell(row, fields, "цвет")
         memory = _import_row_cell(row, fields, "память")
-        condition = _norm_condition(_import_row_cell(row, fields, "состояние") or "new")
-        purchase_raw = _import_row_cell(row, fields, "закупка")
+        condition = "used" if kind == "used" else _norm_condition(_import_row_cell(row, fields, "состояние") or "new")
+        purchase_raw = _import_row_cell(row, fields, "закупка") or _import_row_cell(row, fields, "себестоимость")
         sale_raw = _import_row_cell(row, fields, "цена")
-        qty_raw = _import_row_cell(row, fields, "количество") or "1"
-        min_stock_raw = _import_row_cell(row, fields, "мин_остаток") or "2"
+        qty_raw = "1"
+        min_stock_raw = "0"
         imei = _import_row_cell(row, fields, "imei")
         serial = _import_row_cell(row, fields, "серийник")
         notes = _import_row_cell(row, fields, "комментарий")
-        battery_raw = _import_row_cell(row, fields, "батарея_%")
+        battery_raw = _import_row_cell(row, fields, "аккумулятор_%") or _import_row_cell(row, fields, "батарея_%")
+        client_name = _import_row_cell(row, fields, "клиент")
+        region = _import_row_cell(row, fields, "регион")
+        arrival_date = _import_row_cell(row, fields, "дата_прихода")
 
         try:
             purchase = float(purchase_raw.replace(",", ".") if purchase_raw else 0)
             sale = float(sale_raw.replace(",", ".") if sale_raw else 0)
-            qty = max(1, int(float(qty_raw.replace(",", "."))))
-            min_stock = max(0, int(float(min_stock_raw.replace(",", "."))))
+            qty = 1
+            min_stock = 0
         except ValueError:
             errors.append(f"Строка {i}: неверные числа")
             continue
@@ -1049,20 +1106,20 @@ def _import_products_rows(
                 errors.append(f"Строка {i}: неверная ёмкость батареи")
                 continue
 
-        if condition in ("used", "refurbished") and category == "phone" and battery is None:
-            errors.append(f"Строка {i}: для Б/у укажите батарея_%")
+        if kind == "used" and battery is None:
+            errors.append(f"Строка {i}: для Б/у укажите аккумулятор_%")
             continue
 
         if ownership == "consignment" and not supplier:
             errors.append(f"Строка {i}: укажите поставщика для реализации")
             continue
 
-        track = category == "phone"
-        if track and not imei and not serial:
-            errors.append(f"Строка {i}: для телефона нужен IMEI или серийник")
+        if not imei and not serial:
+            errors.append(f"Строка {i}: укажите IMEI")
             continue
-        if track:
-            qty = 1
+
+        if sale <= 0:
+            sale = max(purchase, 1)
 
         existing = _find_product_for_import(conn, name, color, memory)
         if existing:
@@ -1078,10 +1135,7 @@ def _import_products_rows(
                 )
             product = conn.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
         else:
-            if sale <= 0:
-                errors.append(f"Строка {i}: укажите цену продажи")
-                continue
-            track_val = 1 if track else 0
+            track_val = 1
             cur = conn.execute(
                 """
                 INSERT INTO products
@@ -1101,7 +1155,7 @@ def _import_products_rows(
             product = conn.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
             created_products += 1
 
-        if track:
+        if imei or serial:
             if imei:
                 dup = conn.execute(
                     "SELECT id FROM product_units WHERE imei = ? AND status != 'sold'", (imei,)
@@ -1113,21 +1167,18 @@ def _import_products_rows(
                 """
                 INSERT INTO product_units
                 (product_id, warehouse_id, imei, serial, status, notes, created_at,
-                 customs_status, customs_cleared, battery_capacity)
-                VALUES (?, ?, ?, ?, 'in_stock', ?, ?, 'none', 0, ?)
+                 customs_status, customs_cleared, battery_capacity, client_name, region, arrival_date)
+                VALUES (?, ?, ?, ?, 'in_stock', ?, ?, 'none', 0, ?, ?, ?, ?)
                 """,
-                (product_id, default_wh_id, imei, serial, notes or "Импорт Excel", utc_now(), battery),
+                (
+                    product_id, default_wh_id, imei, serial, notes or "Импорт Excel", utc_now(), battery,
+                    client_name, region, arrival_date or utc_now()[:10],
+                ),
             )
             adjust_warehouse_stock(conn, default_wh_id, product_id, 1, "inbound", notes=f"Импорт: {imei or serial}")
             conn.execute("UPDATE products SET track_units = 1 WHERE id = ?", (product_id,))
             created_units += 1
             updated_stock += 1
-        else:
-            adjust_warehouse_stock(
-                conn, default_wh_id, product_id, qty, "inbound",
-                notes=notes or "Импорт Excel",
-            )
-            updated_stock += qty
 
     return {
         "created_products": created_products,
@@ -1357,14 +1408,39 @@ def validate_sale_payments(
     payments: list[dict[str, float | str]],
     total: float,
 ) -> tuple[float, float, str, list[dict[str, float | str]]]:
-    if not payments:
-        raise HTTPException(status_code=400, detail="Укажите способ оплаты")
-    paid = sum(float(p["amount"]) for p in payments)
-    if abs(paid - total) > 0.01:
+    cash_amount, card_amount, payment_method, normalized, _, _ = process_sale_payments(
+        conn, payments, total, require_full=True
+    )
+    return cash_amount, card_amount, payment_method, normalized
+
+
+def process_sale_payments(
+    conn: sqlite3.Connection,
+    payments: list[dict[str, float | str]],
+    total: float,
+    *,
+    debtor_name: str = "",
+    require_full: bool = False,
+) -> tuple[float, float, str, list[dict[str, float | str]], float, float]:
+    paid = sum(float(p["amount"]) for p in payments if float(p["amount"]) > 0)
+    due = max(0.0, total - paid)
+    if paid > total + 0.01:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Сумма оплат ({paid:.2f}) больше итога ({total:.2f})",
+        )
+    if require_full and due > 0.01:
         raise HTTPException(
             status_code=400,
             detail=f"Сумма оплат ({paid:.2f}) не совпадает с итогом ({total:.2f})",
         )
+    if due > 0.01 and not debtor_name.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Сумма оплаты меньше цены продажи — укажите имя и телефон должника",
+        )
+    if paid <= 0 and due <= 0.01 and total > 0 and not payments:
+        raise HTTPException(status_code=400, detail="Укажите способ оплаты")
     cash_amount = 0.0
     card_amount = 0.0
     codes: list[str] = []
@@ -1383,8 +1459,106 @@ def validate_sale_payments(
             cash_amount += amount
         else:
             card_amount += amount
-    payment_method = codes[0] if len(codes) == 1 else "split"
-    return cash_amount, card_amount, payment_method, normalized
+    if not normalized and due <= 0.01 and total > 0:
+        raise HTTPException(status_code=400, detail="Укажите способ оплаты")
+    payment_method = codes[0] if len(codes) == 1 else ("split" if codes else "credit")
+    return cash_amount, card_amount, payment_method, normalized, paid, due
+
+
+def create_receivable(
+    conn: sqlite3.Connection,
+    *,
+    sale_id: int,
+    customer_name: str,
+    customer_phone: str,
+    total_amount: float,
+    paid_amount: float,
+    warehouse_id: int | None,
+    notes: str = "",
+) -> int:
+    due = max(0.0, total_amount - paid_amount)
+    cur = conn.execute(
+        """
+        INSERT INTO receivables
+        (sale_id, customer_name, customer_phone, total_amount, paid_amount, amount_due,
+         status, warehouse_id, notes, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)
+        """,
+        (
+            sale_id, customer_name.strip(), customer_phone.strip(),
+            total_amount, paid_amount, due, warehouse_id, notes, utc_now(),
+        ),
+    )
+    return int(cur.lastrowid)
+
+
+def get_expense_warehouse_split(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT ews.warehouse_id, ews.pct, w.name AS warehouse_name
+        FROM expense_warehouse_split ews
+        JOIN warehouses w ON w.id = ews.warehouse_id
+        WHERE ews.pct > 0
+        ORDER BY w.name
+        """
+    ).fetchall()
+    if rows:
+        return [
+            {"warehouse_id": r["warehouse_id"], "warehouse_name": r["warehouse_name"], "pct": float(r["pct"])}
+            for r in rows
+        ]
+    whs = conn.execute("SELECT id, name FROM warehouses ORDER BY id").fetchall()
+    if not whs:
+        return []
+    pct = round(100.0 / len(whs), 4)
+    return [
+        {"warehouse_id": w["id"], "warehouse_name": w["name"], "pct": pct}
+        for w in whs
+    ]
+
+
+def allocate_expense_amount(amount: float, split: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not split:
+        return []
+    total_pct = sum(float(s["pct"]) for s in split) or 100.0
+    out = []
+    for s in split:
+        share = amount * float(s["pct"]) / total_pct
+        out.append({**s, "amount": round(share, 2)})
+    return out
+
+
+def _cash_net_before(conn: sqlite3.Connection, cutoff: str) -> float:
+    sale_in = conn.execute(
+        """
+        SELECT COALESCE(SUM(sp.amount), 0)
+        FROM sale_payments sp
+        JOIN sales s ON s.id = sp.sale_id
+        WHERE s.status = 'completed' AND s.created_at < ?
+        """,
+        (cutoff,),
+    ).fetchone()[0]
+    recv_in = conn.execute(
+        "SELECT COALESCE(SUM(amount), 0) FROM receivable_payments WHERE created_at < ?",
+        (cutoff,),
+    ).fetchone()[0]
+    sup_out = conn.execute(
+        "SELECT COALESCE(SUM(amount), 0) FROM supplier_payments WHERE created_at < ?",
+        (cutoff,),
+    ).fetchone()[0]
+    exp_out = conn.execute(
+        "SELECT COALESCE(SUM(amount), 0) FROM expenses WHERE expense_date < ?",
+        (cutoff[:10],),
+    ).fetchone()[0]
+    return float(sale_in) + float(recv_in) - float(sup_out) - float(exp_out)
+
+
+def _period_cutoff_start(period: str, date_from: str, date_to: str) -> str:
+    if date_from:
+        return date_from if len(date_from) > 10 else f"{date_from} 00:00:00"
+    if period == "all":
+        return "9999-12-31"
+    return period_start(period)
 
 
 def insert_sale_payments(conn: sqlite3.Connection, sale_id: int, payments: list[dict[str, float | str]]) -> None:
@@ -1735,6 +1909,106 @@ def resolve_warehouse_id(conn: sqlite3.Connection, warehouse_id: int | None) -> 
     return get_default_warehouse_id(conn)
 
 
+def resolve_accessories_warehouse_id(conn: sqlite3.Connection) -> int:
+    row = conn.execute(
+        """
+        SELECT id FROM warehouses
+        WHERE LOWER(name) LIKE '%аксесс%'
+        ORDER BY id LIMIT 1
+        """
+    ).fetchone()
+    if row:
+        return int(row["id"])
+    return get_default_warehouse_id(conn)
+
+
+def _accessories_category_clause() -> str:
+    return " AND EXISTS (SELECT 1 FROM products p WHERE p.id = si.product_id AND p.category = 'accessory')"
+
+
+def _accessories_finance_report(
+    conn: sqlite3.Connection, period: str, date_from: str, date_to: str
+) -> dict[str, Any]:
+    if date_from or date_to:
+        since_clause, params = date_filter_sql(date_from, date_to)
+        period_label = f"{date_from or '…'} — {date_to or '…'}"
+    elif period == "all":
+        since_clause, params = "", []
+        period_label = "Всё время"
+    else:
+        since_clause = " AND s.created_at >= ?"
+        params = [period_start(period)]
+        period_label = {"day": "Сегодня", "week": "Неделя", "month": "Месяц", "quarter": "Квартал", "year": "Год"}.get(period, period)
+
+    cat = _accessories_category_clause()
+    agg = conn.execute(
+        f"""
+        SELECT COUNT(DISTINCT s.id) AS sales_count,
+               COALESCE(SUM(si.subtotal), 0) AS gross_revenue,
+               COALESCE(SUM(si.purchase_price * si.quantity), 0) AS cogs,
+               COALESCE(SUM(si.shop_profit), 0) AS shop_profit,
+               COALESCE(SUM(si.quantity), 0) AS items_sold
+        FROM sale_items si
+        JOIN sales s ON s.id = si.sale_id
+        WHERE s.status = 'completed' {since_clause} {cat}
+        """,
+        params,
+    ).fetchone()
+
+    if period != "all" and not date_from and not date_to:
+        exp_clause = " AND expense_date >= ?"
+        exp_params = [period_start(period)[:10]]
+    elif date_from or date_to:
+        exp_clause, exp_params = date_filter_sql(date_from, date_to, "expense_date")
+        exp_params = [p[:10] if isinstance(p, str) and len(p) > 10 else p for p in exp_params]
+    else:
+        exp_clause, exp_params = "", []
+    expenses_total = conn.execute(
+        f"SELECT COALESCE(SUM(amount), 0) FROM expenses WHERE department = 'accessories' {exp_clause}",
+        exp_params,
+    ).fetchone()[0]
+    exp_by_cat = conn.execute(
+        f"""
+        SELECT category, COALESCE(SUM(amount), 0) AS total
+        FROM expenses WHERE department = 'accessories' {exp_clause}
+        GROUP BY category ORDER BY total DESC
+        """,
+        exp_params,
+    ).fetchall()
+
+    revenue = float(agg["gross_revenue"] or 0)
+    profit = float(agg["shop_profit"] or 0)
+    cogs = float(agg["cogs"] or 0)
+    exp = float(expenses_total)
+    return {
+        "period_label": period_label,
+        "sales_count": int(agg["sales_count"] or 0),
+        "items_sold": int(agg["items_sold"] or 0),
+        "revenue": revenue,
+        "cogs": cogs,
+        "gross_profit": revenue - cogs,
+        "shop_profit": profit,
+        "expenses": exp,
+        "net_profit": profit - exp,
+        "expenses_by_category": [{"category": r["category"], "amount": float(r["total"])} for r in exp_by_cat],
+    }
+
+
+def get_warehouse_receipt_kind(conn: sqlite3.Connection, warehouse_id: int) -> str:
+    row = conn.execute("SELECT name, warehouse_type FROM warehouses WHERE id = ?", (warehouse_id,)).fetchone()
+    if not row:
+        return "new"
+    wt = (row["warehouse_type"] or "").strip().lower()
+    if wt == "used":
+        return "used"
+    if wt == "new":
+        return "new"
+    name = (row["name"] or "").lower()
+    if "бу" in name or "б/у" in name or "б у" in name:
+        return "used"
+    return "new"
+
+
 def sync_product_stock(conn: sqlite3.Connection, product_id: int) -> int:
     total = conn.execute(
         """
@@ -1993,11 +2267,12 @@ class CartItem(BaseModel):
     quantity: int = Field(ge=1)
     unit_ids: list[int] = Field(default_factory=list)
     units: list[UnitCheckoutIn] = Field(default_factory=list)
+    unit_price: float | None = Field(default=None, gt=0)
 
 
 class PaymentPart(BaseModel):
     method_code: str = Field(min_length=1)
-    amount: float = Field(gt=0)
+    amount: float = Field(ge=0)
 
 
 class SaleIn(BaseModel):
@@ -2008,6 +2283,8 @@ class SaleIn(BaseModel):
     notes: str = ""
     warehouse_id: int | None = None
     shift_id: int | None = None
+    debtor_name: str = ""
+    debtor_phone: str = ""
 
 
 class CurrencySettingsIn(BaseModel):
@@ -2043,6 +2320,31 @@ class ExpenseIn(BaseModel):
     description: str = ""
     payment_method_code: str = "cash"
     expense_date: str = ""
+    department: str = "main"
+
+
+class AccessoryInboundIn(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    model: str = ""
+    quantity: int = Field(ge=1, le=10000)
+    supplier_name: str = ""
+    purchase_price: float = Field(gt=0)
+    sale_price: float | None = Field(default=None, gt=0)
+
+
+class ExpenseAllocationRule(BaseModel):
+    warehouse_id: int
+    pct: float = Field(ge=0, le=100)
+
+
+class ExpenseAllocationIn(BaseModel):
+    rules: list[ExpenseAllocationRule]
+
+
+class ReceivablePaymentIn(BaseModel):
+    amount: float = Field(gt=0)
+    payment_method_code: str = "cash"
+    notes: str = ""
 
 
 class UnitIn(BaseModel):
@@ -2166,7 +2468,22 @@ class InboundReceiptIn(BaseModel):
     serial: str = ""
     battery_capacity: int | None = Field(default=None, ge=0, le=100)
     notes: str = ""
+    client_name: str = ""
+    region: str = ""
+    arrival_date: str = ""
     product: InboundProductNew | None = None
+
+
+class WarehouseQuickSellIn(BaseModel):
+    unit_id: int
+    sale_price: float = Field(gt=0)
+    payment_method: str = "cash"
+    paid_amount: float | None = Field(default=None, ge=0)
+    payments: list[PaymentPart] = Field(default_factory=list)
+    discount: float = Field(ge=0, default=0)
+    notes: str = ""
+    debtor_name: str = ""
+    debtor_phone: str = ""
 
 
 class StockTransferIn(BaseModel):
@@ -2365,15 +2682,20 @@ async def list_expenses(
 
 @app.post("/api/expenses")
 async def create_expense(body: ExpenseIn, x_pin: str | None = Header(default=None, alias="X-Pin")):
-    check_pin(x_pin, min_role="owner")
+    user = check_pin(x_pin)
+    dept = (body.department or "main").strip() or "main"
+    if dept != "accessories" and user.get("role") != "owner":
+        raise HTTPException(status_code=403, detail="Недостаточно прав")
     when = body.expense_date or utc_now()[:10]
     with db() as conn:
+        if user.get("role") == "accessories" and dept != "accessories":
+            raise HTTPException(status_code=403, detail="Доступны только расходы аксессуаров")
         cur = conn.execute(
             """
-            INSERT INTO expenses (category, amount, description, payment_method_code, expense_date, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO expenses (category, amount, description, payment_method_code, expense_date, created_at, department)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (body.category.strip(), body.amount, body.description, body.payment_method_code, when, utc_now()),
+            (body.category.strip(), body.amount, body.description, body.payment_method_code, when, utc_now(), dept),
         )
         row = conn.execute("SELECT * FROM expenses WHERE id = ?", (cur.lastrowid,)).fetchone()
     return row_to_dict(row)
@@ -2387,6 +2709,103 @@ async def delete_expense(expense_id: int, x_pin: str | None = Header(default=Non
         if cur.rowcount == 0:
             raise HTTPException(status_code=404, detail="Не найдено")
     return {"ok": True}
+
+
+@app.get("/api/settings/expense-allocation")
+async def get_expense_allocation(x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin, min_role="owner")
+    with db() as conn:
+        rules = get_expense_warehouse_split(conn)
+    return {"rules": rules}
+
+
+@app.put("/api/settings/expense-allocation")
+async def save_expense_allocation(body: ExpenseAllocationIn, x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin, min_role="owner")
+    total = sum(r.pct for r in body.rules)
+    if body.rules and abs(total - 100) > 0.5:
+        raise HTTPException(status_code=400, detail=f"Сумма процентов должна быть 100% (сейчас {total:.1f}%)")
+    with db() as conn:
+        conn.execute("DELETE FROM expense_warehouse_split")
+        for r in body.rules:
+            conn.execute(
+                "INSERT INTO expense_warehouse_split (warehouse_id, pct) VALUES (?, ?)",
+                (r.warehouse_id, r.pct),
+            )
+        rules = get_expense_warehouse_split(conn)
+    return {"rules": rules}
+
+
+@app.get("/api/receivables")
+async def list_receivables(
+    status: str = Query(default="", pattern="^(|open|closed)$"),
+    x_pin: str | None = Header(default=None, alias="X-Pin"),
+):
+    check_pin(x_pin)
+    with db() as conn:
+        sql = """
+            SELECT r.*, COALESCE(w.name, '—') AS warehouse_name,
+                   (SELECT GROUP_CONCAT(si.product_name, ', ')
+                    FROM sale_items si WHERE si.sale_id = r.sale_id) AS products
+            FROM receivables r
+            LEFT JOIN warehouses w ON w.id = r.warehouse_id
+            WHERE 1=1
+        """
+        params: list[Any] = []
+        if status:
+            sql += " AND r.status = ?"
+            params.append(status)
+        sql += " ORDER BY r.status ASC, r.created_at DESC"
+        rows = conn.execute(sql, params).fetchall()
+    return [row_to_dict(r) for r in rows]
+
+
+@app.post("/api/receivables/{receivable_id}/pay")
+async def pay_receivable(
+    receivable_id: int,
+    body: ReceivablePaymentIn,
+    x_pin: str | None = Header(default=None, alias="X-Pin"),
+):
+    check_pin(x_pin)
+    with db() as conn:
+        row = conn.execute("SELECT * FROM receivables WHERE id = ?", (receivable_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Долг не найден")
+        if row["status"] == "closed":
+            raise HTTPException(status_code=400, detail="Долг уже закрыт")
+        due = float(row["amount_due"])
+        if body.amount > due + 0.01:
+            raise HTTPException(status_code=400, detail=f"Сумма больше долга ({due:.2f})")
+        pm = get_payment_method(conn, body.payment_method_code)
+        if not pm:
+            raise HTTPException(status_code=400, detail="Способ оплаты не найден")
+        now = utc_now()
+        conn.execute(
+            """
+            INSERT INTO receivable_payments (receivable_id, amount, payment_method_code, notes, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (receivable_id, body.amount, body.payment_method_code, body.notes, now),
+        )
+        new_paid = float(row["paid_amount"]) + body.amount
+        new_due = max(0.0, float(row["total_amount"]) - new_paid)
+        new_status = "closed" if new_due <= 0.01 else "open"
+        conn.execute(
+            """
+            UPDATE receivables
+            SET paid_amount = ?, amount_due = ?, status = ?,
+                closed_at = CASE WHEN ? = 'closed' THEN ? ELSE closed_at END
+            WHERE id = ?
+            """,
+            (new_paid, new_due, new_status, new_status, now, receivable_id),
+        )
+        if row["sale_id"]:
+            conn.execute(
+                "UPDATE sales SET amount_paid = COALESCE(amount_paid, 0) + ?, amount_due = ? WHERE id = ?",
+                (body.amount, new_due, row["sale_id"]),
+            )
+        updated = conn.execute("SELECT * FROM receivables WHERE id = ?", (receivable_id,)).fetchone()
+    return row_to_dict(updated)
 
 
 # --- Users (owner) ---
@@ -3277,6 +3696,208 @@ async def warehouse_stock(warehouse_id: int, x_pin: str | None = Header(default=
     return result
 
 
+@app.get("/api/warehouses/{warehouse_id}/devices")
+async def warehouse_devices(warehouse_id: int, x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin)
+    with db() as conn:
+        if not conn.execute("SELECT id FROM warehouses WHERE id = ?", (warehouse_id,)).fetchone():
+            raise HTTPException(status_code=404, detail="Склад не найден")
+        kind = get_warehouse_receipt_kind(conn, warehouse_id)
+        rows = conn.execute(
+            """
+            SELECT u.*, p.name AS model, p.color, p.memory, p.purchase_price, p.supplier_name,
+                   p.sale_price, p.ownership_type, p.condition, p.category
+            FROM product_units u
+            JOIN products p ON p.id = u.product_id
+            WHERE u.warehouse_id = ? AND u.status = 'in_stock'
+            ORDER BY COALESCE(u.arrival_date, u.created_at) DESC, u.id DESC
+            """,
+            (warehouse_id,),
+        ).fetchall()
+        items = []
+        for r in rows:
+            d = enrich_unit_row(r)
+            d["model"] = r["model"] or ""
+            d["color"] = r["color"] or ""
+            d["memory"] = r["memory"] or ""
+            d["purchase_price"] = float(r["purchase_price"] or 0)
+            d["supplier_name"] = r["supplier_name"] or ""
+            d["ownership_type"] = r["ownership_type"] or "own"
+            items.append(d)
+        acc = conn.execute(
+            """
+            SELECT p.*, ws.quantity AS warehouse_quantity
+            FROM warehouse_stock ws
+            JOIN products p ON p.id = ws.product_id
+            WHERE ws.warehouse_id = ? AND ws.quantity > 0 AND IFNULL(p.track_units, 0) = 0
+            ORDER BY p.name
+            """,
+            (warehouse_id,),
+        ).fetchall()
+        accessories = [enrich_product(conn, r) | {"warehouse_quantity": r["warehouse_quantity"]} for r in acc]
+    return {"kind": kind, "items": items, "accessories": accessories}
+
+
+@app.get("/api/warehouses/{warehouse_id}/z-report")
+async def warehouse_z_report(
+    warehouse_id: int,
+    period: str = Query(default="day", pattern="^(day|week|month)$"),
+    x_pin: str | None = Header(default=None, alias="X-Pin"),
+):
+    check_pin(x_pin)
+    with db() as conn:
+        resolve_warehouse_id(conn, warehouse_id)
+        since = period_start(period)
+        agg = conn.execute(
+            """
+            SELECT COUNT(DISTINCT s.id) AS sales_count,
+                   COALESCE(SUM(s.total), 0) AS revenue,
+                   COALESCE(SUM(s.discount), 0) AS discounts
+            FROM sales s
+            WHERE s.status = 'completed' AND s.warehouse_id = ? AND s.created_at >= ?
+            """,
+            (warehouse_id, since),
+        ).fetchone()
+        profit_row = conn.execute(
+            """
+            SELECT COALESCE(SUM(si.shop_profit), 0)
+            FROM sale_items si
+            JOIN sales s ON s.id = si.sale_id
+            WHERE s.status = 'completed' AND s.warehouse_id = ? AND s.created_at >= ?
+            """,
+            (warehouse_id, since),
+        ).fetchone()
+        by_payment = conn.execute(
+            """
+            SELECT sp.method_code, pm.name, COALESCE(SUM(sp.amount), 0) AS amount
+            FROM sale_payments sp
+            JOIN sales s ON s.id = sp.sale_id
+            LEFT JOIN payment_methods pm ON pm.code = sp.method_code
+            WHERE s.status = 'completed' AND s.warehouse_id = ? AND s.created_at >= ?
+            GROUP BY sp.method_code
+            ORDER BY amount DESC
+            """,
+            (warehouse_id, since),
+        ).fetchall()
+        lines = conn.execute(
+            """
+            SELECT s.id AS sale_id, s.created_at, s.user_name, si.product_name, si.quantity,
+                   si.subtotal, si.shop_profit, si.unit_price,
+                   GROUP_CONCAT(siu.imei, ', ') AS imeis
+            FROM sale_items si
+            JOIN sales s ON s.id = si.sale_id
+            LEFT JOIN sale_item_units siu ON siu.sale_item_id = si.id
+            WHERE s.status = 'completed' AND s.warehouse_id = ? AND s.created_at >= ?
+            GROUP BY si.id
+            ORDER BY s.created_at DESC
+            LIMIT 200
+            """,
+            (warehouse_id, since),
+        ).fetchall()
+        period_labels = {"day": "Сегодня", "week": "Неделя", "month": "Месяц"}
+    return {
+        "warehouse_id": warehouse_id,
+        "period": period,
+        "period_label": period_labels.get(period, period),
+        "sales_count": int(agg["sales_count"] or 0),
+        "revenue": float(agg["revenue"] or 0),
+        "discounts": float(agg["discounts"] or 0),
+        "profit": float(profit_row[0] or 0),
+        "by_payment": [row_to_dict(r) for r in by_payment],
+        "lines": [row_to_dict(r) for r in lines],
+    }
+
+
+@app.post("/api/warehouse/quick-sell")
+async def warehouse_quick_sell(body: WarehouseQuickSellIn, x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin)
+    with db() as conn:
+        unit = conn.execute(
+            "SELECT * FROM product_units WHERE id = ? AND status = 'in_stock'", (body.unit_id,)
+        ).fetchone()
+        if not unit:
+            raise HTTPException(status_code=404, detail="Устройство не найдено или уже продано")
+        wh_id = int(unit["warehouse_id"])
+        product_id = int(unit["product_id"])
+    total = body.sale_price - body.discount
+    if body.payments:
+        pay_list = [{"method_code": p.method_code, "amount": p.amount} for p in body.payments]
+    elif body.paid_amount is not None:
+        pay_list = [{"method_code": body.payment_method, "amount": body.paid_amount}]
+    else:
+        pay_list = [{"method_code": body.payment_method, "amount": total}]
+    sale_in = SaleIn(
+        items=[CartItem(product_id=product_id, quantity=1, unit_ids=[body.unit_id], unit_price=body.sale_price)],
+        discount=body.discount,
+        payments=[PaymentPart(**p) for p in pay_list],
+        notes=body.notes or "Продажа со склада",
+        warehouse_id=wh_id,
+        debtor_name=body.debtor_name,
+        debtor_phone=body.debtor_phone,
+    )
+    return await create_sale(sale_in, x_pin)
+
+
+@app.get("/api/pos/cash-register")
+async def pos_cash_register(
+    period: str = Query(default="day", pattern="^(day|week|month|all)$"),
+    x_pin: str | None = Header(default=None, alias="X-Pin"),
+):
+    check_pin(x_pin)
+    with db() as conn:
+        dds = _report_dds(conn, period, "", "")
+        opiu = _report_opiu(conn, period, "", "")
+        fin = _finance_report(conn, period, "all", "", "")
+        clause, params, _ = _report_period_clause(period, "", "", "expense_date")
+        if period != "all" and not params:
+            clause = " AND expense_date >= ?"
+            params = [period_start(period)[:10]]
+        exp_rows = conn.execute(
+            f"SELECT * FROM expenses WHERE 1=1 {clause} ORDER BY expense_date DESC LIMIT 30",
+            params,
+        ).fetchall()
+        methods = list_payment_methods(conn, active_only=True)
+        balances: list[dict[str, Any]] = []
+        for pm in methods:
+            amt = conn.execute(
+                """
+                SELECT COALESCE(SUM(sp.amount), 0)
+                FROM sale_payments sp
+                JOIN sales s ON s.id = sp.sale_id
+                WHERE s.status = 'completed' AND sp.method_code = ?
+                """
+                + (" AND s.created_at >= ?" if period != "all" else ""),
+                ([pm["code"], period_start(period)] if period != "all" else [pm["code"]]),
+            ).fetchone()[0]
+            out = 0.0
+            if pm["method_type"] == "cash":
+                out = float(conn.execute(
+                    f"SELECT COALESCE(SUM(amount), 0) FROM expenses WHERE payment_method_code = ? {clause.replace('expense_date', 'expense_date') if clause else ''}",
+                    [pm["code"], *params] if clause else [pm["code"]],
+                ).fetchone()[0])
+            balances.append({
+                "code": pm["code"],
+                "name": pm["name"],
+                "method_type": pm["method_type"],
+                "inflow": float(amt),
+                "outflow": out,
+                "net": float(amt) - out,
+            })
+    return {
+        "period": period,
+        "period_label": dds["period_label"],
+        "inflows": dds["operating_inflows"],
+        "total_inflows": dds["total_inflows"],
+        "total_outflows": dds["total_outflows"],
+        "net_cash": dds["net_operating_cash"],
+        "revenue": fin["gross_revenue"],
+        "profit": fin["shop_profit"],
+        "expenses_total": opiu["operating_expenses"],
+        "expenses": [row_to_dict(r) for r in exp_rows],
+        "balances": balances,
+    }
+
+
 @app.get("/api/stock/total")
 async def stock_total(x_pin: str | None = Header(default=None, alias="X-Pin")):
     check_pin(x_pin)
@@ -3301,13 +3922,19 @@ async def stock_total(x_pin: str | None = Header(default=None, alias="X-Pin")):
 
 
 @app.get("/api/import/products/template")
-async def import_products_template(x_pin: str | None = Header(default=None, alias="X-Pin")):
+async def import_products_template(
+    warehouse_id: int | None = Query(default=None),
+    x_pin: str | None = Header(default=None, alias="X-Pin"),
+):
     check_pin(x_pin, min_role="warehouse")
-    data = build_products_import_xlsx()
+    with db() as conn:
+        kind = get_warehouse_receipt_kind(conn, warehouse_id) if warehouse_id else "new"
+    data = build_products_import_xlsx(kind)
+    fname = "telestore_used_import.xlsx" if kind == "used" else "telestore_new_import.xlsx"
     return Response(
         content=data,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": 'attachment; filename="telestore_import.xlsx"'},
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
     )
 
 
@@ -3446,13 +4073,15 @@ async def stock_inbound_receipt(body: InboundReceiptIn, x_pin: str | None = Head
                 """
                 INSERT INTO product_units
                 (product_id, warehouse_id, imei, serial, status, notes, created_at,
-                 customs_status, customs_cleared, battery_capacity)
-                VALUES (?, ?, ?, ?, 'in_stock', ?, ?, ?, ?, ?)
+                 customs_status, customs_cleared, battery_capacity, client_name, region, arrival_date)
+                VALUES (?, ?, ?, ?, 'in_stock', ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     product_id, wh_id, imei, serial,
                     body.notes or "Приход на склад", utc_now(), cs,
                     int(product["customs_cleared"] or 0), body.battery_capacity,
+                    body.client_name.strip(), body.region.strip(),
+                    body.arrival_date.strip() or utc_now()[:10],
                 ),
             )
             unit_row = conn.execute("SELECT * FROM product_units WHERE id = ?", (cur_u.lastrowid,)).fetchone()
@@ -3690,6 +4319,187 @@ async def list_products(
         return [enrich_product(conn, r) for r in rows]
 
 
+@app.get("/api/accessories/warehouse")
+async def accessories_warehouse(x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin)
+    with db() as conn:
+        wh_id = resolve_accessories_warehouse_id(conn)
+        row = conn.execute("SELECT * FROM warehouses WHERE id = ?", (wh_id,)).fetchone()
+    return row_to_dict(row)
+
+
+@app.get("/api/accessories/stock")
+async def accessories_stock(
+    q: str = "",
+    x_pin: str | None = Header(default=None, alias="X-Pin"),
+):
+    check_pin(x_pin)
+    with db() as conn:
+        wh_id = resolve_accessories_warehouse_id(conn)
+        sql = """
+            SELECT p.*, COALESCE(ws.quantity, 0) AS warehouse_quantity
+            FROM products p
+            LEFT JOIN warehouse_stock ws ON ws.product_id = p.id AND ws.warehouse_id = ?
+            WHERE p.category = 'accessory'
+        """
+        params: list[Any] = [wh_id]
+        if q.strip():
+            clause, sp = product_search_sql(q)
+            sql += clause
+            params.extend(sp)
+        sql += " ORDER BY p.name"
+        rows = conn.execute(sql, params).fetchall()
+        return [enrich_product(conn, r) | {"warehouse_quantity": r["warehouse_quantity"]} for r in rows]
+
+
+@app.post("/api/accessories/inbound")
+async def accessories_inbound(body: AccessoryInboundIn, x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin)
+    with db() as conn:
+        wh_id = resolve_accessories_warehouse_id(conn)
+        sale_price = body.sale_price if body.sale_price and body.sale_price > 0 else round(body.purchase_price * 1.3, 2)
+        existing = conn.execute(
+            """
+            SELECT * FROM products
+            WHERE category = 'accessory' AND LOWER(TRIM(name)) = LOWER(TRIM(?))
+              AND LOWER(TRIM(COALESCE(model, ''))) = LOWER(TRIM(?))
+              AND LOWER(TRIM(COALESCE(supplier_name, ''))) = LOWER(TRIM(?))
+            LIMIT 1
+            """,
+            (body.name, body.model, body.supplier_name),
+        ).fetchone()
+        if existing:
+            product_id = int(existing["id"])
+            conn.execute(
+                """
+                UPDATE products SET purchase_price = ?, supplier_name = ?, model = ?
+                WHERE id = ?
+                """,
+                (body.purchase_price, body.supplier_name.strip(), body.model.strip(), product_id),
+            )
+        else:
+            cur = conn.execute(
+                """
+                INSERT INTO products
+                (name, category, ownership_type, supplier_name, brand, sku, barcode,
+                 purchase_price, sale_price, stock, min_stock, created_at,
+                 model, color, size, memory, ram, customs_cleared, customs_price, specs_extra,
+                 condition, track_units, image_url)
+                VALUES (?, 'accessory', 'own', ?, '', '', '', ?, ?, 0, 0, ?,
+                        ?, '', '', '', '', 0, 0, '', 'new', 0, '')
+                """,
+                (
+                    body.name.strip(), body.supplier_name.strip(),
+                    body.purchase_price, sale_price, utc_now(), body.model.strip(),
+                ),
+            )
+            product_id = int(cur.lastrowid)
+        adjust_warehouse_stock(
+            conn, wh_id, product_id, body.quantity, "inbound",
+            notes=f"Приход аксессуаров: {body.name} ×{body.quantity}",
+        )
+        product = conn.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
+        result = enrich_product(conn, product)
+        result["warehouse_quantity"] = get_warehouse_stock(conn, wh_id, product_id)
+        return result
+
+
+@app.put("/api/accessories/products/{product_id}/price")
+async def accessories_update_price(
+    product_id: int,
+    sale_price: float = Query(gt=0),
+    x_pin: str | None = Header(default=None, alias="X-Pin"),
+):
+    check_pin(x_pin)
+    with db() as conn:
+        row = conn.execute(
+            "SELECT * FROM products WHERE id = ? AND category = 'accessory'", (product_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Товар не найден")
+        conn.execute("UPDATE products SET sale_price = ? WHERE id = ?", (sale_price, product_id))
+        return enrich_product(conn, conn.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone())
+
+
+@app.get("/api/accessories/reports/finance")
+async def accessories_finance_report(
+    period: str = Query(default="month", pattern="^(day|week|month|quarter|year|all)$"),
+    date_from: str = "",
+    date_to: str = "",
+    x_pin: str | None = Header(default=None, alias="X-Pin"),
+):
+    check_pin(x_pin)
+    with db() as conn:
+        fin = _accessories_finance_report(conn, period, date_from, date_to)
+        wh_id = resolve_accessories_warehouse_id(conn)
+        clause, params, _ = _report_period_clause(period, date_from, date_to, "s.created_at")
+        lines = conn.execute(
+            f"""
+            SELECT s.id, s.created_at, s.total, si.product_name, si.quantity, si.subtotal, si.shop_profit
+            FROM sales s
+            JOIN sale_items si ON si.sale_id = s.id
+            JOIN products p ON p.id = si.product_id
+            WHERE s.status = 'completed' AND p.category = 'accessory' {clause}
+            ORDER BY s.created_at DESC LIMIT 50
+            """,
+            params,
+        ).fetchall()
+        fin["recent_sales"] = [row_to_dict(r) for r in lines]
+        fin["warehouse_id"] = wh_id
+        return fin
+
+
+@app.get("/api/accessories/cash-register")
+async def accessories_cash_register(
+    period: str = Query(default="day", pattern="^(day|week|month|all)$"),
+    x_pin: str | None = Header(default=None, alias="X-Pin"),
+):
+    check_pin(x_pin)
+    with db() as conn:
+        fin = _accessories_finance_report(conn, period, "", "")
+        clause = ""
+        params: list[Any] = []
+        if period != "all":
+            clause = " AND s.created_at >= ?"
+            params = [period_start(period)]
+        inflows = conn.execute(
+            f"""
+            SELECT sp.method_code, pm.name, COALESCE(SUM(sp.amount), 0) AS amount
+            FROM sale_payments sp
+            JOIN sales s ON s.id = sp.sale_id
+            JOIN sale_items si ON si.sale_id = s.id
+            JOIN products p ON p.id = si.product_id
+            LEFT JOIN payment_methods pm ON pm.code = sp.method_code
+            WHERE s.status = 'completed' AND p.category = 'accessory' {clause}
+            GROUP BY sp.method_code
+            """,
+            params,
+        ).fetchall()
+        total_in = sum(float(r["amount"]) for r in inflows)
+        exp_clause = " AND expense_date >= ?" if period != "all" else ""
+        exp_params = [period_start(period)[:10]] if period != "all" else []
+        exp_out = conn.execute(
+            f"SELECT COALESCE(SUM(amount), 0) FROM expenses WHERE department = 'accessories' {exp_clause}",
+            exp_params,
+        ).fetchone()[0]
+        exp_rows = conn.execute(
+            f"SELECT * FROM expenses WHERE department = 'accessories' {exp_clause} ORDER BY expense_date DESC LIMIT 20",
+            exp_params,
+        ).fetchall()
+        return {
+            "period": period,
+            "period_label": fin["period_label"],
+            "total_inflows": total_in,
+            "total_outflows": float(exp_out),
+            "net_cash": total_in - float(exp_out),
+            "profit": fin["shop_profit"],
+            "revenue": fin["revenue"],
+            "expenses": fin["expenses"],
+            "inflows": [{"method_code": r["method_code"], "name": r["name"] or r["method_code"], "amount": float(r["amount"])} for r in inflows],
+            "expense_lines": [row_to_dict(r) for r in exp_rows],
+        }
+
+
 @app.get("/api/suppliers")
 async def list_suppliers(x_pin: str | None = Header(default=None, alias="X-Pin")):
     check_pin(x_pin)
@@ -3892,8 +4702,6 @@ async def create_sale(body: SaleIn, x_pin: str | None = Header(default=None, ali
         user = resolve_user(conn, x_pin)
         shift = get_open_shift(conn)
         shift_id = body.shift_id or (shift["id"] if shift else None)
-        if shift_id is None:
-            raise HTTPException(status_code=400, detail="Сначала откройте смену (раздел «Смена»)")
 
         subtotal = 0.0
         lines: list[dict[str, Any]] = []
@@ -3923,7 +4731,7 @@ async def create_sale(body: SaleIn, x_pin: str | None = Header(default=None, ali
                         status_code=400,
                         detail=f"Недостаточно «{product['name']}» на складе: доступно {wh_stock}",
                     )
-            calc = calc_line(product, item.quantity)
+            calc = calc_line(product, item.quantity, item.unit_price)
             subtotal += calc["subtotal"]
             lines.append({"product": product, "qty": item.quantity, "unit_ids": item.unit_ids, "unit_checkouts": {u.unit_id: u for u in item.units}, **calc})
 
@@ -3932,28 +4740,57 @@ async def create_sale(body: SaleIn, x_pin: str | None = Header(default=None, ali
 
         if body.payments:
             pay_payload = [{"method_code": p.method_code, "amount": p.amount} for p in body.payments]
-            cash_amount, card_amount, payment_method, pay_payload = validate_sale_payments(
-                conn, pay_payload, total
+            cash_amount, card_amount, payment_method, pay_payload, amount_paid, amount_due = process_sale_payments(
+                conn, pay_payload, total, debtor_name=body.debtor_name
             )
         else:
-            cash_amount = total if body.payment_method == "cash" else 0.0
-            card_amount = total if body.payment_method not in ("cash", "trade_in") else 0.0
-            payment_method = body.payment_method
-            pay_payload = [{"method_code": body.payment_method, "amount": total}]
+            if total <= 0:
+                amount_paid = 0.0
+                amount_due = 0.0
+                cash_amount = card_amount = 0.0
+                payment_method = body.payment_method
+                pay_payload = []
+            elif body.debtor_name.strip():
+                amount_paid = 0.0
+                amount_due = total
+                cash_amount = card_amount = 0.0
+                payment_method = "credit"
+                pay_payload = []
+            else:
+                cash_amount = total if body.payment_method == "cash" else 0.0
+                card_amount = total if body.payment_method not in ("cash", "trade_in", "credit") else 0.0
+                payment_method = body.payment_method
+                pay_payload = [{"method_code": body.payment_method, "amount": total}]
+                amount_paid = total
+                amount_due = 0.0
 
         cur = conn.execute(
             """
             INSERT INTO sales
             (total, discount, payment_method, status, notes, created_at,
-             warehouse_id, cash_amount, card_amount, trade_in_value, shift_id, user_id, user_name)
-            VALUES (?, ?, ?, 'completed', ?, ?, ?, ?, ?, 0, ?, ?, ?)
+             warehouse_id, cash_amount, card_amount, trade_in_value, shift_id, user_id, user_name,
+             amount_paid, amount_due)
+            VALUES (?, ?, ?, 'completed', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
             """,
             (total, body.discount, payment_method, body.notes, now,
              warehouse_id, cash_amount, card_amount, shift_id,
-             user.get("id") if user else None, user.get("name", "") if user else ""),
+             user.get("id") if user else None, user.get("name", "") if user else "",
+             amount_paid, amount_due),
         )
         sale_id = cur.lastrowid
-        insert_sale_payments(conn, sale_id, pay_payload)
+        if pay_payload:
+            insert_sale_payments(conn, sale_id, pay_payload)
+        if amount_due > 0.01:
+            create_receivable(
+                conn,
+                sale_id=sale_id,
+                customer_name=body.debtor_name,
+                customer_phone=body.debtor_phone,
+                total_amount=total,
+                paid_amount=amount_paid,
+                warehouse_id=warehouse_id,
+                notes=body.notes,
+            )
         for line in lines:
             p = line["product"]
             cur_item = conn.execute(
@@ -4329,6 +5166,17 @@ def _report_dds(conn: sqlite3.Connection, period: str, date_from: str, date_to: 
         params,
     ).fetchall()
     total_in = sum(float(r["amount"]) for r in inflows)
+    recv_clause = clause.replace("s.created_at", "rp.created_at")
+    recv_params = params
+    recv_in = conn.execute(
+        f"""
+        SELECT COALESCE(SUM(rp.amount), 0)
+        FROM receivable_payments rp
+        WHERE 1=1 {recv_clause.replace('s.', '') if 's.' in recv_clause else recv_clause}
+        """,
+        recv_params if recv_clause else [],
+    ).fetchone()[0]
+    total_in += float(recv_in)
     sup_clause = clause.replace("s.created_at", "created_at")
     supplier_out = conn.execute(
         f"SELECT COALESCE(SUM(amount), 0) FROM supplier_payments WHERE 1=1 {sup_clause.replace('s.', '') if 's.' in sup_clause else sup_clause}",
@@ -4345,14 +5193,158 @@ def _report_dds(conn: sqlite3.Connection, period: str, date_from: str, date_to: 
         exp_params,
     ).fetchone()[0]
     operating_out = float(supplier_out) + float(expenses_out)
+    net_operating_cash = total_in - operating_out
+    cutoff = _period_cutoff_start(period, date_from, date_to)
+    opening_balance = _cash_net_before(conn, cutoff) if period != "all" or date_from else 0.0
+    closing_balance = opening_balance + net_operating_cash
     return {
         "period_label": label,
         "operating_inflows": [{"method_code": r["method_code"], "name": r["name"] or r["method_code"], "amount": float(r["amount"])} for r in inflows],
+        "receivable_collections": float(recv_in),
         "total_inflows": total_in,
         "supplier_payments": float(supplier_out),
         "operating_expenses": float(expenses_out),
         "total_outflows": operating_out,
-        "net_operating_cash": total_in - operating_out,
+        "net_operating_cash": net_operating_cash,
+        "opening_balance": opening_balance,
+        "closing_balance": closing_balance,
+    }
+
+
+def _report_financial_detail(
+    conn: sqlite3.Connection,
+    kind: str,
+    period: str,
+    date_from: str,
+    date_to: str,
+    warehouse_id: int | None = None,
+) -> dict[str, Any]:
+    clause, params, label = _report_period_clause(period, date_from, date_to, "s.created_at")
+    wh_clause = " AND s.warehouse_id = ?" if warehouse_id else ""
+    wh_params = list(params) + ([warehouse_id] if warehouse_id else [])
+
+    sale_lines = conn.execute(
+        f"""
+        SELECT s.id, s.created_at, s.total, s.amount_paid, s.amount_due,
+               COALESCE(w.name, '—') AS warehouse_name, s.warehouse_id,
+               COALESCE(SUM(si.shop_profit), 0) AS profit
+        FROM sales s
+        LEFT JOIN warehouses w ON w.id = s.warehouse_id
+        LEFT JOIN sale_items si ON si.sale_id = s.id
+        WHERE s.status = 'completed' {clause}{wh_clause}
+        GROUP BY s.id
+        ORDER BY s.created_at DESC
+        LIMIT 200
+        """,
+        wh_params,
+    ).fetchall()
+
+    pay_lines = conn.execute(
+        f"""
+        SELECT sp.method_code, pm.name, sp.amount, s.created_at, s.id AS sale_id,
+               COALESCE(w.name, '—') AS warehouse_name
+        FROM sale_payments sp
+        JOIN sales s ON s.id = sp.sale_id
+        LEFT JOIN payment_methods pm ON pm.code = sp.method_code
+        LEFT JOIN warehouses w ON w.id = s.warehouse_id
+        WHERE s.status = 'completed' {clause}{wh_clause}
+        ORDER BY s.created_at DESC
+        LIMIT 300
+        """,
+        wh_params,
+    ).fetchall()
+
+    exp_clause = clause.replace("s.created_at", "expense_date")
+    if period != "all" and not date_from and not date_to:
+        exp_clause = " AND expense_date >= ?"
+        exp_params: list[Any] = [period_start(period)[:10]]
+    else:
+        exp_params = [p[:10] if isinstance(p, str) and len(p) > 10 else p for p in params] if exp_clause else []
+    expense_rows = conn.execute(
+        f"SELECT * FROM expenses WHERE 1=1 {exp_clause} ORDER BY expense_date DESC LIMIT 200",
+        exp_params,
+    ).fetchall()
+
+    sup_clause = clause.replace("s.created_at", "created_at")
+    supplier_rows = conn.execute(
+        f"SELECT * FROM supplier_payments WHERE 1=1 {sup_clause.replace('s.', '') if 's.' in sup_clause else sup_clause} ORDER BY created_at DESC LIMIT 100",
+        params if sup_clause else [],
+    ).fetchall()
+
+    recv_clause = clause.replace("s.created_at", "rp.created_at")
+    recv_rows = conn.execute(
+        f"""
+        SELECT rp.*, r.customer_name, r.customer_phone
+        FROM receivable_payments rp
+        JOIN receivables r ON r.id = rp.receivable_id
+        WHERE 1=1 {recv_clause.replace('s.', '') if 's.' in recv_clause else recv_clause}
+        ORDER BY rp.created_at DESC LIMIT 100
+        """,
+        params if recv_clause else [],
+    ).fetchall()
+
+    split = get_expense_warehouse_split(conn)
+    opiu = _report_opiu(conn, period, date_from, date_to)
+    total_expenses = float(opiu.get("operating_expenses") or 0)
+    wh_breakdown: list[dict[str, Any]] = []
+    warehouses = conn.execute("SELECT id, name FROM warehouses ORDER BY name").fetchall()
+    for wh in warehouses:
+        wid = wh["id"]
+        rev = conn.execute(
+            f"""
+            SELECT COALESCE(SUM(s.total), 0)
+            FROM sales s
+            WHERE s.status = 'completed' AND s.warehouse_id = ? {clause}
+            """,
+            [wid, *params],
+        ).fetchone()[0]
+        profit = conn.execute(
+            f"""
+            SELECT COALESCE(SUM(si.shop_profit), 0)
+            FROM sale_items si
+            JOIN sales s ON s.id = si.sale_id
+            WHERE s.status = 'completed' AND s.warehouse_id = ? {clause}
+            """,
+            [wid, *params],
+        ).fetchone()[0]
+        inflow = conn.execute(
+            f"""
+            SELECT COALESCE(SUM(sp.amount), 0)
+            FROM sale_payments sp
+            JOIN sales s ON s.id = sp.sale_id
+            WHERE s.status = 'completed' AND s.warehouse_id = ? {clause}
+            """,
+            [wid, *params],
+        ).fetchone()[0]
+        wh_split = next((s for s in split if s["warehouse_id"] == wid), None)
+        pct = float(wh_split["pct"]) if wh_split else 0.0
+        total_pct = sum(float(s["pct"]) for s in split) or 100.0
+        exp_alloc = total_expenses * pct / total_pct if split else 0.0
+        wh_breakdown.append({
+            "warehouse_id": wid,
+            "warehouse_name": wh["name"],
+            "revenue": float(rev),
+            "profit": float(profit),
+            "inflows": float(inflow),
+            "expenses_allocated": round(exp_alloc, 2),
+            "pct": pct,
+        })
+
+    opiu = _report_opiu(conn, period, date_from, date_to)
+    dds = _report_dds(conn, period, date_from, date_to)
+    return {
+        "kind": kind,
+        "period_label": label,
+        "warehouse_id": warehouse_id,
+        "summary": opiu if kind == "opiu" else dds,
+        "warehouses": wh_breakdown,
+        "sales": [row_to_dict(r) for r in sale_lines],
+        "inflow_lines": [row_to_dict(r) for r in pay_lines],
+        "expense_lines": [row_to_dict(r) for r in expense_rows],
+        "expenses_by_category": opiu.get("expenses_by_category", []),
+        "supplier_payments": [row_to_dict(r) for r in supplier_rows],
+        "receivable_collections": [row_to_dict(r) for r in recv_rows],
+        "expense_allocation": split,
     }
 
 
@@ -4393,13 +5385,17 @@ def _report_balance(conn: sqlite3.Connection) -> dict[str, Any]:
             "SELECT COALESCE(SUM(amount), 0) FROM supplier_payments WHERE supplier_name = ?", (s["supplier_name"],)
         ).fetchone()[0]
         supplier_payable += max(0, float(s["accrued"]) - float(paid))
-    assets = cash_balance + float(inventory)
+    receivables_total = conn.execute(
+        "SELECT COALESCE(SUM(amount_due), 0) FROM receivables WHERE status = 'open'"
+    ).fetchone()[0]
+    assets = cash_balance + float(inventory) + float(receivables_total)
     liabilities = supplier_payable
     equity = assets - liabilities
     return {
         "assets": {
             "cash": cash_balance,
             "inventory": float(inventory),
+            "receivables": float(receivables_total),
             "total": assets,
         },
         "liabilities": {
@@ -4503,6 +5499,20 @@ async def report_dds(
     check_pin(x_pin, min_role="owner")
     with db() as conn:
         return _report_dds(conn, period, date_from, date_to)
+
+
+@app.get("/api/reports/detail")
+async def report_detail(
+    kind: str = Query(pattern="^(opiu|dds|finance)$"),
+    period: str = Query(default="month", pattern="^(day|week|month|quarter|year|all)$"),
+    date_from: str = "",
+    date_to: str = "",
+    warehouse_id: int | None = None,
+    x_pin: str | None = Header(default=None, alias="X-Pin"),
+):
+    check_pin(x_pin, min_role="owner")
+    with db() as conn:
+        return _report_financial_detail(conn, kind, period, date_from, date_to, warehouse_id)
 
 
 @app.get("/api/reports/balance")

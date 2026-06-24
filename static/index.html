@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/style.css?v=16">
+  <link rel="stylesheet" href="/static/style.css?v=23">
 </head>
 <body>
   <div class="mesh-bg" aria-hidden="true"></div>
@@ -46,9 +46,6 @@
         <button class="nav-item" data-page="pos">
           <span class="nav-icon">⊞</span> Касса
         </button>
-        <button class="nav-item" data-page="shifts">
-          <span class="nav-icon">◷</span> Смена
-        </button>
         <button class="nav-item" data-page="sales">
           <span class="nav-icon">☰</span> Продажи
         </button>
@@ -62,24 +59,21 @@
         <button class="nav-item" data-page="products-consignment">
           <span class="nav-icon">⇄</span> Под реализацию
         </button>
-        <button class="nav-item" data-page="suppliers">
-          <span class="nav-icon">◎</span> Поставщики
-        </button>
-        <button class="nav-item" data-page="trade-in">
-          <span class="nav-icon">⇋</span> Обмен
-        </button>
         <button class="nav-item" data-page="imei">
           <span class="nav-icon">#</span> IMEI / Серийники
-        </button>
-        <button class="nav-item" data-page="reservations">
-          <span class="nav-icon">🔖</span> Резервы
         </button>
                 <button class="nav-item" data-page="stocktake">
           <span class="nav-icon">☑</span> Инвентаризация
         </button>
+        <button class="nav-item" data-page="accessories">
+          <span class="nav-icon">◎</span> Аксессуары
+        </button>
         <div class="nav-group-label">Финансы</div>
         <button class="nav-item" data-page="reports">
           <span class="nav-icon">₽</span> Фин. отчёты
+        </button>
+        <button class="nav-item" data-page="debtors">
+          <span class="nav-icon">📋</span> Дебиторка
         </button>
         <button class="nav-item" data-page="analytics">
           <span class="nav-icon">↗</span> Аналитика
@@ -132,11 +126,11 @@
 
         <!-- POS -->
         <section id="page-pos" class="page">
-          <div class="pos-layout">
+          <div class="pos-layout pos-layout-3">
             <div class="pos-left card">
               <div class="toolbar">
                 <select id="pos-warehouse" class="select" title="Склад отгрузки"></select>
-                <input type="search" id="pos-search" class="input" placeholder="Поиск, IMEI (5 цифр), штрихкод…" autofocus>
+                <input type="search" id="pos-search" class="input" placeholder="Поиск, IMEI (5 цифр)…" autofocus>
                 <select id="pos-category" class="select">
                   <option value="">Все категории</option>
                   <option value="phone">Телефоны</option>
@@ -149,6 +143,28 @@
                 </select>
               </div>
               <div id="pos-products" class="product-grid"></div>
+            </div>
+            <div class="pos-mid card" id="pos-cash-panel">
+              <div class="card-header"><h3>Касса — деньги</h3><button type="button" id="pos-cash-refresh" class="btn btn-ghost btn-sm">Обновить</button></div>
+              <div class="card-body">
+                <div class="kpi-grid pos-kpi" id="pos-cash-kpi"></div>
+                <h4 class="sub-heading">По кошелькам</h4>
+                <div id="pos-balances" class="pos-balances"></div>
+                <h4 class="sub-heading">Расход</h4>
+                <form id="pos-expense-form" class="form-stack">
+                  <label>Категория<input id="pos-exp-category" class="input" required placeholder="Аренда"></label>
+                  <div class="form-row">
+                    <label>Сумма<input type="number" id="pos-exp-amount" class="input" min="0.01" step="0.01" required></label>
+                    <label>Оплата<select id="pos-exp-pay" class="select"></select></label>
+                  </div>
+                  <label>Описание<input id="pos-exp-desc" class="input"></label>
+                  <button type="submit" class="btn btn-primary btn-sm">Добавить расход</button>
+                </form>
+                <div class="table-wrap" style="margin-top:1rem;max-height:200px;overflow:auto">
+                  <table class="data-table"><thead><tr><th>Дата</th><th>Категория</th><th>Сумма</th></tr></thead>
+                  <tbody id="pos-expenses-tbody"></tbody></table>
+                </div>
+              </div>
             </div>
             <div class="pos-right card">
               <div class="card-header"><h3>Текущий чек</h3><span class="cart-badge" id="cart-count">0</span></div>
@@ -236,8 +252,13 @@
               <div class="toolbar wh-toolbar">
                 <button id="wh-show-total" class="btn btn-ghost btn-sm">Сводка по всем складам</button>
               </div>
-              <div class="table-wrap"><table class="data-table">
-                <thead><tr><th>Товар</th><th>Модель</th><th>Цвет</th><th>Категория</th><th>Закупка</th><th>Кол-во</th><th>Устройства</th></tr></thead>
+              <div class="segmented wh-view-tabs hidden" id="wh-main-tabs">
+                <button type="button" class="seg active" data-wh-view="stock">Новые товары</button>
+                <button type="button" class="seg" data-wh-view="zreport">Z-отчёт</button>
+              </div>
+              <div id="wh-z-report" class="card-body hidden"></div>
+              <div class="table-wrap" id="wh-stock-table-wrap"><table class="data-table">
+                <thead id="wh-stock-thead"><tr><th>Модель</th><th>Цвет</th><th>Память</th><th>IMEI</th><th>Себест.</th><th></th></tr></thead>
                 <tbody id="wh-stock-tbody"></tbody>
               </table></div>
             </div>
@@ -291,21 +312,17 @@
         <!-- CONSIGNMENT PRODUCTS -->
         <section id="page-products-consignment" class="page">
           <div class="toolbar">
-            <input type="search" id="cons-search" class="input" placeholder="Поиск, IMEI, модель, цвет…">
+            <input type="search" id="cons-search" class="input" placeholder="Поиск, IMEI, модель…">
             <select id="cons-supplier-filter" class="select"><option value="">Все поставщики</option></select>
-            <button type="button" class="btn btn-primary" data-action="product-add-consignment">+ Добавить</button>
+            <button type="button" class="btn btn-primary" data-action="product-add-consignment">+ Приход</button>
           </div>
           <div class="card"><div class="table-wrap"><table class="data-table">
-            <thead><tr><th>Название</th><th>Модель</th><th>Цвет</th><th>Память</th><th>Поставщик</th><th>Категория</th><th>Доля пост.</th><th>Цена</th><th>Комиссия</th><th>Остаток</th><th></th></tr></thead>
+            <thead><tr><th>Модель</th><th>Цвет</th><th>Память</th><th>IMEI</th><th>Поставщик</th><th>Себест.</th><th>Цена</th><th></th></tr></thead>
             <tbody id="cons-tbody"></tbody>
           </table></div></div>
-        </section>
-
-        <!-- SUPPLIERS -->
-        <section id="page-suppliers" class="page">
-          <div class="grid-2">
+          <div class="grid-2" style="margin-top:1rem">
             <div class="card">
-              <div class="card-header"><h3>Поставщики (реализация)</h3></div>
+              <div class="card-header"><h3>Поставщики</h3></div>
               <div class="table-wrap"><table class="data-table">
                 <thead><tr><th>Поставщик</th><th>Товаров</th><th>Начислено</th><th>Оплачено</th><th>Баланс</th></tr></thead>
                 <tbody id="suppliers-tbody"></tbody>
@@ -313,117 +330,132 @@
             </div>
             <div class="card">
               <div class="card-header"><h3>Выплата поставщику</h3></div>
-              <form id="payment-form" class="form-stack">
+              <form id="payment-form" class="form-stack card-body">
                 <label>Поставщик<select id="pay-supplier" class="select" required></select></label>
-                <label>Сумма, ₽<input type="number" id="pay-amount" class="input" min="1" step="1" required></label>
+                <label>Сумма<input type="number" id="pay-amount" class="input" min="1" step="1" required></label>
                 <label>Комментарий<input type="text" id="pay-notes" class="input"></label>
                 <button type="submit" class="btn btn-primary">Зафиксировать выплату</button>
               </form>
-              <h4 class="sub-heading">История выплат</h4>
-              <div id="payments-list" class="payments-list"></div>
+              <h4 class="sub-heading card-body" style="padding-top:0">История выплат</h4>
+              <div id="payments-list" class="payments-list card-body" style="padding-top:0"></div>
             </div>
           </div>
         </section>
 
-        <!-- TRADE-IN -->
-        <section id="page-trade-in" class="page">
-          <div class="grid-2">
-            <div class="card">
-              <div class="card-header"><h3>Новый обмен (trade-in)</h3></div>
-              <form id="trade-in-form" class="form-stack card-body">
-                <label>Склад выдачи<select id="ti-given-warehouse" class="select" required></select></label>
-                <label>Выдаваемый товар<select id="ti-given-product" class="select" required><option value="">— выберите склад —</option></select></label>
-                <label id="ti-given-unit-row" class="hidden">IMEI выдаваемого<select id="ti-given-unit" class="select"><option value="">— выберите IMEI —</option></select></label>
-                <p id="ti-given-price" class="hint hidden"></p>
-                <hr class="form-divider">
-                <h4 class="sub-heading">Принимаемое устройство</h4>
-                <label>Название<input id="ti-received-name" class="input" required placeholder="iPhone 13 Pro"></label>
-                <div class="form-row">
-                  <label>Бренд<input id="ti-received-brand" class="input"></label>
-                  <label>Модель<input id="ti-received-model" class="input"></label>
+        <!-- ACCESSORIES -->
+        <section id="page-accessories" class="page">
+          <div class="segmented acc-view-tabs" id="acc-view-tabs">
+            <button class="seg active" data-acc-view="intake">Приём</button>
+            <button class="seg" data-acc-view="pos">Касса</button>
+            <button class="seg" data-acc-view="report">Фин. отчёт</button>
+          </div>
+
+          <div id="acc-panel-intake">
+            <div class="grid-2">
+              <div class="card">
+                <div class="card-header"><h3>Приход аксессуаров</h3></div>
+                <form id="acc-inbound-form" class="form-stack card-body">
+                  <label>Название<input id="acc-ib-name" class="input" required placeholder="Чехол iPhone 15"></label>
+                  <label>Модель<input id="acc-ib-model" class="input" placeholder="iPhone 15 Pro"></label>
+                  <label>Количество<input type="number" id="acc-ib-qty" class="input" min="1" value="1" required></label>
+                  <label>Поставщик<input id="acc-ib-supplier" class="input" placeholder="Поставщик"></label>
+                  <label>Себестоимость<input type="number" id="acc-ib-purchase" class="input" min="0.01" step="0.01" required></label>
+                  <label>Цена продажи <span class="muted">(необяз.)</span><input type="number" id="acc-ib-sale" class="input" min="0.01" step="0.01" placeholder="Авто +30%"></label>
+                  <button type="submit" class="btn btn-primary">Принять на склад</button>
+                </form>
+              </div>
+              <div class="card">
+                <div class="card-header">
+                  <h3>Остатки</h3>
+                  <input type="search" id="acc-stock-search" class="input sm" placeholder="Поиск…">
                 </div>
-                <div class="form-row">
-                  <label>Цвет<input id="ti-received-color" class="input"></label>
-                  <label>Размер<input id="ti-received-size" class="input"></label>
-                </div>
-                <div class="form-row">
-                  <label>Память<input id="ti-received-memory" class="input" placeholder="128 ГБ"></label>
-                  <label>RAM<input id="ti-received-ram" class="input"></label>
-                </div>
-                <label>Состояние<select id="ti-received-condition" class="select">
-                  <option value="new">Новый</option>
-                  <option value="used" selected>Б/у</option>
-                  <option value="refurbished">Восстановленный</option>
-                </select></label>
-                <div class="form-row">
-                  <label>IMEI принятого<input id="ti-received-imei" class="input" placeholder="15 цифр"></label>
-                  <label>Серийный №<input id="ti-received-serial" class="input"></label>
-                </div>
-                <label>Доп. характеристики<textarea id="ti-received-specs" class="input textarea" rows="2"></textarea></label>
-                <div class="form-row">
-                  <label>Закупка принятого, ₽<input type="number" id="ti-received-purchase" class="input" min="0" value="0"></label>
-                  <label>Цена продажи принятого, ₽<input type="number" id="ti-received-sale" class="input" min="0" value="0"></label>
-                </div>
-                <label>Склад для принятого<select id="ti-received-warehouse" class="select" required></select></label>
-                <hr class="form-divider">
-                <h4 class="sub-heading">Оплата</h4>
-                <div class="form-row">
-                  <label>Зачёт trade-in, ₽<input type="number" id="ti-received-value" class="input" min="0" value="0" required></label>
-                  <label>Наличные доплата, ₽<input type="number" id="ti-cash" class="input" min="0" value="0"></label>
-                </div>
-                <label>Карта доплата, ₽<input type="number" id="ti-card" class="input" min="0" value="0"></label>
-                <p id="ti-pay-summary" class="hint"></p>
-                <label>Комментарий<input id="ti-notes" class="input"></label>
-                <button type="submit" class="btn btn-primary" id="ti-submit" disabled>Провести обмен</button>
-              </form>
+                <div class="table-wrap card-body"><table class="data-table">
+                  <thead><tr><th>Название</th><th>Модель</th><th>Поставщик</th><th>Себест.</th><th>Цена</th><th>Кол-во</th><th></th></tr></thead>
+                  <tbody id="acc-stock-tbody"></tbody>
+                </table></div>
+              </div>
             </div>
-            <div class="card">
-              <div class="card-header">
-                <h3>История обменов</h3>
-                <div class="wh-actions">
-                  <select id="ti-report-period" class="select sm-select">
-                    <option value="day">Сегодня</option>
-                    <option value="week">Неделя</option>
-                    <option value="month" selected>Месяц</option>
-                    <option value="quarter">Квартал</option>
-                    <option value="year">Год</option>
-                    <option value="all">Всё время</option>
-                  </select>
-                  <button id="ti-print-report" class="btn btn-ghost btn-sm">Печать отчёта</button>
+          </div>
+
+          <div id="acc-panel-pos" class="hidden">
+            <div class="pos-layout pos-layout-3">
+              <div class="pos-left card">
+                <div class="toolbar">
+                  <input type="search" id="acc-pos-search" class="input" placeholder="Поиск аксессуара…" autofocus>
+                </div>
+                <div id="acc-pos-products" class="product-grid"></div>
+              </div>
+              <div class="pos-mid card">
+                <div class="card-header"><h3>Касса аксессуаров</h3><button type="button" id="acc-cash-refresh" class="btn btn-ghost btn-sm">Обновить</button></div>
+                <div class="card-body">
+                  <div class="kpi-grid pos-kpi" id="acc-cash-kpi"></div>
+                  <div id="acc-balances" class="pos-balances"></div>
+                  <h4 class="sub-heading">Расход</h4>
+                  <form id="acc-expense-form" class="form-stack">
+                    <label>Категория<input id="acc-exp-category" class="input" required placeholder="Аренда"></label>
+                    <div class="form-row">
+                      <label>Сумма<input type="number" id="acc-exp-amount" class="input" min="0.01" step="0.01" required></label>
+                      <label>Оплата<select id="acc-exp-pay" class="select"></select></label>
+                    </div>
+                    <label>Описание<input id="acc-exp-desc" class="input"></label>
+                    <button type="submit" class="btn btn-primary btn-sm">Добавить расход</button>
+                  </form>
+                  <div class="table-wrap" style="margin-top:0.75rem;max-height:160px;overflow:auto">
+                    <table class="data-table"><thead><tr><th>Дата</th><th>Категория</th><th>Сумма</th></tr></thead>
+                    <tbody id="acc-expenses-tbody"></tbody></table>
+                  </div>
                 </div>
               </div>
-              <div id="ti-report-summary" class="card-body ti-report-kpi"></div>
-              <div class="table-wrap"><table class="data-table">
-                <thead><tr><th>Дата</th><th>Выдано</th><th>Принято</th><th>Зачёт</th><th>Доплата</th><th>Склады</th></tr></thead>
-                <tbody id="ti-history-tbody"></tbody>
-              </table></div>
+              <div class="pos-right card">
+                <div class="card-header"><h3>Чек</h3><span class="cart-badge" id="acc-cart-count">0</span></div>
+                <div id="acc-cart-items" class="cart-items"></div>
+                <div class="cart-empty" id="acc-cart-empty">Выберите товар</div>
+                <div class="cart-totals">
+                  <div class="total-line"><span>Подытог</span><span id="acc-cart-subtotal">0</span></div>
+                  <div class="total-line grand"><span>К оплате</span><span id="acc-cart-total">0</span></div>
+                </div>
+                <div id="acc-split-payments" class="split-payments"></div>
+                <div class="split-pay-summary">
+                  <span>Оплачено: <strong id="acc-split-paid">0</strong></span>
+                  <span id="acc-split-remain-wrap" class="hidden">Осталось: <strong id="acc-split-remain">0</strong></span>
+                </div>
+                <button type="button" id="acc-fill-cash" class="btn btn-ghost btn-sm btn-block">Вся сумма наличными</button>
+                <button id="acc-checkout-btn" class="btn btn-success btn-block" disabled>Провести оплату</button>
+                <button id="acc-clear-cart" class="btn btn-ghost btn-block">Очистить</button>
+              </div>
             </div>
+          </div>
+
+          <div id="acc-panel-report" class="hidden">
+            <div class="toolbar">
+              <select id="acc-report-period" class="select">
+                <option value="day">Сегодня</option>
+                <option value="week">Неделя</option>
+                <option value="month" selected>Месяц</option>
+                <option value="quarter">Квартал</option>
+                <option value="year">Год</option>
+                <option value="all">Всё время</option>
+              </select>
+              <button type="button" id="acc-report-refresh" class="btn btn-secondary">Обновить</button>
+            </div>
+            <div id="acc-report-content"></div>
           </div>
         </section>
 
-        <!-- SHIFTS -->
-        <section id="page-shifts" class="page">
-          <div class="grid-2">
-            <div class="card" id="shift-open-card">
-              <div class="card-header"><h3>Текущая смена</h3></div>
-              <div class="card-body" id="shift-current"></div>
-            </div>
-            <div class="card" id="shift-close-card">
-              <div class="card-header"><h3>Закрытие смены</h3></div>
-              <form id="shift-close-form" class="form-stack card-body">
-                <div id="shift-summary"></div>
-                <div id="shift-actual-payments"></div>
-                <label id="shift-actual-cash-label"><span id="shift-actual-cash-text">Наличные в кассе (с разменом)</span><input type="number" id="shift-actual-cash" class="input" min="0" step="0.01" required></label>
-                <label>Комментарий<input id="shift-close-notes" class="input"></label>
-                <button type="submit" class="btn btn-primary" id="shift-close-btn" disabled>Закрыть смену</button>
-              </form>
-            </div>
+        <!-- DEBTORS -->
+        <section id="page-debtors" class="page">
+          <div class="toolbar">
+            <select id="debtors-filter" class="select">
+              <option value="">Все</option>
+              <option value="open" selected>Открытые</option>
+              <option value="closed">Закрытые</option>
+            </select>
+            <button type="button" id="debtors-refresh" class="btn btn-ghost btn-sm">Обновить</button>
           </div>
-          <div class="card" style="margin-top:1rem">
-            <div class="card-header"><h3>История смен</h3></div>
+          <div class="card">
             <div class="table-wrap"><table class="data-table">
-              <thead><tr><th>№</th><th>Кассир</th><th>Открыта</th><th>Закрыта</th><th>Продаж</th><th>Выручка</th><th>Разница нал.</th></tr></thead>
-              <tbody id="shifts-history-tbody"></tbody>
+              <thead><tr><th>Клиент</th><th>Телефон</th><th>Товар</th><th>Склад</th><th>Сумма</th><th>Оплачено</th><th>Долг</th><th>Дата</th><th></th></tr></thead>
+              <tbody id="debtors-tbody"></tbody>
             </table></div>
           </div>
         </section>
@@ -502,19 +534,6 @@
           </div>
         </section>
 
-        <!-- RESERVATIONS -->
-        <section id="page-reservations" class="page">
-          <div class="card">
-            <div class="card-header"><h3>Активные резервы</h3></div>
-            <div class="table-wrap card-body"><table class="data-table">
-              <thead><tr><th>Клиент</th><th>Телефон</th><th>Товар</th><th>Устройство</th><th>Склад</th><th>До</th><th>Кто</th><th></th></tr></thead>
-              <tbody id="reservations-tbody"></tbody>
-            </table></div>
-            <p class="hint card-body">Резерв создаётся из списка IMEI — кнопка «Резерв» у устройства на складе.</p>
-          </div>
-        </section>
-
-
         <!-- SETTINGS -->
         <section id="page-settings" class="page">
           <div class="grid-2">
@@ -556,7 +575,7 @@
                 <tbody id="paymethods-tbody"></tbody>
               </table></div>
             </div>
-            <div class="card">
+            <div class="card hidden" id="settings-expense-card">
               <div class="card-header"><h3>Расходы (для ОПиУ / ДДС)</h3></div>
               <form id="expense-form" class="form-stack card-body">
                 <label>Категория<input id="exp-category" class="input" required placeholder="Аренда"></label>
@@ -570,6 +589,16 @@
                 <thead><tr><th>Дата</th><th>Категория</th><th>Сумма</th><th></th></tr></thead>
                 <tbody id="expenses-tbody"></tbody>
               </table></div>
+            </div>
+          </div>
+          <div class="card" style="margin-top:1rem" id="expense-allocation-card">
+            <div class="card-header"><h3>Распределение расходов по складам</h3></div>
+            <div class="card-body">
+              <p class="hint">Укажите % для каждого склада (сумма = 100). Расходы в отчётах распределятся пропорционально.</p>
+              <form id="expense-allocation-form" class="form-stack">
+                <div id="expense-allocation-rows"></div>
+                <button type="submit" class="btn btn-primary">Сохранить распределение</button>
+              </form>
             </div>
           </div>
           <div class="card catalog-wipe-card hidden" id="catalog-wipe-card">
@@ -681,6 +710,7 @@
             <input type="date" id="report-from" class="input" title="С даты">
             <input type="date" id="report-to" class="input" title="По дату">
             <button id="load-report" class="btn btn-secondary">Сформировать</button>
+            <button id="report-detail-btn" class="btn btn-primary">Детализация</button>
             <button id="print-report" class="btn btn-ghost">Печать</button>
           </div>
           <div id="report-content"></div>
@@ -841,29 +871,36 @@
         <button type="button" class="seg" data-inbound-mode="existing">Существующий</button>
       </div>
       <div id="inbound-panel-new" class="inbound-panel">
-        <div class="form-row">
-          <label>Тип<select id="ib-ownership" class="select"><option value="own">Собственный</option><option value="consignment">Реализация</option></select></label>
-          <label>Категория<select id="ib-category" class="select"><option value="phone">Телефон</option><option value="accessory">Аксессуар</option></select></label>
+        <input type="hidden" id="ib-receipt-kind" value="new">
+        <div id="ib-new-fields">
+          <label>Дата прихода<input type="date" id="ib-arrival" class="input"></label>
+          <label>Модель<input id="ib-name" class="input" required placeholder="iPhone 15 Pro"></label>
+          <div class="form-row">
+            <label>Цвет<input id="ib-color" class="input"></label>
+            <label>Память<input id="ib-memory" class="input" placeholder="256 ГБ"></label>
+          </div>
+          <div class="form-row">
+            <label>Регион<input id="ib-region" class="input" placeholder="EU / US"></label>
+            <label id="ib-supplier-row">Поставщик<input id="ib-supplier" class="input"></label>
+          </div>
+          <div class="form-row">
+            <label>Тип<select id="ib-ownership" class="select"><option value="own">Собственный</option><option value="consignment">Реализация</option></select></label>
+            <label>Себестоимость<input type="number" id="ib-purchase" class="input" min="0" step="0.01" required></label>
+          </div>
         </div>
-        <label id="ib-supplier-row" class="hidden">Поставщик<input id="ib-supplier" class="input"></label>
-        <label>Название<input id="ib-name" class="input" required placeholder="iPhone 15 Pro 256GB Black"></label>
-        <div class="form-row">
-          <label>Цвет<input id="ib-color" class="input"></label>
-          <label>Память<input id="ib-memory" class="input" placeholder="256 ГБ"></label>
+        <div id="ib-used-fields" class="hidden">
+          <label>Модель<input id="ib-name-used" class="input" placeholder="iPhone 13 Pro"></label>
+          <div class="form-row">
+            <label>Цвет<input id="ib-color-used" class="input"></label>
+            <label>Память<input id="ib-memory-used" class="input"></label>
+          </div>
+          <div class="form-row">
+            <label>Себестоимость<input type="number" id="ib-purchase-used" class="input" min="0" step="0.01" required></label>
+            <label>Клиент<input id="ib-client" class="input" placeholder="От кого приняли"></label>
+          </div>
         </div>
-        <div class="form-row">
-          <label>Состояние<select id="ib-condition" class="select">
-            <option value="new">Новый</option>
-            <option value="used">Б/у</option>
-            <option value="refurbished">Восстановленный</option>
-          </select></label>
-          <span></span>
-        </div>
-        <div class="form-row">
-          <label>Закупочная цена<input type="number" id="ib-purchase" class="input" min="0" step="0.01" required></label>
-          <label>Цена продажи<input type="number" id="ib-sale" class="input" min="0" step="0.01" required></label>
-        </div>
-        <label id="ib-qty-row">Количество<input type="number" id="ib-qty" class="input" min="1" value="1"></label>
+        <input type="hidden" id="ib-category" value="phone">
+        <input type="hidden" id="ib-condition-used" value="used">
       </div>
       <div id="inbound-panel-existing" class="inbound-panel hidden">
         <label>Товар<select id="ib-existing-product" class="select"></select></label>
@@ -916,6 +953,63 @@
     <div class="modal-actions">
       <button class="btn btn-primary" id="transfer-doc-close">Закрыть</button>
       <button class="btn btn-secondary" id="transfer-doc-print">Печать накладной</button>
+    </div>
+  </dialog>
+
+  <dialog id="wh-sell-modal" class="modal">
+    <form id="wh-sell-form" novalidate>
+      <h3>Продажа со склада</h3>
+      <div id="wh-sell-meta" class="inbound-product-meta"></div>
+      <label>Цена продажи<input type="number" id="wh-sell-price" class="input" min="0.01" step="0.01" required></label>
+      <label>Оплачено клиентом<input type="number" id="wh-sell-paid" class="input" min="0" step="0.01"></label>
+      <label>Способ оплаты<select id="wh-sell-pay" class="select"></select></label>
+      <div id="wh-sell-debtor-fields" class="hidden">
+        <label>Имя должника<input id="wh-sell-debtor-name" class="input" required></label>
+        <label>Телефон<input id="wh-sell-debtor-phone" class="input" placeholder="+992…"></label>
+      </div>
+      <p id="wh-sell-profit" class="hint"></p>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-ghost" id="wh-sell-cancel">Отмена</button>
+        <button type="submit" class="btn btn-primary">Оформить продажу</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="debtor-modal" class="modal">
+    <form id="debtor-form" novalidate>
+      <h3>Долг клиента</h3>
+      <p id="debtor-modal-hint" class="hint"></p>
+      <label>Имя клиента<input id="debtor-name" class="input" required></label>
+      <label>Телефон<input id="debtor-phone" class="input" placeholder="+992…"></label>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-ghost" id="debtor-cancel">Отмена</button>
+        <button type="submit" class="btn btn-primary">Оформить в долг</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="debtor-pay-modal" class="modal">
+    <form id="debtor-pay-form" novalidate>
+      <h3>Приём оплаты по долгу</h3>
+      <div id="debtor-pay-meta" class="inbound-product-meta"></div>
+      <label>Сумма<input type="number" id="debtor-pay-amount" class="input" min="0.01" step="0.01" required></label>
+      <label>Способ оплаты<select id="debtor-pay-method" class="select"></select></label>
+      <label>Комментарий<input id="debtor-pay-notes" class="input"></label>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-ghost" id="debtor-pay-cancel">Отмена</button>
+        <button type="submit" class="btn btn-primary">Принять оплату</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="report-detail-modal" class="modal modal-lg">
+    <h3 id="report-detail-title">Детализация</h3>
+    <div class="toolbar" style="margin-bottom:0.75rem">
+      <select id="report-detail-wh" class="select"><option value="">Все склады</option></select>
+    </div>
+    <div id="report-detail-content"></div>
+    <div class="modal-actions">
+      <button type="button" class="btn btn-ghost" id="report-detail-close">Закрыть</button>
     </div>
   </dialog>
 
@@ -1002,6 +1096,6 @@
   </dialog>
 
   <div id="toast" class="toast"></div>
-  <script src="/static/app.js?v=19"></script>
+  <script src="/static/app.js?v=23"></script>
 </body>
 </html>
