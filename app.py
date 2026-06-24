@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import FastAPI, File, Header, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -612,49 +612,7 @@ def init_db() -> None:
             """
         )
 
-        count = conn.execute("SELECT COUNT(*) FROM products").fetchone()[0]
-        if count == 0:
-            now = utc_now()
-            default_wh_id = get_default_warehouse_id(conn)
-            samples = [
-                ("iPhone 15 128GB", "phone", "own", "", "Apple", "IP15-128", "4601234567890", 62000, 74990, 5, 2,
-                 "iPhone 15", "Чёрный", "", "128GB", "6GB", 1, 0, "", "new"),
-                ("Samsung Galaxy A55", "phone", "own", "", "Samsung", "A55-128", "4601234567891", 22000, 27990, 8, 2,
-                 "Galaxy A55", "Синий", "", "128GB", "8GB", 1, 0, "", "new"),
-                ("Xiaomi Redmi Note 13", "phone", "consignment", "ООО ТехноСнаб", "Xiaomi", "RN13-256", "4601234567892",
-                 14000, 18990, 10, 3, "Redmi Note 13", "Чёрный", "", "256GB", "8GB", 0, 0, "", "new"),
-                ("iPhone 14 Pro (комиссия)", "phone", "consignment", "ИП Петров", "Apple", "IP14P-256", "4601234567893",
-                 55000, 69990, 3, 1, "iPhone 14 Pro", "Фиолетовый", "", "256GB", "6GB", 1, 0, "", "new"),
-                ("Чехол силиконовый", "accessory", "own", "", "Generic", "CASE-SIL", "4601234567894", 150, 590, 50, 10,
-                 "", "", "", "", "", 0, 0, "", "new"),
-                ("Защитное стекло", "accessory", "own", "", "Generic", "GLASS-67", "4601234567895", 80, 390, 80, 15,
-                 "", "", "6.7\"", "", "", 0, 0, "", "new"),
-                ("Наушники JBL (реализация)", "accessory", "consignment", "ООО ТехноСнаб", "JBL", "JBL-TUNE", "4601234567896",
-                 1800, 3490, 12, 3, "Tune 520BT", "Чёрный", "", "", "", 0, 0, "", "new"),
-                ("Powerbank 10000 mAh", "accessory", "own", "", "Xiaomi", "PB-10K", "4601234567897", 900, 1990, 15, 5,
-                 "Mi Power Bank 3", "Белый", "", "10000 mAh", "", 0, 0, "", "new"),
-            ]
-            for row in samples:
-                cur = conn.execute(
-                    """
-                    INSERT INTO products
-                    (name, category, ownership_type, supplier_name, brand, sku, barcode,
-                     purchase_price, sale_price, stock, min_stock, created_at,
-                     model, color, size, memory, ram, customs_cleared, customs_price, specs_extra, condition)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (*row[:12], *row[12:], now),
-                )
-                pid = cur.lastrowid
-                qty = row[9]
-                if qty > 0:
-                    conn.execute(
-                        """
-                        INSERT INTO warehouse_stock (warehouse_id, product_id, quantity)
-                        VALUES (?, ?, ?)
-                        """,
-                        (default_wh_id, pid, qty),
-                    )
+        # Каталог пустой — товары добавляются через склад или импорт Excel
 
 
 def _seed_finance_defaults(conn: sqlite3.Connection) -> None:
@@ -742,6 +700,337 @@ def set_setting(conn: sqlite3.Connection, key: str, value: str) -> None:
         "INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         (key, value),
     )
+
+
+IMPORT_PRODUCT_HEADERS = [
+    "название", "категория", "тип", "поставщик", "бренд", "модель", "цвет", "память",
+    "ram", "состояние", "закупка", "цена", "количество", "мин_остаток", "артикул",
+    "штрихкод", "imei", "серийник", "батарея_%", "комментарий",
+]
+
+IMPORT_HEADER_ALIASES: dict[str, tuple[str, ...]] = {
+    "название": ("название", "name", "product_name", "товар"),
+    "категория": ("категория", "category"),
+    "тип": ("тип", "ownership_type", "ownership"),
+    "поставщик": ("поставщик", "supplier_name", "supplier"),
+    "бренд": ("бренд", "brand"),
+    "модель": ("модель", "model"),
+    "цвет": ("цвет", "color"),
+    "память": ("память", "memory"),
+    "ram": ("ram",),
+    "состояние": ("состояние", "condition"),
+    "закупка": ("закупка", "purchase_price", "закупочная"),
+    "цена": ("цена", "sale_price", "продажа"),
+    "количество": ("количество", "quantity", "qty", "кол-во"),
+    "мин_остаток": ("мин_остаток", "min_stock"),
+    "артикул": ("артикул", "sku"),
+    "штрихкод": ("штрихкод", "barcode"),
+    "imei": ("imei", "imei1"),
+    "серийник": ("серийник", "serial", "serial_number"),
+    "батарея_%": ("батарея_%", "battery_capacity", "батарея", "battery"),
+    "комментарий": ("комментарий", "notes", "примечание"),
+}
+
+
+def _norm_category(raw: str) -> str:
+    v = raw.strip().lower()
+    if v in ("phone", "телефон", "телефоны", "phone"):
+        return "phone"
+    return "accessory"
+
+
+def _norm_ownership(raw: str) -> str:
+    v = raw.strip().lower()
+    if v in ("consignment", "реализация", "комиссия"):
+        return "consignment"
+    return "own"
+
+
+def _norm_condition(raw: str) -> str:
+    v = raw.strip().lower()
+    if v in ("used", "б/у", "бу", "б у"):
+        return "used"
+    if v in ("refurbished", "восстановленный", "ref"):
+        return "refurbished"
+    return "new"
+
+
+def _import_row_cell(row: dict[str, Any], fields: dict[str, str], canonical: str) -> str:
+    for alias in IMPORT_HEADER_ALIASES.get(canonical, (canonical,)):
+        key = fields.get(alias.lower())
+        if key and row.get(key) not in (None, ""):
+            return str(row[key]).strip()
+    return ""
+
+
+def _parse_import_file(raw: bytes, filename: str) -> list[dict[str, Any]]:
+    name = (filename or "").lower()
+    if name.endswith(".xlsx"):
+        from openpyxl import load_workbook
+
+        wb = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+        ws = wb["Товары"] if "Товары" in wb.sheetnames else wb.active
+        rows_iter = ws.iter_rows(values_only=True)
+        header_row = next(rows_iter, None)
+        if not header_row:
+            raise HTTPException(status_code=400, detail="Пустой файл Excel")
+        headers = [str(h or "").strip() for h in header_row]
+        fields = {h.lower(): h for h in headers if h}
+        out: list[dict[str, Any]] = []
+        for cells in rows_iter:
+            if not any(c is not None and str(c).strip() for c in cells):
+                continue
+            row_dict: dict[str, Any] = {}
+            for i, h in enumerate(headers):
+                if h and i < len(cells) and cells[i] is not None:
+                    row_dict[h] = cells[i]
+            out.append(row_dict)
+        wb.close()
+        return out
+
+    text = raw.decode("utf-8-sig", errors="replace")
+    reader = csv.DictReader(io.StringIO(text))
+    if not reader.fieldnames:
+        raise HTTPException(status_code=400, detail="Файл без заголовков")
+    return [dict(r) for r in reader]
+
+
+def build_products_import_xlsx() -> bytes:
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Товары"
+    header_fill = PatternFill("solid", fgColor="E8E4FF")
+    for col, title in enumerate(IMPORT_PRODUCT_HEADERS, start=1):
+        cell = ws.cell(row=1, column=col, value=title)
+        cell.font = Font(bold=True)
+        cell.fill = header_fill
+    examples = [
+        [
+            "iPhone 15 Pro 256 Black", "телефон", "собственный", "", "Apple", "iPhone 15 Pro",
+            "Чёрный", "256GB", "8GB", "новый", 85000, 99990, 1, 2, "IP15P-256-BLK", "",
+            "123456789012345", "IP15P-BLK-001", "", "пример — удалите строку",
+        ],
+        [
+            "Чехол силикон iPhone 15", "аксессуар", "собственный", "", "Generic", "",
+            "Чёрный", "", "", "новый", 150, 590, 20, 5, "CASE-IP15", "4600000000001",
+            "", "", "", "",
+        ],
+    ]
+    for r, ex in enumerate(examples, start=2):
+        for c, val in enumerate(ex, start=1):
+            ws.cell(row=r, column=c, value=val)
+    for col in range(1, len(IMPORT_PRODUCT_HEADERS) + 1):
+        from openpyxl.utils import get_column_letter
+        ws.column_dimensions[get_column_letter(col)].width = 14
+
+    help_ws = wb.create_sheet("Инструкция")
+    lines = [
+        "Как заполнять шаблон TeleStore",
+        "",
+        "• Одна строка = одна позиция на складе.",
+        "• Телефон: укажите IMEI или серийник (количество всегда 1).",
+        "• Аксессуар: IMEI не нужен — укажите количество.",
+        "• Б/у телефон: состояние «б/у» + обязательно батарея_% (например 87).",
+        "• тип: собственный или реализация (для реализации — поставщик).",
+        "• категория: телефон или аксессуар.",
+        "• Если товар с таким артикулом уже есть — добавится остаток / новое устройство.",
+        "",
+        "После загрузки: Склады → остатки, отчёты и касса обновятся автоматически.",
+    ]
+    for i, line in enumerate(lines, start=1):
+        help_ws.cell(row=i, column=1, value=line)
+    help_ws.column_dimensions["A"].width = 72
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def wipe_catalog_data(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        DELETE FROM sale_item_units;
+        DELETE FROM sale_payments;
+        DELETE FROM sale_items;
+        DELETE FROM sales;
+        DELETE FROM unit_reservations;
+        DELETE FROM product_units;
+        DELETE FROM stocktake_lines;
+        DELETE FROM stocktake_sessions;
+        DELETE FROM stock_movements;
+        DELETE FROM warehouse_stock;
+        DELETE FROM trade_ins;
+        DELETE FROM supplier_payments;
+        DELETE FROM products;
+        DELETE FROM shifts;
+        """
+    )
+
+
+def _find_product_for_import(
+    conn: sqlite3.Connection, sku: str, name: str, model: str, color: str, memory: str
+) -> sqlite3.Row | None:
+    if sku:
+        row = conn.execute("SELECT * FROM products WHERE sku = ? LIMIT 1", (sku,)).fetchone()
+        if row:
+            return row
+    if name:
+        row = conn.execute(
+            """
+            SELECT * FROM products
+            WHERE name = ? AND COALESCE(model,'') = ? AND COALESCE(color,'') = ? AND COALESCE(memory,'') = ?
+            LIMIT 1
+            """,
+            (name, model, color, memory),
+        ).fetchone()
+        if row:
+            return row
+    return None
+
+
+def _import_products_rows(
+    conn: sqlite3.Connection, rows: list[dict[str, Any]], default_wh_id: int
+) -> dict[str, Any]:
+    if not rows:
+        raise HTTPException(status_code=400, detail="Нет строк для импорта")
+    first = rows[0]
+    fields = {str(k).strip().lower(): k for k in first.keys()}
+    created_products = 0
+    updated_stock = 0
+    created_units = 0
+    errors: list[str] = []
+
+    for i, row in enumerate(rows, start=2):
+        name = _import_row_cell(row, fields, "название")
+        if not name:
+            continue
+        category = _norm_category(_import_row_cell(row, fields, "категория") or "аксессуар")
+        ownership = _norm_ownership(_import_row_cell(row, fields, "тип") or "own")
+        supplier = _import_row_cell(row, fields, "поставщик")
+        brand = _import_row_cell(row, fields, "бренд")
+        model = _import_row_cell(row, fields, "модель")
+        color = _import_row_cell(row, fields, "цвет")
+        memory = _import_row_cell(row, fields, "память")
+        ram = _import_row_cell(row, fields, "ram")
+        condition = _norm_condition(_import_row_cell(row, fields, "состояние") or "new")
+        purchase_raw = _import_row_cell(row, fields, "закупка")
+        sale_raw = _import_row_cell(row, fields, "цена")
+        qty_raw = _import_row_cell(row, fields, "количество") or "1"
+        min_stock_raw = _import_row_cell(row, fields, "мин_остаток") or "2"
+        sku = _import_row_cell(row, fields, "артикул")
+        barcode = _import_row_cell(row, fields, "штрихкод")
+        imei = _import_row_cell(row, fields, "imei")
+        serial = _import_row_cell(row, fields, "серийник")
+        notes = _import_row_cell(row, fields, "комментарий")
+        battery_raw = _import_row_cell(row, fields, "батарея_%")
+
+        try:
+            purchase = float(purchase_raw.replace(",", ".") if purchase_raw else 0)
+            sale = float(sale_raw.replace(",", ".") if sale_raw else 0)
+            qty = max(1, int(float(qty_raw.replace(",", "."))))
+            min_stock = max(0, int(float(min_stock_raw.replace(",", "."))))
+        except ValueError:
+            errors.append(f"Строка {i}: неверные числа")
+            continue
+
+        battery: int | None = None
+        if battery_raw:
+            try:
+                battery = int(float(battery_raw.replace(",", ".")))
+            except ValueError:
+                errors.append(f"Строка {i}: неверная ёмкость батареи")
+                continue
+
+        if condition in ("used", "refurbished") and category == "phone" and battery is None:
+            errors.append(f"Строка {i}: для Б/у укажите батарея_%")
+            continue
+
+        if ownership == "consignment" and not supplier:
+            errors.append(f"Строка {i}: укажите поставщика для реализации")
+            continue
+
+        track = category == "phone"
+        if track and not imei and not serial:
+            errors.append(f"Строка {i}: для телефона нужен IMEI или серийник")
+            continue
+        if track:
+            qty = 1
+
+        existing = _find_product_for_import(conn, sku, name, model, color, memory)
+        if existing:
+            product_id = int(existing["id"])
+            if purchase > 0 or sale > 0:
+                conn.execute(
+                    "UPDATE products SET purchase_price = ?, sale_price = ? WHERE id = ?",
+                    (
+                        purchase if purchase > 0 else existing["purchase_price"],
+                        sale if sale > 0 else existing["sale_price"],
+                        product_id,
+                    ),
+                )
+            product = conn.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
+        else:
+            if sale <= 0:
+                errors.append(f"Строка {i}: укажите цену продажи")
+                continue
+            track_val = 1 if track else 0
+            cur = conn.execute(
+                """
+                INSERT INTO products
+                (name, category, ownership_type, supplier_name, brand, sku, barcode,
+                 purchase_price, sale_price, stock, min_stock, created_at,
+                 model, color, size, memory, ram, customs_cleared, customs_price, specs_extra, condition, track_units, image_url)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?,
+                        ?, ?, '', ?, ?, 0, 0, '', ?, ?, '')
+                """,
+                (
+                    name, category, ownership, supplier, brand, sku, barcode,
+                    purchase, sale, min_stock, utc_now(),
+                    model, color, memory, ram, condition, track_val,
+                ),
+            )
+            product_id = int(cur.lastrowid)
+            product = conn.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
+            created_products += 1
+
+        if track:
+            if imei:
+                dup = conn.execute(
+                    "SELECT id FROM product_units WHERE imei = ? AND status != 'sold'", (imei,)
+                ).fetchone()
+                if dup:
+                    errors.append(f"Строка {i}: IMEI {imei} уже есть")
+                    continue
+            conn.execute(
+                """
+                INSERT INTO product_units
+                (product_id, warehouse_id, imei, serial, status, notes, created_at,
+                 customs_status, customs_cleared, battery_capacity)
+                VALUES (?, ?, ?, ?, 'in_stock', ?, ?, 'none', 0, ?)
+                """,
+                (product_id, default_wh_id, imei, serial, notes or "Импорт Excel", utc_now(), battery),
+            )
+            adjust_warehouse_stock(conn, default_wh_id, product_id, 1, "inbound", notes=f"Импорт: {imei or serial}")
+            conn.execute("UPDATE products SET track_units = 1 WHERE id = ?", (product_id,))
+            created_units += 1
+            updated_stock += 1
+        else:
+            adjust_warehouse_stock(
+                conn, default_wh_id, product_id, qty, "inbound",
+                notes=notes or "Импорт Excel",
+            )
+            updated_stock += qty
+
+    return {
+        "created_products": created_products,
+        "created_units": created_units,
+        "stock_added": updated_stock,
+        "errors": errors,
+        "total_rows": len(rows),
+    }
 
 
 def get_currency_config(conn: sqlite3.Connection) -> dict[str, str]:
@@ -2743,6 +3032,42 @@ async def stock_total(x_pin: str | None = Header(default=None, alias="X-Pin")):
             if product:
                 enriched.append(enrich_product(conn, product))
     return enriched
+
+
+@app.get("/api/import/products/template")
+async def import_products_template(x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin, min_role="warehouse")
+    data = build_products_import_xlsx()
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="telestore_import.xlsx"'},
+    )
+
+
+@app.post("/api/import/products")
+async def import_products_file(
+    file: UploadFile = File(...),
+    warehouse_id: int | None = Query(default=None),
+    x_pin: str | None = Header(default=None, alias="X-Pin"),
+):
+    check_pin(x_pin, min_role="warehouse")
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Пустой файл")
+    rows = _parse_import_file(raw, file.filename or "import.csv")
+    with db() as conn:
+        wh_id = resolve_warehouse_id(conn, warehouse_id)
+        result = _import_products_rows(conn, rows, wh_id)
+    return result
+
+
+@app.post("/api/store/wipe-catalog")
+async def wipe_catalog(x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin, min_role="owner")
+    with db() as conn:
+        wipe_catalog_data(conn)
+    return {"ok": True, "message": "Демо-данные удалены. Можно загружать свои товары."}
 
 
 @app.post("/api/stock/inbound")

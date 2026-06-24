@@ -1278,14 +1278,125 @@ function bindWarehouses() {
   document.getElementById("wh-refresh-movements").onclick = loadWarehouseMovements;
   document.getElementById("transfer-doc-close").onclick = () => document.getElementById("transfer-doc-modal").close();
   document.getElementById("transfer-doc-print").onclick = () => printTransferDocument();
+  document.getElementById("wh-download-template")?.addEventListener("click", downloadImportTemplate);
+  document.getElementById("wh-import-file")?.addEventListener("change", onImportFileSelected);
+  document.getElementById("wh-import-form")?.addEventListener("submit", submitProductsImport);
 }
 
 async function loadWarehousesPage() {
   if (!warehouses.length) await loadWarehouses();
   renderWarehouseList();
   if (!selectedWarehouseId) selectedWarehouseId = defaultWarehouseId();
+  populateImportWarehouseSelect();
   await loadWarehouseStock();
   await loadWarehouseMovements();
+}
+
+function populateImportWarehouseSelect() {
+  const sel = document.getElementById("wh-import-warehouse");
+  if (!sel) return;
+  sel.innerHTML = warehouses.map((w) =>
+    `<option value="${w.id}"${w.id === selectedWarehouseId ? " selected" : ""}>${esc(w.name)}</option>`
+  ).join("");
+}
+
+let importSelectedFile = null;
+
+function onImportFileSelected(e) {
+  importSelectedFile = e.target.files?.[0] || null;
+  const nameEl = document.getElementById("wh-import-filename");
+  const submitBtn = document.getElementById("wh-import-submit");
+  if (nameEl) nameEl.textContent = importSelectedFile ? importSelectedFile.name : "Файл не выбран";
+  if (submitBtn) submitBtn.disabled = !importSelectedFile;
+}
+
+async function downloadImportTemplate() {
+  try {
+    const headers = {};
+    if (pin) headers["X-Pin"] = pin;
+    const res = await fetch("/api/import/products/template", { headers });
+    if (res.status === 401) {
+      pin = "";
+      localStorage.removeItem(PIN_KEY);
+      showLogin();
+      throw new Error("Неверный PIN — войдите снова");
+    }
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(typeof err.detail === "string" ? err.detail : "Не удалось скачать шаблон");
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "telestore_import.xlsx";
+    a.click();
+    URL.revokeObjectURL(url);
+    toast("Шаблон скачан");
+  } catch (err) {
+    toast(err.message, "error");
+  }
+}
+
+async function submitProductsImport(e) {
+  e.preventDefault();
+  if (!importSelectedFile) {
+    toast("Выберите файл Excel или CSV", "error");
+    return;
+  }
+  const whId = document.getElementById("wh-import-warehouse")?.value;
+  const resultEl = document.getElementById("wh-import-result");
+  const submitBtn = document.getElementById("wh-import-submit");
+  if (submitBtn) submitBtn.disabled = true;
+  try {
+    const headers = {};
+    if (pin) headers["X-Pin"] = pin;
+    const fd = new FormData();
+    fd.append("file", importSelectedFile);
+    const qs = whId ? `?warehouse_id=${encodeURIComponent(whId)}` : "";
+    const res = await fetch(`/api/import/products${qs}`, { method: "POST", headers, body: fd });
+    if (res.status === 401) {
+      pin = "";
+      localStorage.removeItem(PIN_KEY);
+      showLogin();
+      throw new Error("Неверный PIN — войдите снова");
+    }
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(typeof data.detail === "string" ? data.detail : "Ошибка импорта");
+    }
+    const errLines = (data.errors || []).slice(0, 8);
+    const more = (data.errors || []).length > 8 ? `<br>…и ещё ${data.errors.length - 8}` : "";
+    if (resultEl) {
+      resultEl.classList.remove("hidden", "has-errors");
+      resultEl.innerHTML = `
+        <strong>Импорт завершён</strong><br>
+        Новых товаров: ${data.created_products || 0} · Устройств: ${data.created_units || 0} · Добавлено на склад: ${data.stock_added || 0}
+        ${errLines.length ? `<br><span style="color:var(--danger)">Предупреждения:<br>${errLines.map(esc).join("<br>")}${more}</span>` : ""}`;
+      if (!errLines.length) resultEl.classList.remove("has-errors");
+      else resultEl.classList.add("has-errors");
+    }
+    toast(`Импорт: +${data.created_products || 0} товаров, +${data.stock_added || 0} на склад`);
+    importSelectedFile = null;
+    const fileInput = document.getElementById("wh-import-file");
+    if (fileInput) fileInput.value = "";
+    onImportFileSelected({ target: { files: [] } });
+    await loadWarehouses();
+    products = [];
+    if (currentPage === "warehouses") {
+      renderWarehouseList();
+      await loadWarehouseStock();
+    }
+  } catch (err) {
+    toast(err.message, "error");
+    if (resultEl) {
+      resultEl.classList.remove("hidden");
+      resultEl.classList.add("has-errors");
+      resultEl.textContent = err.message;
+    }
+  } finally {
+    if (submitBtn) submitBtn.disabled = !importSelectedFile;
+  }
 }
 
 function renderWarehouseList() {
@@ -2780,10 +2891,27 @@ function bindSettings() {
       loadSettingsPage();
     } catch (err) { toast(err.message, "error"); }
   });
+  document.getElementById("btn-wipe-catalog")?.addEventListener("click", wipeCatalogData);
+}
+
+async function wipeCatalogData() {
+  if (!confirm("Удалить все товары, продажи и остатки? Склады и настройки сохранятся.")) return;
+  try {
+    await api("/api/store/wipe-catalog", { method: "POST" });
+    toast("Каталог очищен — можно загружать свои товары");
+    products = [];
+    warehouses = [];
+    await loadWarehouses();
+    if (currentPage === "warehouses") loadWarehousesPage();
+    if (currentPage === "dashboard") loadDashboard();
+  } catch (err) {
+    toast(err.message, "error");
+  }
 }
 
 async function loadSettingsPage() {
   const data = await api("/api/settings");
+  document.getElementById("catalog-wipe-card")?.classList.toggle("hidden", currentUser?.role !== "owner");
   storeConfig.currency = data.currency;
   storeConfig.payment_methods = data.payment_methods.filter((m) => m.is_active);
   document.getElementById("set-currency-code").value = data.currency.code || "";
