@@ -320,8 +320,10 @@ def migrate_db(conn: sqlite3.Connection) -> None:
             """
         )
         _merge_duplicate_bu_warehouses(conn)
+        _merge_duplicate_accessories_warehouses(conn)
         _set_warehouse_currencies(conn)
         _fix_z_register_warehouse_split(conn)
+        _fix_misclassified_accessories(conn)
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS unit_reservations (
@@ -388,16 +390,8 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     _add_column(conn, "sales", "amount_due", "REAL NOT NULL DEFAULT 0")
     _add_column(conn, "sales", "currency_code", "TEXT NOT NULL DEFAULT 'TJS'")
     _add_column(conn, "expenses", "department", "TEXT NOT NULL DEFAULT 'main'")
-    if _table_exists(conn, "warehouses") and not conn.execute(
-        "SELECT 1 FROM warehouses WHERE LOWER(name) LIKE '%аксесс%'"
-    ).fetchone():
-        conn.execute(
-            """
-            INSERT INTO warehouses (name, address, notes, is_default, warehouse_type, created_at)
-            VALUES ('Аксессуары', '', 'Склад аксессуаров', 0, 'new', ?)
-            """,
-            (utc_now(),),
-        )
+    if _table_exists(conn, "warehouses"):
+        _merge_duplicate_accessories_warehouses(conn)
 
     conn.executescript(
         """
@@ -1427,6 +1421,85 @@ def _bu_warehouse_clause(alias: str = "") -> str:
     )
 
 
+def _accessories_warehouse_clause(col: str = "name") -> str:
+    return (
+        f"(LOWER({col}) LIKE '%аксесс%' OR LOWER({col}) LIKE '%accessory%' "
+        f"OR LOWER({col}) LIKE '%accessories%')"
+    )
+
+
+def _merge_duplicate_accessories_warehouses(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
+        f"SELECT id FROM warehouses WHERE {_accessories_warehouse_clause()} ORDER BY id"
+    ).fetchall()
+    if not rows:
+        conn.execute(
+            """
+            INSERT INTO warehouses (name, address, notes, is_default, warehouse_type, created_at)
+            VALUES ('Аксессуары', '', 'Склад аксессуаров', 0, 'accessories', ?)
+            """,
+            (utc_now(),),
+        )
+        rows = conn.execute(
+            f"SELECT id FROM warehouses WHERE {_accessories_warehouse_clause()} ORDER BY id"
+        ).fetchall()
+    if len(rows) < 2:
+        primary_id = int(rows[0]["id"])
+        conn.execute(
+            """
+            UPDATE warehouses SET warehouse_type = 'accessories', currency_code = 'TJS',
+                   notes = COALESCE(NULLIF(notes, ''), 'Склад аксессуаров')
+            WHERE id = ?
+            """,
+            (primary_id,),
+        )
+        return
+    primary_id = int(rows[0]["id"])
+    for row in rows[1:]:
+        dup_id = int(row["id"])
+        conn.execute(
+            "UPDATE product_units SET warehouse_id = ? WHERE warehouse_id = ?",
+            (primary_id, dup_id),
+        )
+        conn.execute(
+            "UPDATE sales SET warehouse_id = ? WHERE warehouse_id = ?",
+            (primary_id, dup_id),
+        )
+        for ws in conn.execute(
+            "SELECT product_id, quantity FROM warehouse_stock WHERE warehouse_id = ?", (dup_id,)
+        ).fetchall():
+            adjust_warehouse_stock(
+                conn, primary_id, int(ws["product_id"]), int(ws["quantity"]), "transfer",
+                notes="Слияние складов аксессуаров",
+            )
+        conn.execute("DELETE FROM warehouse_stock WHERE warehouse_id = ?", (dup_id,))
+        conn.execute("DELETE FROM stock_movements WHERE warehouse_id = ?", (dup_id,))
+        conn.execute("DELETE FROM warehouses WHERE id = ?", (dup_id,))
+    conn.execute(
+        """
+        UPDATE warehouses SET warehouse_type = 'accessories', currency_code = 'TJS',
+               notes = COALESCE(NULLIF(notes, ''), 'Склад аксессуаров')
+        WHERE id = ?
+        """,
+        (primary_id,),
+    )
+
+
+PHONE_NAME_HINTS = (
+    "iphone", "samsung", "xiaomi", "huawei", "pixel", "oneplus", "redmi", "ipad",
+    "macbook", "apple watch", "aw ultra", "airpods", "honor", "oppo", "vivo",
+    "realme", "poco", "nokia", "sony", "google", "tecno", "infinix", "meizu",
+)
+
+
+def _z_row_is_phone(row: dict[str, Any]) -> bool:
+    name = (row.get("name") or "").lower()
+    memory = (row.get("memory") or "").strip().lower().replace("gb", "").replace("tb", "").strip()
+    if memory and memory.isdigit():
+        return True
+    return any(h in name for h in PHONE_NAME_HINTS)
+
+
 def _merge_duplicate_bu_warehouses(conn: sqlite3.Connection) -> None:
     rows = conn.execute(
         f"SELECT id FROM warehouses WHERE {_bu_warehouse_clause()} ORDER BY id"
@@ -1727,6 +1800,148 @@ def _import_z_register_rows(
     }
 
 
+def _import_accessory_z_rows(
+    conn: sqlite3.Connection,
+    rows: list[dict[str, Any]],
+    warehouse_id: int,
+) -> dict[str, Any]:
+    created = sold = skipped = 0
+    errors: list[str] = []
+    currency_code = get_warehouse_currency(conn, warehouse_id)["code"]
+    for row in rows:
+        name = row["name"]
+        purchase = float(row["purchase_price"])
+        extra = float(row["extra_cost"])
+        sale_price = row["sale_price"]
+        sale_date = row["sale_date"]
+        profit = row["profit"]
+        model = row.get("region") or row.get("comments") or ""
+
+        existing = conn.execute(
+            """
+            SELECT id FROM products
+            WHERE category = 'accessory' AND LOWER(TRIM(name)) = LOWER(TRIM(?))
+              AND LOWER(TRIM(COALESCE(model, ''))) = LOWER(TRIM(?))
+            LIMIT 1
+            """,
+            (name, model),
+        ).fetchone()
+        if existing:
+            product_id = int(existing["id"])
+            conn.execute(
+                "UPDATE products SET purchase_price = ?, sale_price = COALESCE(?, sale_price) WHERE id = ?",
+                (purchase, sale_price, product_id),
+            )
+        else:
+            sp = sale_price if sale_price and sale_price > 0 else round(purchase * 1.3, 2)
+            cur = conn.execute(
+                """
+                INSERT INTO products
+                (name, category, ownership_type, supplier_name, brand, sku, barcode,
+                 purchase_price, sale_price, stock, min_stock, created_at,
+                 model, color, size, memory, ram, customs_cleared, customs_price, specs_extra,
+                 condition, track_units, image_url)
+                VALUES (?, 'accessory', 'own', '', '', '', '', ?, ?, 0, 0, ?,
+                        ?, '', '', '', '', 0, 0, '', 'new', 0, '')
+                """,
+                (name, purchase, sp, utc_now(), model),
+            )
+            product_id = int(cur.lastrowid)
+
+        if sale_price and sale_price > 0 and sale_date:
+            shop_profit = profit if profit is not None else (sale_price - purchase - extra)
+            total = float(sale_price)
+            cur_s = conn.execute(
+                """
+                INSERT INTO sales
+                (total, discount, payment_method, status, notes, created_at,
+                 warehouse_id, cash_amount, card_amount, trade_in_value, shift_id, user_id, user_name,
+                 amount_paid, amount_due, currency_code)
+                VALUES (?, 0, 'cash', 'completed', ?, ?, ?, ?, 0, 0, NULL, NULL, 'Z-импорт акс', ?, 0, ?)
+                """,
+                (total, row["comments"] or "Z-импорт аксессуаров", sale_date, warehouse_id, total, total, currency_code),
+            )
+            sale_id = int(cur_s.lastrowid)
+            insert_sale_payments(conn, sale_id, [{"method_code": "cash", "amount": total}])
+            conn.execute(
+                """
+                INSERT INTO sale_items
+                (sale_id, product_id, product_name, ownership_type, supplier_name, quantity,
+                 unit_price, purchase_price, supplier_due, shop_profit, subtotal)
+                VALUES (?, ?, ?, 'own', '', 1, ?, ?, 0, ?, ?)
+                """,
+                (sale_id, product_id, name, total, purchase, shop_profit, total),
+            )
+            sold += 1
+        else:
+            adjust_warehouse_stock(
+                conn, warehouse_id, product_id, 1, "inbound",
+                notes=f"Z-импорт акс: {name}",
+            )
+            created += 1
+    for pid_row in conn.execute(
+        "SELECT id FROM products WHERE category = 'accessory'"
+    ).fetchall():
+        sync_product_stock(conn, int(pid_row["id"]))
+    return {
+        "created_units": created,
+        "sold_units": sold,
+        "skipped_duplicates": skipped,
+        "errors": errors,
+        "total_rows": len(rows),
+    }
+
+
+def reset_accessories_z_import(conn: sqlite3.Connection) -> dict[str, int]:
+    try:
+        acc_wh = resolve_accessories_warehouse_id(conn)
+    except HTTPException:
+        return {"deleted_sales": 0, "warehouse_id": 0}
+    sale_ids = [
+        int(r["id"]) for r in conn.execute(
+            "SELECT id FROM sales WHERE user_name = 'Z-импорт акс' AND warehouse_id = ?",
+            (acc_wh,),
+        ).fetchall()
+    ]
+    for sid in sale_ids:
+        conn.execute("DELETE FROM receivables WHERE sale_id = ?", (sid,))
+        conn.execute(
+            "DELETE FROM sale_item_units WHERE sale_item_id IN (SELECT id FROM sale_items WHERE sale_id = ?)",
+            (sid,),
+        )
+        conn.execute("DELETE FROM sale_items WHERE sale_id = ?", (sid,))
+        conn.execute("DELETE FROM sale_payments WHERE sale_id = ?", (sid,))
+        conn.execute("DELETE FROM sales WHERE id = ?", (sid,))
+    conn.execute("DELETE FROM warehouse_stock WHERE warehouse_id = ?", (acc_wh,))
+    conn.execute(
+        "DELETE FROM product_units WHERE warehouse_id = ? AND notes LIKE 'Z-импорт%'",
+        (acc_wh,),
+    )
+    _rebuild_all_warehouse_stock(conn)
+    return {"deleted_sales": len(sale_ids), "warehouse_id": acc_wh}
+
+
+def import_accessories_excel(
+    conn: sqlite3.Connection, raw: bytes, *, replace: bool = False
+) -> dict[str, Any]:
+    from openpyxl import load_workbook
+
+    results: dict[str, Any] = {}
+    if replace:
+        results["reset"] = reset_accessories_z_import(conn)
+    wb = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+    all_rows: list[dict[str, Any]] = []
+    for sn in wb.sheetnames:
+        low = sn.lower()
+        if low in ("бу", "bu", "б/у"):
+            continue
+        rows = _parse_z_register_sheet(wb[sn], "new")
+        all_rows.extend([r for r in rows if not _z_row_is_phone(r)])
+    acc_wh = resolve_accessories_warehouse_id(conn)
+    results["import"] = _import_accessory_z_rows(conn, all_rows, acc_wh) | {"warehouse_id": acc_wh}
+    return results
+
+
 def import_z_register_excel(
     conn: sqlite3.Connection, raw: bytes, filename: str, sheet: str = "", *, replace: bool = False
 ) -> dict[str, Any]:
@@ -1754,7 +1969,22 @@ def import_z_register_excel(
     for sn, kind, wh_id in targets:
         ws = wb[sn]
         rows = _parse_z_register_sheet(ws, kind)
-        results["sheets"][sn] = _import_z_register_rows(conn, rows, wh_id, sheet_kind=kind) | {"warehouse_id": wh_id, "kind": kind}
+        if kind == "new":
+            phone_rows = [r for r in rows if _z_row_is_phone(r)]
+            acc_rows = [r for r in rows if not _z_row_is_phone(r)]
+            results["sheets"][sn] = _import_z_register_rows(
+                conn, phone_rows, wh_id, sheet_kind=kind
+            ) | {"warehouse_id": wh_id, "kind": kind}
+            if acc_rows:
+                acc_wh = resolve_accessories_warehouse_id(conn)
+                acc_res = _import_accessory_z_rows(conn, acc_rows, acc_wh)
+                results["sheets"]["аксессуары (из доллари)"] = acc_res | {
+                    "warehouse_id": acc_wh, "kind": "accessory"
+                }
+        else:
+            results["sheets"][sn] = _import_z_register_rows(
+                conn, rows, wh_id, sheet_kind=kind
+            ) | {"warehouse_id": wh_id, "kind": kind}
     return results
 
 
@@ -1763,14 +1993,49 @@ def get_warehouse_receipt_kind(conn: sqlite3.Connection, warehouse_id: int) -> s
     if not row:
         return "new"
     wt = (row["warehouse_type"] or "").strip().lower()
+    name = (row["name"] or "").lower()
+    if wt == "accessories" or "аксесс" in name:
+        return "accessories"
     if wt == "used":
         return "used"
     if wt == "new":
         return "new"
-    name = (row["name"] or "").lower()
     if "бу" in name or "б/у" in name or "б у" in name:
         return "used"
     return "new"
+
+
+def _fix_misclassified_accessories(conn: sqlite3.Connection) -> None:
+    if not _table_exists(conn, "product_units"):
+        return
+    try:
+        acc_wh = resolve_accessories_warehouse_id(conn)
+        main_id = get_default_warehouse_id(conn)
+        bu_id = resolve_bu_warehouse_id(conn)
+    except HTTPException:
+        return
+    rows = conn.execute(
+        """
+        SELECT u.id, u.product_id, p.name, p.memory
+        FROM product_units u
+        JOIN products p ON p.id = u.product_id
+        WHERE u.warehouse_id IN (?, ?) AND u.status = 'in_stock' AND p.category = 'phone'
+        """,
+        (main_id, bu_id),
+    ).fetchall()
+    moved = False
+    for r in rows:
+        if _z_row_is_phone({"name": r["name"], "memory": r["memory"] or ""}):
+            continue
+        pid = int(r["product_id"])
+        uid = int(r["id"])
+        conn.execute("UPDATE products SET category = 'accessory', track_units = 0 WHERE id = ?", (pid,))
+        conn.execute("DELETE FROM product_units WHERE id = ?", (uid,))
+        adjust_warehouse_stock(conn, acc_wh, pid, 1, "transfer", notes="Перенос аксессуара со склада телефонов")
+        sync_product_stock(conn, pid)
+        moved = True
+    if moved:
+        _rebuild_all_warehouse_stock(conn)
 
 
 CURRENCY_META: dict[str, dict[str, str]] = {
@@ -1801,6 +2066,8 @@ def _set_warehouse_currencies(conn: sqlite3.Connection) -> None:
         wh_id = int(row["id"])
         kind = get_warehouse_receipt_kind(conn, wh_id)
         if kind == "used":
+            expected = "TJS"
+        elif kind == "accessories":
             expected = "TJS"
         elif int(row["is_default"] or 0):
             expected = "USD"
@@ -2530,15 +2797,22 @@ def resolve_warehouse_id(conn: sqlite3.Connection, warehouse_id: int | None) -> 
 
 def resolve_accessories_warehouse_id(conn: sqlite3.Connection) -> int:
     row = conn.execute(
-        """
+        f"""
         SELECT id FROM warehouses
-        WHERE LOWER(name) LIKE '%аксесс%'
+        WHERE warehouse_type = 'accessories' OR {_accessories_warehouse_clause()}
         ORDER BY id LIMIT 1
         """
     ).fetchone()
     if row:
         return int(row["id"])
-    return get_default_warehouse_id(conn)
+    cur = conn.execute(
+        """
+        INSERT INTO warehouses (name, address, notes, is_default, warehouse_type, currency_code, created_at)
+        VALUES ('Аксессуары', '', 'Склад аксессуаров', 0, 'accessories', 'TJS', ?)
+        """,
+        (utc_now(),),
+    )
+    return int(cur.lastrowid)
 
 
 def _accessories_category_clause() -> str:
@@ -4224,6 +4498,15 @@ async def list_warehouses(x_pin: str | None = Header(default=None, alias="X-Pin"
 async def create_warehouse(body: WarehouseIn, x_pin: str | None = Header(default=None, alias="X-Pin")):
     check_pin(x_pin)
     with db() as conn:
+        nm = body.name.strip().lower()
+        if "аксесс" in nm or "accessory" in nm:
+            if conn.execute(
+                f"SELECT 1 FROM warehouses WHERE {_accessories_warehouse_clause()} LIMIT 1"
+            ).fetchone():
+                raise HTTPException(
+                    status_code=400,
+                    detail="Склад аксессуаров уже есть — используйте раздел «Аксессуары»",
+                )
         if body.is_default:
             conn.execute("UPDATE warehouses SET is_default = 0")
         cur = conn.execute(
@@ -4269,6 +4552,11 @@ async def delete_warehouse(warehouse_id: int, x_pin: str | None = Header(default
             raise HTTPException(status_code=404, detail="Склад не найден")
         if wh["is_default"]:
             raise HTTPException(status_code=400, detail="Нельзя удалить склад по умолчанию")
+        if get_warehouse_receipt_kind(conn, warehouse_id) == "accessories":
+            raise HTTPException(
+                status_code=400,
+                detail="Склад аксессуаров удаляется только через раздел «Аксессуары»",
+            )
         stock_count = conn.execute(
             "SELECT COUNT(*) FROM warehouse_stock WHERE warehouse_id = ? AND quantity > 0",
             (warehouse_id,),
@@ -4320,7 +4608,7 @@ async def warehouse_devices(warehouse_id: int, x_pin: str | None = Header(defaul
                    p.sale_price, p.ownership_type, p.condition, p.category
             FROM product_units u
             JOIN products p ON p.id = u.product_id
-            WHERE u.warehouse_id = ? AND u.status = 'in_stock'
+            WHERE u.warehouse_id = ? AND u.status = 'in_stock' AND p.category != 'accessory'
             ORDER BY COALESCE(u.arrival_date, u.created_at) DESC, u.id DESC
             """,
             (warehouse_id,),
@@ -4944,6 +5232,11 @@ async def list_products(
                 )
             """
             params.append(warehouse_id)
+            wh_row = conn.execute(
+                "SELECT warehouse_type, name FROM warehouses WHERE id = ?", (warehouse_id,)
+            ).fetchone()
+            if wh_row and get_warehouse_receipt_kind(conn, warehouse_id) != "accessories":
+                sql += " AND p.category != 'accessory'"
         if q:
             clause, sparams = product_search_sql(q)
             sql += clause
@@ -5050,6 +5343,27 @@ async def accessories_inbound(body: AccessoryInboundIn, x_pin: str | None = Head
         result = enrich_product(conn, product)
         result["warehouse_quantity"] = get_warehouse_stock(conn, wh_id, product_id)
         return result
+
+
+@app.post("/api/accessories/import/excel")
+async def import_accessories_excel_file(
+    file: UploadFile = File(...),
+    replace: bool = Query(default=False),
+    x_pin: str | None = Header(default=None, alias="X-Pin"),
+):
+    check_pin(x_pin, min_role="warehouse")
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Пустой файл")
+    try:
+        with db() as conn:
+            result = import_accessories_excel(conn, raw, replace=replace)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Accessories import failed")
+        raise HTTPException(status_code=500, detail=f"Ошибка импорта: {exc}") from exc
+    return result
 
 
 @app.put("/api/accessories/products/{product_id}/price")

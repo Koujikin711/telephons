@@ -130,11 +130,11 @@
             <div class="pos-left card">
               <div class="toolbar">
                 <select id="pos-warehouse" class="select" title="Склад отгрузки"></select>
+                <span id="pos-currency-hint" class="muted" style="font-size:.8rem;white-space:nowrap"></span>
                 <input type="search" id="pos-search" class="input" placeholder="Поиск, IMEI (5 цифр)…" autofocus>
                 <select id="pos-category" class="select">
                   <option value="">Все категории</option>
                   <option value="phone">Телефоны</option>
-                  <option value="accessory">Аксессуары</option>
                 </select>
                 <select id="pos-ownership" class="select">
                   <option value="">Все товары</option>
@@ -373,6 +373,19 @@
                   <thead><tr><th>Название</th><th>Модель</th><th>Поставщик</th><th>Себест.</th><th>Цена</th><th>Кол-во</th><th></th></tr></thead>
                   <tbody id="acc-stock-tbody"></tbody>
                 </table></div>
+              </div>
+            </div>
+            <div class="card" style="margin-top:1rem">
+              <div class="card-header"><h3>Импорт из Excel</h3></div>
+              <div class="card-body">
+                <p class="muted" style="margin-bottom:.75rem">Загрузите Excel (лист «доллари») — аксессуары (Dyson и т.п.) попадут сюда, телефоны не затронутся.</p>
+                <div class="form-row" style="align-items:center;gap:.75rem;flex-wrap:wrap">
+                  <input type="file" id="acc-import-file" accept=".xlsx" hidden>
+                  <button type="button" class="btn btn-ghost" onclick="document.getElementById('acc-import-file').click()">Выбрать файл…</button>
+                  <span id="acc-import-filename" class="muted">Файл не выбран</span>
+                  <button type="button" id="acc-import-submit" class="btn btn-primary" disabled>Загрузить (заменить остатки)</button>
+                </div>
+                <div id="acc-import-result" class="hidden" style="margin-top:.75rem;font-size:.9rem"></div>
               </div>
             </div>
           </div>
@@ -758,6 +771,19 @@
               </div>
             </div>
           </div>
+          <div class="card" style="margin-top:1rem">
+            <div class="card-header"><h3>Импорт из Excel</h3></div>
+            <div class="card-body">
+              <p class="muted" style="margin-bottom:.75rem">Загрузите тот же Excel (лист «доллари») — аксессуары (Dyson, чехлы и т.п.) попадут сюда автоматически, телефоны не затронутся.</p>
+              <div class="form-row" style="align-items:center;gap:.75rem;flex-wrap:wrap">
+                <input type="file" id="acc-import-file" accept=".xlsx" hidden>
+                <button type="button" class="btn btn-ghost" onclick="document.getElementById('acc-import-file').click()">Выбрать файл…</button>
+                <span id="acc-import-filename" class="muted">Файл не выбран</span>
+                <button type="button" id="acc-import-submit" class="btn btn-primary" disabled>Загрузить (заменить остатки)</button>
+              </div>
+              <div id="acc-import-result" class="hidden" style="margin-top:.75rem;font-size:.9rem"></div>
+            </div>
+          </div>
         </section>
       </main>
     </div>
@@ -1096,6 +1122,6 @@
   </dialog>
 
   <div id="toast" class="toast"></div>
-  <script src="/static/app.js?v=28"></script>
+  <script src="/static/app.js?v=29"></script>
 </body>
 </html>
