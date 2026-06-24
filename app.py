@@ -1749,12 +1749,23 @@ def _transfer_unit_between_warehouses(
 ) -> None:
     if from_wh == to_wh:
         return
+    unit = conn.execute(
+        "SELECT status, sale_id FROM product_units WHERE id = ?", (unit_id,)
+    ).fetchone()
     conn.execute("UPDATE product_units SET warehouse_id = ? WHERE id = ?", (to_wh, unit_id))
-    sale_row = conn.execute("SELECT sale_id FROM product_units WHERE id = ?", (unit_id,)).fetchone()
-    if sale_row and sale_row["sale_id"]:
-        conn.execute("UPDATE sales SET warehouse_id = ? WHERE id = ?", (to_wh, sale_row["sale_id"]))
-    adjust_warehouse_stock(conn, from_wh, product_id, -1, "transfer", target_warehouse_id=to_wh, notes="Перенос по типу NEW/БУ")
-    adjust_warehouse_stock(conn, to_wh, product_id, 1, "transfer", target_warehouse_id=from_wh, notes="Перенос по типу NEW/БУ")
+    if unit and unit["sale_id"]:
+        conn.execute("UPDATE sales SET warehouse_id = ? WHERE id = ?", (to_wh, unit["sale_id"]))
+    if unit and unit["status"] == "in_stock":
+        current = get_warehouse_stock(conn, from_wh, product_id)
+        if current > 0:
+            adjust_warehouse_stock(
+                conn, from_wh, product_id, -1, "transfer",
+                target_warehouse_id=to_wh, notes="Перенос по типу NEW/БУ",
+            )
+            adjust_warehouse_stock(
+                conn, to_wh, product_id, 1, "transfer",
+                target_warehouse_id=from_wh, notes="Перенос по типу NEW/БУ",
+            )
 
 
 def _fix_z_register_warehouse_split(conn: sqlite3.Connection) -> None:
@@ -1767,24 +1778,27 @@ def _fix_z_register_warehouse_split(conn: sqlite3.Connection) -> None:
         return
     if bu_id == main_id:
         return
-    for u in conn.execute(
-        """
-        SELECT u.id, u.product_id FROM product_units u
-        JOIN products p ON p.id = u.product_id
-        WHERE u.warehouse_id = ? AND COALESCE(p.condition, 'new') != 'new'
-        """,
-        (main_id,),
-    ).fetchall():
-        _transfer_unit_between_warehouses(conn, int(u["id"]), int(u["product_id"]), main_id, bu_id)
-    for u in conn.execute(
-        """
-        SELECT u.id, u.product_id FROM product_units u
-        JOIN products p ON p.id = u.product_id
-        WHERE u.warehouse_id = ? AND COALESCE(p.condition, 'new') = 'new'
-        """,
-        (bu_id,),
-    ).fetchall():
-        _transfer_unit_between_warehouses(conn, int(u["id"]), int(u["product_id"]), bu_id, main_id)
+    try:
+        for u in conn.execute(
+            """
+            SELECT u.id, u.product_id FROM product_units u
+            JOIN products p ON p.id = u.product_id
+            WHERE u.warehouse_id = ? AND COALESCE(p.condition, 'new') != 'new'
+            """,
+            (main_id,),
+        ).fetchall():
+            _transfer_unit_between_warehouses(conn, int(u["id"]), int(u["product_id"]), main_id, bu_id)
+        for u in conn.execute(
+            """
+            SELECT u.id, u.product_id FROM product_units u
+            JOIN products p ON p.id = u.product_id
+            WHERE u.warehouse_id = ? AND COALESCE(p.condition, 'new') = 'new'
+            """,
+            (bu_id,),
+        ).fetchall():
+            _transfer_unit_between_warehouses(conn, int(u["id"]), int(u["product_id"]), bu_id, main_id)
+    except Exception as exc:
+        logger.warning("Z-register warehouse split fix skipped: %s", exc)
 
 
 def _z_register_condition_clause(conn: sqlite3.Connection, warehouse_id: int) -> str:
