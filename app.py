@@ -2152,6 +2152,28 @@ def _normalize_accessory_name(name: str) -> str:
     return " ".join((name or "").lower().split())
 
 
+def _reassign_product_id(conn: sqlite3.Connection, old_id: int, new_id: int) -> None:
+    if old_id == new_id:
+        return
+    conn.execute("UPDATE sale_items SET product_id = ? WHERE product_id = ?", (new_id, old_id))
+    if _table_exists(conn, "stock_movements"):
+        conn.execute("UPDATE stock_movements SET product_id = ? WHERE product_id = ?", (new_id, old_id))
+    if _table_exists(conn, "product_units"):
+        conn.execute("UPDATE product_units SET product_id = ? WHERE product_id = ?", (new_id, old_id))
+    if _table_exists(conn, "trade_ins"):
+        conn.execute("UPDATE trade_ins SET given_product_id = ? WHERE given_product_id = ?", (new_id, old_id))
+        conn.execute(
+            "UPDATE trade_ins SET received_product_id = ? WHERE received_product_id = ?",
+            (new_id, old_id),
+        )
+    if _table_exists(conn, "stocktake_lines"):
+        conn.execute("UPDATE stocktake_lines SET product_id = ? WHERE product_id = ?", (new_id, old_id))
+    if _table_exists(conn, "unit_reservations"):
+        conn.execute("UPDATE unit_reservations SET product_id = ? WHERE product_id = ?", (new_id, old_id))
+    conn.execute("DELETE FROM warehouse_stock WHERE product_id = ?", (old_id,))
+    conn.execute("DELETE FROM products WHERE id = ?", (old_id,))
+
+
 def _dedupe_accessory_products(conn: sqlite3.Connection) -> None:
     try:
         acc_wh = resolve_accessories_warehouse_id(conn)
@@ -2179,9 +2201,11 @@ def _dedupe_accessory_products(conn: sqlite3.Connection) -> None:
                 adjust_warehouse_stock(
                     conn, acc_wh, primary_id, qty, "transfer", notes="Слияние дубликата аксессуара",
                 )
-            conn.execute("UPDATE sale_items SET product_id = ? WHERE product_id = ?", (primary_id, dup_id))
-            conn.execute("DELETE FROM warehouse_stock WHERE product_id = ?", (dup_id,))
-            conn.execute("DELETE FROM products WHERE id = ?", (dup_id,))
+            try:
+                _reassign_product_id(conn, dup_id, primary_id)
+            except sqlite3.IntegrityError as exc:
+                logger.warning("Accessory dedupe: could not merge product %s into %s: %s", dup_id, primary_id, exc)
+                continue
             changed = True
     if changed:
         for pid_row in conn.execute("SELECT id FROM products WHERE category = 'accessory'").fetchall():
