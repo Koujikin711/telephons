@@ -40,7 +40,7 @@ DEFAULT_WAREHOUSE_NAME = "Основной склад"
 ROLE_PAGES: dict[str, list[str]] = {
     "owner": [
         "dashboard", "pos", "sales", "warehouses", "products-own",
-        "products-consignment", "accessories", "reports", "analytics", "debtors",
+        "products-consignment", "accessories", "reports", "analytics", "debtors", "creditors",
         "imei", "stocktake", "settings",
     ],
     "warehouse": [
@@ -125,6 +125,67 @@ def product_search_sql(q: str) -> tuple[str, list[Any]]:
         text = f"({text}{unit_sql})"
         params.extend([like, like])
     return f" AND {text}", params
+
+
+def sale_search_sql(q: str) -> tuple[str, list[Any]]:
+    q = normalize_search_q(q)
+    if not q:
+        return "", []
+    params: list[Any] = []
+    parts: list[str] = []
+    id_q = q.lstrip("#").strip()
+    if id_q.isdigit():
+        parts.append("s.id = ?")
+        params.append(int(id_q))
+    like = f"%{q}%"
+    parts.append(
+        """
+        EXISTS (
+            SELECT 1 FROM sale_items si2
+            WHERE si2.sale_id = s.id
+              AND (
+                LOWER(si2.product_name) LIKE LOWER(?)
+                OR LOWER(COALESCE(si2.supplier_name, '')) LIKE LOWER(?)
+              )
+        )
+        """
+    )
+    params.extend([like, like])
+    d = only_digits(q)
+    if len(d) >= 5:
+        suffix = d[-min(len(d), 15):]
+        parts.append(
+            """
+            EXISTS (
+                SELECT 1 FROM sale_items si3
+                JOIN sale_item_units siu ON siu.sale_item_id = si3.id
+                WHERE si3.sale_id = s.id
+                  AND (
+                    siu.imei LIKE ? OR siu.serial LIKE ?
+                    OR siu.imei LIKE ? OR siu.serial LIKE ?
+                  )
+            )
+            """
+        )
+        params.extend([f"%{suffix}", f"%{suffix}", f"%{d}%", f"%{d}%"])
+    parts.append(
+        """
+        EXISTS (
+            SELECT 1 FROM receivables r
+            WHERE r.sale_id = s.id
+              AND (
+                LOWER(r.customer_name) LIKE LOWER(?)
+                OR COALESCE(r.customer_phone, '') LIKE ?
+              )
+        )
+        """
+    )
+    params.extend([like, like])
+    parts.append(
+        "(LOWER(COALESCE(s.user_name, '')) LIKE LOWER(?) OR LOWER(COALESCE(s.notes, '')) LIKE LOWER(?))"
+    )
+    params.extend([like, like])
+    return f"({' OR '.join(parts)})", params
 
 
 def unit_search_sql(q: str, imei_col: str = "u.imei", serial_col: str = "u.serial") -> tuple[str, list[Any]]:
@@ -238,6 +299,7 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     _add_column(conn, "sale_items", "supplier_name", "TEXT DEFAULT ''")
     _add_column(conn, "sale_items", "supplier_due", "REAL NOT NULL DEFAULT 0")
     _add_column(conn, "sale_items", "shop_profit", "REAL NOT NULL DEFAULT 0")
+    _add_column(conn, "supplier_payments", "payment_method_code", "TEXT DEFAULT 'cash'")
     _add_column(conn, "sales", "warehouse_id", "INTEGER")
     _add_column(conn, "sales", "cash_amount", "REAL NOT NULL DEFAULT 0")
     _add_column(conn, "sales", "card_amount", "REAL NOT NULL DEFAULT 0")
@@ -2919,6 +2981,22 @@ def enrich_sale(conn: sqlite3.Connection, sale: sqlite3.Row) -> dict[str, Any]:
     items = conn.execute("SELECT * FROM sale_items WHERE sale_id = ?", (sale["id"],)).fetchall()
     data["items"] = enrich_sale_items(conn, items)
     data["payments"] = sale_payments_for(conn, sale["id"])
+    rec = conn.execute(
+        "SELECT * FROM receivables WHERE sale_id = ? ORDER BY id DESC LIMIT 1",
+        (sale["id"],),
+    ).fetchone()
+    data["receivable"] = row_to_dict(rec) if rec else None
+    data["supplier_due_total"] = sum(
+        float(i["supplier_due"] or 0)
+        for i in items
+        if (i["ownership_type"] or "") == "consignment"
+    )
+    suppliers = sorted({
+        (i["supplier_name"] or "").strip()
+        for i in items
+        if (i["ownership_type"] or "") == "consignment" and (i["supplier_name"] or "").strip()
+    })
+    data["supplier_names"] = suppliers
     return data
 
 
@@ -3744,6 +3822,7 @@ class SupplierPaymentIn(BaseModel):
     supplier_name: str = Field(min_length=1)
     amount: float = Field(gt=0)
     notes: str = ""
+    payment_method_code: str = "cash"
 
 
 class WarehouseIn(BaseModel):
@@ -5933,46 +6012,107 @@ async def accessories_cash_register(
 async def list_suppliers(x_pin: str | None = Header(default=None, alias="X-Pin")):
     check_pin(x_pin)
     with db() as conn:
+        return _creditors_list(conn)
+
+
+def _creditors_list(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT p.supplier_name,
+               COUNT(DISTINCT p.id) AS products_count,
+               COALESCE(SUM(ws.quantity), 0) AS total_stock,
+               COALESCE(SUM(p.purchase_price * ws.quantity), 0) AS stock_value
+        FROM products p
+        LEFT JOIN warehouse_stock ws ON ws.product_id = p.id
+        WHERE p.ownership_type = 'consignment' AND p.supplier_name != ''
+        GROUP BY p.supplier_name
+        ORDER BY p.supplier_name
+        """
+    ).fetchall()
+    result = []
+    for r in rows:
+        name = r["supplier_name"]
+        sold_due = conn.execute(
+            """
+            SELECT COALESCE(SUM(supplier_due), 0)
+            FROM sale_items si
+            JOIN sales s ON s.id = si.sale_id
+            WHERE si.ownership_type = 'consignment'
+              AND si.supplier_name = ?
+              AND s.status = 'completed'
+            """,
+            (name,),
+        ).fetchone()[0]
+        paid = conn.execute(
+            "SELECT COALESCE(SUM(amount), 0) FROM supplier_payments WHERE supplier_name = ?",
+            (name,),
+        ).fetchone()[0]
+        sales_count = conn.execute(
+            """
+            SELECT COUNT(DISTINCT s.id)
+            FROM sale_items si
+            JOIN sales s ON s.id = si.sale_id
+            WHERE si.ownership_type = 'consignment'
+              AND si.supplier_name = ?
+              AND s.status = 'completed'
+              AND si.supplier_due > 0
+            """,
+            (name,),
+        ).fetchone()[0]
+        result.append({
+            "supplier_name": name,
+            "products_count": r["products_count"],
+            "total_stock": r["total_stock"],
+            "stock_value": float(r["stock_value"]),
+            "accrued_due": float(sold_due),
+            "paid": float(paid),
+            "balance": float(sold_due) - float(paid),
+            "sales_count": int(sales_count or 0),
+        })
+    return result
+
+
+@app.get("/api/creditors")
+async def list_creditors(x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin)
+    with db() as conn:
+        creditors = _creditors_list(conn)
+        total_balance = sum(c["balance"] for c in creditors if c["balance"] > 0)
+        payments = conn.execute(
+            "SELECT * FROM supplier_payments ORDER BY created_at DESC LIMIT 50"
+        ).fetchall()
+    return {
+        "creditors": creditors,
+        "total_balance": total_balance,
+        "recent_payments": [row_to_dict(r) for r in payments],
+    }
+
+
+@app.get("/api/creditors/sales")
+async def list_creditor_sales(
+    supplier_name: str = Query(min_length=1),
+    x_pin: str | None = Header(default=None, alias="X-Pin"),
+):
+    check_pin(x_pin)
+    with db() as conn:
         rows = conn.execute(
             """
-            SELECT p.supplier_name,
-                   COUNT(DISTINCT p.id) AS products_count,
-                   COALESCE(SUM(ws.quantity), 0) AS total_stock,
-                   COALESCE(SUM(p.purchase_price * ws.quantity), 0) AS stock_value
-            FROM products p
-            LEFT JOIN warehouse_stock ws ON ws.product_id = p.id
-            WHERE p.ownership_type = 'consignment' AND p.supplier_name != ''
-            GROUP BY p.supplier_name
-            ORDER BY p.supplier_name
-            """
+            SELECT s.id AS sale_id, s.created_at, s.warehouse_id,
+                   si.product_name, si.quantity, si.subtotal, si.supplier_due, si.shop_profit,
+                   COALESCE(w.name, '—') AS warehouse_name
+            FROM sale_items si
+            JOIN sales s ON s.id = si.sale_id
+            LEFT JOIN warehouses w ON w.id = s.warehouse_id
+            WHERE si.ownership_type = 'consignment'
+              AND si.supplier_name = ?
+              AND s.status = 'completed'
+              AND si.supplier_due > 0
+            ORDER BY s.created_at DESC
+            LIMIT 200
+            """,
+            (supplier_name.strip(),),
         ).fetchall()
-        result = []
-        for r in rows:
-            sold_due = conn.execute(
-                """
-                SELECT COALESCE(SUM(supplier_due), 0)
-                FROM sale_items si
-                JOIN sales s ON s.id = si.sale_id
-                WHERE si.ownership_type = 'consignment'
-                  AND si.supplier_name = ?
-                  AND s.status = 'completed'
-                """,
-                (r["supplier_name"],),
-            ).fetchone()[0]
-            paid = conn.execute(
-                "SELECT COALESCE(SUM(amount), 0) FROM supplier_payments WHERE supplier_name = ?",
-                (r["supplier_name"],),
-            ).fetchone()[0]
-            result.append({
-                "supplier_name": r["supplier_name"],
-                "products_count": r["products_count"],
-                "total_stock": r["total_stock"],
-                "stock_value": float(r["stock_value"]),
-                "accrued_due": float(sold_due),
-                "paid": float(paid),
-                "balance": float(sold_due) - float(paid),
-            })
-    return result
+    return [row_to_dict(r) for r in rows]
 
 
 @app.post("/api/products")
@@ -6276,6 +6416,7 @@ async def list_sales(
     ownership_type: str = "",
     warehouse_id: int | None = None,
     user_id: int | None = None,
+    q: str = "",
     x_pin: str | None = Header(default=None, alias="X-Pin"),
 ):
     check_pin(x_pin)
@@ -6292,9 +6433,13 @@ async def list_sales(
     if user_id is not None:
         wheres.append("s.user_id = ?")
         params.append(user_id)
+    search_clause, search_params = sale_search_sql(q)
+    if search_clause:
+        wheres.append(search_clause)
+        params.extend(search_params)
     df, dp = date_filter_sql(date_from, date_to, "s.created_at")
     params.extend(dp)
-    join_sql = " " + " ".join(joins) if joins else ""
+    join_sql = " " + " ".join(dict.fromkeys(joins)) if joins else ""
     where_sql = " AND ".join(wheres)
     sql = f"SELECT DISTINCT s.* FROM sales s{join_sql} WHERE {where_sql}{df} ORDER BY s.created_at DESC LIMIT ? OFFSET ?"
     params.extend([limit, offset])
@@ -6309,12 +6454,37 @@ async def list_sales(
         }
         sale_ids = [s["id"] for s in sales]
         pay_map = payments_for_sales(conn, sale_ids)
+        recv_map: dict[int, dict[str, Any]] = {}
+        if sale_ids:
+            placeholders = ",".join("?" * len(sale_ids))
+            for r in conn.execute(
+                f"""
+                SELECT sale_id, customer_name, customer_phone, amount_due, status
+                FROM receivables WHERE sale_id IN ({placeholders})
+                ORDER BY id DESC
+                """,
+                sale_ids,
+            ).fetchall():
+                sid = int(r["sale_id"])
+                if sid not in recv_map:
+                    recv_map[sid] = row_to_dict(r) or {}
     items = []
     for s in sales:
         d = row_to_dict(s)
         d["payments"] = pay_map.get(s["id"], [])
         wid = int(s["warehouse_id"]) if s["warehouse_id"] else None
         d["warehouse_name"] = wh_map.get(wid, "—") if wid else "—"
+        rec = recv_map.get(int(s["id"]))
+        if rec:
+            d["debtor_name"] = rec.get("customer_name") or ""
+            d["debtor_phone"] = rec.get("customer_phone") or ""
+            d["amount_due"] = float(rec.get("amount_due") or 0)
+            d["receivable_status"] = rec.get("status") or ""
+        else:
+            d["debtor_name"] = ""
+            d["debtor_phone"] = ""
+            d["amount_due"] = float(s["amount_due"] or 0) if s["amount_due"] else 0.0
+            d["receivable_status"] = ""
         items.append(d)
     return {"items": items, "total": int(total_count)}
 
@@ -6332,6 +6502,7 @@ async def get_sale(sale_id: int, x_pin: str | None = Header(default=None, alias=
 @app.post("/api/sales/{sale_id}/void")
 async def void_sale(sale_id: int, x_pin: str | None = Header(default=None, alias="X-Pin")):
     check_pin(x_pin, min_role="owner")
+    now = utc_now()
     with db() as conn:
         sale = conn.execute("SELECT * FROM sales WHERE id = ? AND status = 'completed'", (sale_id,)).fetchone()
         if not sale:
@@ -6342,9 +6513,30 @@ async def void_sale(sale_id: int, x_pin: str | None = Header(default=None, alias
             if item["product_id"]:
                 adjust_warehouse_stock(
                     conn, warehouse_id, item["product_id"], item["quantity"],
-                    "void", reference_id=sale_id, notes=f"Отмена продажи #{sale_id}",
+                    "void", reference_id=sale_id, notes=f"Возврат продажи #{sale_id}",
                 )
-        conn.execute("UPDATE sales SET status = 'voided' WHERE id = ?", (sale_id,))
+        for rec in conn.execute(
+            "SELECT * FROM receivables WHERE sale_id = ? AND status = 'open'", (sale_id,)
+        ).fetchall():
+            conn.execute(
+                """
+                UPDATE receivables
+                SET status = 'closed', amount_due = 0, paid_amount = total_amount,
+                    closed_at = ?, notes = TRIM(COALESCE(notes, '') || ?)
+                WHERE id = ?
+                """,
+                (now, f"Закрыто: возврат продажи #{sale_id}", rec["id"]),
+            )
+        note_suffix = f" [Возврат {now[:10]}]"
+        conn.execute(
+            """
+            UPDATE sales
+            SET status = 'voided', amount_due = 0,
+                notes = TRIM(COALESCE(notes, '') || ?)
+            WHERE id = ?
+            """,
+            (note_suffix, sale_id),
+        )
     return {"ok": True}
 
 
@@ -6549,9 +6741,25 @@ async def list_supplier_payments(x_pin: str | None = Header(default=None, alias=
 async def create_supplier_payment(body: SupplierPaymentIn, x_pin: str | None = Header(default=None, alias="X-Pin")):
     check_pin(x_pin)
     with db() as conn:
+        pm = get_payment_method(conn, body.payment_method_code)
+        if not pm:
+            raise HTTPException(status_code=400, detail="Способ оплаты не найден")
+        balance_row = next(
+            (c for c in _creditors_list(conn) if c["supplier_name"] == body.supplier_name.strip()),
+            None,
+        )
+        if balance_row and body.amount > balance_row["balance"] + 0.01:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Сумма больше долга ({balance_row['balance']:.2f})",
+            )
         cur = conn.execute(
-            "INSERT INTO supplier_payments (supplier_name, amount, notes, created_at) VALUES (?, ?, ?, ?)",
-            (body.supplier_name.strip(), body.amount, body.notes, utc_now()),
+            """
+            INSERT INTO supplier_payments
+            (supplier_name, amount, notes, created_at, payment_method_code)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (body.supplier_name.strip(), body.amount, body.notes, utc_now(), body.payment_method_code),
         )
         row = conn.execute("SELECT * FROM supplier_payments WHERE id = ?", (cur.lastrowid,)).fetchone()
     return row_to_dict(row)

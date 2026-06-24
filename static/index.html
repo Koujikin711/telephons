@@ -75,6 +75,9 @@
         <button class="nav-item" data-page="debtors">
           <span class="nav-icon">📋</span> Дебиторка
         </button>
+        <button class="nav-item" data-page="creditors">
+          <span class="nav-icon">📑</span> Кредиторка
+        </button>
         <button class="nav-item" data-page="analytics">
           <span class="nav-icon">↗</span> Аналитика
         </button>
@@ -194,6 +197,7 @@
         <!-- SALES -->
         <section id="page-sales" class="page">
           <div class="toolbar">
+            <input type="search" id="sales-search" class="input" placeholder="Поиск: № чека, IMEI, товар, клиент, кассир…" style="flex:1;min-width:14rem">
             <input type="date" id="sales-from" class="input" title="С даты">
             <input type="date" id="sales-to" class="input" title="По дату">
             <select id="sales-warehouse" class="select" title="Склад">
@@ -230,7 +234,7 @@
               <button type="button" id="sales-toggle-all-detail" class="btn btn-secondary btn-sm" disabled>Детализация</button>
             </div>
             <div class="table-wrap"><table class="data-table">
-            <thead><tr><th>№</th><th>Дата</th><th>Склад</th><th>Кассир</th><th>Сумма</th><th>Оплата</th><th></th></tr></thead>
+            <thead><tr><th>№</th><th>Дата</th><th>Склад</th><th>Кассир</th><th>Сумма</th><th>Оплата</th><th>Долг</th><th></th></tr></thead>
             <tbody id="sales-tbody"></tbody>
           </table></div></div>
         </section>
@@ -460,6 +464,32 @@
               <button type="button" id="acc-report-refresh" class="btn btn-secondary">Обновить</button>
             </div>
             <div id="acc-report-content"></div>
+          </div>
+        </section>
+
+        <!-- CREDITORS -->
+        <section id="page-creditors" class="page">
+          <div class="kpi-grid" style="margin-bottom:1rem">
+            <div class="kpi accent-blue"><div class="label">Долг поставщикам</div><div class="value" id="creditors-total-balance">—</div></div>
+            <div class="kpi"><div class="label">Поставщиков с долгом</div><div class="value" id="creditors-open-count">—</div></div>
+          </div>
+          <div class="toolbar">
+            <input type="search" id="creditors-search" class="input" placeholder="Поиск поставщика…" style="flex:1;min-width:12rem">
+            <button type="button" id="creditors-refresh" class="btn btn-ghost btn-sm">Обновить</button>
+          </div>
+          <div class="grid-2">
+            <div class="card">
+              <div class="card-header"><h3>Кредиторка — поставщики</h3></div>
+              <p class="muted import-hint" style="padding:0 1rem">Долг начисляется при продаже товаров «под реализацию». Возврат продажи уменьшает начисление автоматически.</p>
+              <div class="table-wrap"><table class="data-table">
+                <thead><tr><th>Поставщик</th><th>Начислено</th><th>Оплачено</th><th>Долг</th><th>Продаж</th><th></th></tr></thead>
+                <tbody id="creditors-tbody"></tbody>
+              </table></div>
+            </div>
+            <div class="card">
+              <div class="card-header"><h3>Последние выплаты</h3></div>
+              <div id="creditors-payments-list" class="card-body"></div>
+            </div>
           </div>
         </section>
 
@@ -1014,6 +1044,31 @@
     </form>
   </dialog>
 
+  <dialog id="creditor-pay-modal" class="modal">
+    <form id="creditor-pay-form" novalidate>
+      <h3>Выплата поставщику</h3>
+      <div id="creditor-pay-meta" class="inbound-product-meta"></div>
+      <label>Сумма<input type="number" id="creditor-pay-amount" class="input" min="0.01" step="0.01" required></label>
+      <label>Способ оплаты<select id="creditor-pay-method" class="select"></select></label>
+      <label>Комментарий<input id="creditor-pay-notes" class="input"></label>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-ghost" id="creditor-pay-cancel">Отмена</button>
+        <button type="submit" class="btn btn-primary">Зафиксировать выплату</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="creditor-sales-modal" class="modal modal-lg">
+    <h3 id="creditor-sales-title">Продажи поставщика</h3>
+    <div class="table-wrap"><table class="data-table">
+      <thead><tr><th>Дата</th><th>№</th><th>Товар</th><th>Склад</th><th>Сумма</th><th>Долг пост.</th><th></th></tr></thead>
+      <tbody id="creditor-sales-tbody"></tbody>
+    </table></div>
+    <div class="modal-actions">
+      <button type="button" class="btn btn-ghost" id="creditor-sales-close">Закрыть</button>
+    </div>
+  </dialog>
+
   <dialog id="debtor-pay-modal" class="modal">
     <form id="debtor-pay-form" novalidate>
       <h3>Приём оплаты по долгу</h3>
@@ -1122,6 +1177,6 @@
   </dialog>
 
   <div id="toast" class="toast"></div>
-  <script src="/static/app.js?v=41"></script>
+  <script src="/static/app.js?v=42"></script>
 </body>
 </html>

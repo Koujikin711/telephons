@@ -384,6 +384,7 @@ const PAGE_TITLES = {
   users: "Пользователи",
   reports: "Финансовые отчёты",
   debtors: "Дебиторка",
+  creditors: "Кредиторка",
   analytics: "Аналитика",
   settings: "Настройки",
   stocktake: "Инвентаризация",
@@ -543,6 +544,7 @@ function navigate(page) {
     stocktake: loadStocktakePage,
     reports: loadReport,
     debtors: loadDebtorsPage,
+    creditors: loadCreditorsPage,
     analytics: loadAnalytics,
   };
   loaders[page]?.();
@@ -622,6 +624,7 @@ async function init() {
     bindSuppliers();
     bindAccessories();
     bindDebtors();
+    bindCreditors();
     bindReports();
     bindAnalytics();
     bindImei();
@@ -1287,6 +1290,7 @@ function bindSales() {
   ["sales-from", "sales-to", "sales-ownership", "sales-warehouse"].forEach((id) => {
     document.getElementById(id).addEventListener("change", loadSales);
   });
+  document.getElementById("sales-search")?.addEventListener("input", debounce(loadSales, 320));
   document.getElementById("sale-detail-close").onclick = () => document.getElementById("sale-detail-modal").close();
   document.getElementById("sale-detail-print").onclick = () => {
     if (lastSaleDetail) printReceiptHtml(renderReceiptHtml(lastSaleDetail));
@@ -1397,12 +1401,13 @@ function renderSaleItemsBlock(sale) {
   const rows = (sale.items || []).map((i) => `<tr>
       <td>${esc(i.product_name)}</td>
       <td style="font-size:.8rem">${i.units?.length ? i.units.map((u) => esc(u.imei || u.serial || "—") + (u.imei_pending ? " ⏳" : "")).join("<br>") : "—"}</td>
-      <td><span class="tag tag-${i.ownership_type === "consignment" ? "cons" : "own"}">${ownLabel(i.ownership_type)}</span></td>
-      <td>${i.quantity}</td><td>${saleFmt(sale, i.subtotal)}</td><td>${saleFmt(sale, i.shop_profit)}</td>
+      <td><span class="tag tag-${i.ownership_type === "consignment" ? "cons" : "own"}">${ownLabel(i.ownership_type)}</span>${i.ownership_type === "consignment" && i.supplier_name ? `<br><span class="muted" style="font-size:.75rem">${esc(i.supplier_name)}</span>` : ""}</td>
+      <td>${i.quantity}</td><td>${saleFmt(sale, i.subtotal)}</td>
+      <td>${i.ownership_type === "consignment" && i.supplier_due ? `${saleFmt(sale, i.supplier_due)} <span class="muted" style="font-size:.75rem">пост.</span>` : saleFmt(sale, i.shop_profit)}</td>
     </tr>`).join("");
   return `
     <p class="sale-detail-meta">${meta}</p>
-    <table class="data-table sale-detail-table"><thead><tr><th>Товар</th><th>IMEI</th><th>Тип</th><th>Кол-во</th><th>Сумма</th><th>Прибыль</th></tr></thead>
+    <table class="data-table sale-detail-table"><thead><tr><th>Товар</th><th>IMEI</th><th>Тип</th><th>Кол-во</th><th>Сумма</th><th>Прибыль / пост.</th></tr></thead>
     <tbody>${rows || '<tr><td colspan="6" style="text-align:center;color:var(--muted)">Нет позиций</td></tr>'}</tbody></table>
     <div class="sale-detail-total">Итого: ${saleFmt(sale, sale.total)}</div>`;
 }
@@ -1434,7 +1439,7 @@ async function toggleAllSalesDetail() {
       const detailRow = document.createElement("tr");
       detailRow.className = "sale-detail-row";
       detailRow.dataset.detailFor = String(sale.id);
-      detailRow.innerHTML = `<td colspan="7"><div class="sale-inline-detail">${renderSaleItemsBlock(sale)}</div></td>`;
+      detailRow.innerHTML = `<td colspan="8"><div class="sale-inline-detail">${renderSaleItemsBlock(sale)}</div></td>`;
       row.after(detailRow);
       row.classList.add("sale-row-open");
     });
@@ -1463,24 +1468,34 @@ async function loadSales() {
   const to = document.getElementById("sales-to").value;
   const own = document.getElementById("sales-ownership").value;
   const wh = document.getElementById("sales-warehouse")?.value || "";
+  const search = document.getElementById("sales-search")?.value?.trim() || "";
   let url = `/api/sales?limit=200`;
   if (from) url += `&date_from=${encodeURIComponent(from)}`;
   if (to) url += `&date_to=${encodeURIComponent(to)}`;
   if (own) url += `&ownership_type=${encodeURIComponent(own)}`;
   if (wh) url += `&warehouse_id=${encodeURIComponent(wh)}`;
+  if (search) url += `&q=${encodeURIComponent(search)}`;
   const data = await api(url);
   const tb = document.getElementById("sales-tbody");
   const detailBtn = document.getElementById("sales-toggle-all-detail");
+  const isOwner = !currentUser || currentUser.role === "owner";
   salesAllExpanded = false;
   if (detailBtn) detailBtn.textContent = "Детализация";
   const countHint = data.total != null ? ` · найдено ${data.total}` : "";
   if (!data.items.length) {
-    tb.innerHTML = `<tr><td colspan="7" style="text-align:center;color:var(--muted)">Нет продаж${countHint}</td></tr>`;
+    tb.innerHTML = `<tr><td colspan="8" style="text-align:center;color:var(--muted)">Нет продаж${countHint}</td></tr>`;
     if (detailBtn) detailBtn.disabled = true;
     return;
   }
   if (detailBtn) detailBtn.disabled = false;
-  tb.innerHTML = data.items.map((s) => `
+  tb.innerHTML = data.items.map((s) => {
+    const debt = s.amount_due > 0.01
+      ? `<span class="tag tag-cons" title="${esc(s.debtor_name || "")}">${saleFmt(s, s.amount_due)}</span>`
+      : "—";
+    const returnBtn = isOwner
+      ? `<button class="btn btn-ghost btn-sm" style="color:var(--danger)" onclick="returnSale(${s.id})" title="Возврат на склад">↩</button>`
+      : "";
+    return `
     <tr class="sale-row" data-sale-id="${s.id}">
       <td><strong>#${s.id}</strong></td>
       <td>${s.created_at?.slice(0, 10) || s.created_at}</td>
@@ -1488,11 +1503,14 @@ async function loadSales() {
       <td>${esc(s.user_name || "—")}</td>
       <td><strong>${saleFmt(s, s.total)}</strong></td>
       <td style="font-size:.85rem">${formatPaySummary(s)}</td>
+      <td>${debt}</td>
       <td class="sales-actions">
         <button class="btn btn-ghost btn-sm" onclick="showSale(${s.id})">Детали</button>
         <button class="btn btn-ghost btn-sm" onclick="printSaleReceipt(${s.id})">Чек</button>
+        ${returnBtn}
       </td>
-    </tr>`).join("");
+    </tr>`;
+  }).join("");
 }
 
 window.printSaleReceipt = async (id) => {
@@ -1515,24 +1533,45 @@ window.showSale = async (id) => {
     ? `<div class="card" style="margin-top:1rem"><div class="card-header"><h3>Устройства</h3></div><div class="card-body">${sale.items.flatMap((i) => (i.units || []).map((u) =>
         `<div class="metric-row"><span>${esc(u.imei || u.serial || "—")}</span><span>${u.customs_cleared ? `Таможня ${saleFmt(sale, u.customs_price)}` : ""}${u.imei_pending ? " · IMEI позже" : ""}</span></div>`
       )).join("")}</div></div>` : "";
+  const rec = sale.receivable;
+  const debtorHtml = rec && rec.status === "open" && rec.amount_due > 0.01
+    ? `<div class="card" style="margin-top:1rem;border-color:var(--warning)"><div class="card-header"><h3>Дебиторка</h3></div><div class="card-body">
+        <div class="metric-row"><span>${esc(rec.customer_name)}</span><strong>Долг ${saleFmt(sale, rec.amount_due)}</strong></div>
+        <button type="button" class="btn btn-secondary btn-sm" onclick="document.getElementById('sale-detail-modal').close();navigate('debtors');openDebtorPayModal(${rec.id})">Принять оплату</button>
+      </div></div>`
+    : "";
+  const creditorHtml = sale.supplier_due_total > 0
+    ? `<div class="card" style="margin-top:1rem"><div class="card-header"><h3>Кредиторка</h3></div><div class="card-body">
+        <div class="metric-row"><span>Поставщикам к выплате</span><strong>${saleFmt(sale, sale.supplier_due_total)}</strong></div>
+        <p class="muted" style="font-size:.8rem;margin:.5rem 0 0">${(sale.supplier_names || []).map(esc).join(", ")}</p>
+        ${isOwner ? `<button type="button" class="btn btn-secondary btn-sm" style="margin-top:.5rem" onclick="document.getElementById('sale-detail-modal').close();navigate('creditors')">Открыть кредиторку</button>` : ""}
+      </div></div>`
+    : "";
   document.getElementById("sale-detail-content").innerHTML = `
     <h3>Продажа #${sale.id}</h3>
     ${renderSaleItemsBlock(sale)}
     ${unitsExtra}
     ${payHtml}
-    ${isOwner ? `<button class="btn btn-danger" style="margin-top:1rem" onclick="voidSale(${id})">Отменить продажу</button>` : ""}`;
+    ${debtorHtml}
+    ${creditorHtml}
+    ${isOwner ? `<button class="btn btn-danger" style="margin-top:1rem" onclick="returnSale(${id})">↩ Возврат (товар на склад)</button>` : ""}`;
   document.getElementById("sale-detail-modal").showModal();
 };
 
-window.voidSale = async (id) => {
-  if (!confirm("Отменить? Товары вернутся на склад.")) return;
+window.returnSale = async (id) => {
+  if (!confirm("Оформить возврат? Товары вернутся на склад, долг клиента закроется, начисление поставщику отменится.")) return;
   try {
     await api(`/api/sales/${id}/void`, { method: "POST" });
-    document.getElementById("sale-detail-modal").close();
-    toast("Отменено");
+    document.getElementById("sale-detail-modal")?.close();
+    toast("Возврат оформлен");
     loadSales();
+    if (currentPage === "debtors") loadDebtorsPage();
+    if (currentPage === "creditors") loadCreditorsPage();
+    if (currentPage === "dashboard") loadDashboard();
   } catch (e) { toast(e.message, "error"); }
 };
+
+window.voidSale = window.returnSale;
 
 /* ── Catalog ── */
 function bindCatalog() {
@@ -4383,6 +4422,95 @@ window.openDebtorPayModal = async (id) => {
   document.getElementById("debtor-pay-notes").value = "";
   fillPaySelect(document.getElementById("debtor-pay-method"));
   document.getElementById("debtor-pay-modal").showModal();
+};
+
+/* ── Creditors (кредиторка) ── */
+let payCreditorTarget = null;
+let creditorsCache = [];
+
+function bindCreditors() {
+  document.getElementById("creditors-refresh")?.addEventListener("click", loadCreditorsPage);
+  document.getElementById("creditors-search")?.addEventListener("input", debounce(loadCreditorsPage, 280));
+  document.getElementById("creditor-pay-cancel")?.addEventListener("click", () => {
+    document.getElementById("creditor-pay-modal").close();
+    payCreditorTarget = null;
+  });
+  document.getElementById("creditor-sales-close")?.addEventListener("click", () => {
+    document.getElementById("creditor-sales-modal").close();
+  });
+  document.getElementById("creditor-pay-form")?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    if (!payCreditorTarget) return;
+    try {
+      await api("/api/supplier-payments", {
+        method: "POST",
+        body: JSON.stringify({
+          supplier_name: payCreditorTarget.supplier_name,
+          amount: +document.getElementById("creditor-pay-amount").value,
+          payment_method_code: document.getElementById("creditor-pay-method").value,
+          notes: document.getElementById("creditor-pay-notes").value,
+        }),
+      });
+      document.getElementById("creditor-pay-modal").close();
+      toast("Выплата зафиксирована");
+      loadCreditorsPage();
+      if (currentPage === "products-consignment") loadSuppliers();
+      if (currentPage === "dashboard") loadDashboard();
+    } catch (err) { toast(err.message, "error"); }
+  });
+}
+
+async function loadCreditorsPage() {
+  const data = await api("/api/creditors");
+  creditorsCache = data.creditors || [];
+  const q = (document.getElementById("creditors-search")?.value || "").trim().toLowerCase();
+  const filtered = q
+    ? creditorsCache.filter((c) => c.supplier_name.toLowerCase().includes(q))
+    : creditorsCache;
+  const openCount = creditorsCache.filter((c) => c.balance > 0.01).length;
+  document.getElementById("creditors-total-balance").textContent = fmt(data.total_balance || 0);
+  document.getElementById("creditors-open-count").textContent = openCount;
+  document.getElementById("creditors-tbody").innerHTML = filtered.map((c) => `
+    <tr>
+      <td><strong>${esc(c.supplier_name)}</strong></td>
+      <td>${fmt(c.accrued_due)}</td>
+      <td>${fmt(c.paid)}</td>
+      <td class="${c.balance > 0 ? "stock-low" : ""}"><strong>${fmt(c.balance)}</strong></td>
+      <td>${c.sales_count || 0}</td>
+      <td>
+        <button class="btn btn-ghost btn-sm" onclick="openCreditorSalesModal(${JSON.stringify(c.supplier_name)})">Продажи</button>
+        ${c.balance > 0 ? `<button class="btn btn-primary btn-sm" onclick="openCreditorPayModal(${JSON.stringify(c.supplier_name)})">Выплатить</button>` : ""}
+      </td>
+    </tr>`).join("") || '<tr><td colspan="6" style="text-align:center;color:var(--muted)">Нет поставщиков</td></tr>';
+  document.getElementById("creditors-payments-list").innerHTML = (data.recent_payments || []).slice(0, 15).map((p) => `
+    <div class="pay-row"><span>${esc(p.supplier_name)} · ${p.created_at?.slice(0, 10) || ""}</span><strong>−${fmt(p.amount)}</strong></div>
+  `).join("") || '<p style="color:var(--muted);font-size:.8rem">Нет выплат</p>';
+}
+
+window.openCreditorPayModal = (name) => {
+  payCreditorTarget = creditorsCache.find((c) => c.supplier_name === name) || { supplier_name: name, balance: 0 };
+  document.getElementById("creditor-pay-meta").innerHTML = `
+    <div class="metric-row"><span>${esc(payCreditorTarget.supplier_name)}</span><strong>Долг ${fmt(payCreditorTarget.balance || 0)}</strong></div>`;
+  document.getElementById("creditor-pay-amount").value = Math.max(0, payCreditorTarget.balance || 0);
+  document.getElementById("creditor-pay-notes").value = "";
+  fillPaySelect(document.getElementById("creditor-pay-method"));
+  document.getElementById("creditor-pay-modal").showModal();
+};
+
+window.openCreditorSalesModal = async (name) => {
+  const rows = await api(`/api/creditors/sales?supplier_name=${encodeURIComponent(name)}`);
+  document.getElementById("creditor-sales-title").textContent = `Продажи — ${name}`;
+  document.getElementById("creditor-sales-tbody").innerHTML = rows.map((r) => `
+    <tr>
+      <td>${esc(r.created_at?.slice(0, 10) || "")}</td>
+      <td>#${r.sale_id}</td>
+      <td>${esc(r.product_name)}</td>
+      <td>${esc(r.warehouse_name || "—")}</td>
+      <td>${fmt(r.subtotal)}</td>
+      <td><strong>${fmt(r.supplier_due)}</strong></td>
+      <td><button class="btn btn-ghost btn-sm" onclick="document.getElementById('creditor-sales-modal').close();showSale(${r.sale_id})">Детали</button></td>
+    </tr>`).join("") || '<tr><td colspan="7" style="text-align:center;color:var(--muted)">Нет продаж</td></tr>';
+  document.getElementById("creditor-sales-modal").showModal();
 };
 
 /* ── Analytics ── */
