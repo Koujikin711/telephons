@@ -1813,8 +1813,9 @@ def _z_register_lines(
     year: int | None = None,
     month: int | None = None,
 ) -> dict[str, Any]:
+    condition_clause = _z_register_condition_clause(conn, warehouse_id)
     rows = conn.execute(
-        """
+        f"""
         SELECT u.id AS unit_id, u.arrival_date, u.imei, u.serial, u.battery_capacity,
                u.client_name, u.region, u.customs_price AS extra_cost, u.status, u.notes,
                p.name AS product_name, p.model, p.memory, p.color, p.purchase_price, p.condition,
@@ -1825,7 +1826,7 @@ def _z_register_lines(
         LEFT JOIN sale_item_units siu ON siu.unit_id = u.id
         LEFT JOIN sale_items si ON si.id = siu.sale_item_id
         LEFT JOIN sales s ON s.id = si.sale_id AND s.status = 'completed'
-        WHERE u.warehouse_id = ?{_z_register_condition_clause(conn, warehouse_id)}
+        WHERE u.warehouse_id = ?{condition_clause}
         ORDER BY COALESCE(u.arrival_date, u.created_at), p.name, u.id
         """,
         (warehouse_id,),
