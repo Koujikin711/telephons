@@ -2044,7 +2044,7 @@ async function loadWhZReport() {
 async function importWhZExcel(e) {
   const file = e.target.files?.[0];
   if (!file) return;
-  if (!confirm("Перезаписать данные Z-отчёта из Excel? Старые импортированные строки будут удалены.")) {
+  if (!confirm("Перезаписать Z-отчёт из Excel? Импортированные строки складов (БУ и основной) будут заменены. Склад «Аксессуары» не затрагивается.")) {
     e.target.value = "";
     return;
   }

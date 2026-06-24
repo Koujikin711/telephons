@@ -325,7 +325,6 @@ def migrate_db(conn: sqlite3.Connection) -> None:
         _fix_z_register_warehouse_split(conn)
         _reclassify_phones_from_accessories(conn)
         _dedupe_accessory_products(conn)
-        _fix_misclassified_accessories(conn)
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS unit_reservations (
@@ -2097,7 +2096,6 @@ def import_z_register_excel(
     results: dict[str, Any] = {"sheets": {}}
     if replace:
         results["reset"] = reset_z_register_import(conn)
-        results["reset_accessories"] = reset_accessories_z_import(conn)
     wb = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
     targets: list[tuple[str, str, int]] = []
     if sheet and sheet in wb.sheetnames:
@@ -2117,22 +2115,9 @@ def import_z_register_excel(
     for sn, kind, wh_id in targets:
         ws = wb[sn]
         rows = _parse_z_register_sheet(ws, kind)
-        if kind == "new":
-            phone_rows = [r for r in rows if _z_row_is_phone(r)]
-            acc_rows = [r for r in rows if not _z_row_is_phone(r)]
-            results["sheets"][sn] = _import_z_register_rows(
-                conn, phone_rows, wh_id, sheet_kind=kind
-            ) | {"warehouse_id": wh_id, "kind": kind}
-            if acc_rows:
-                acc_wh = resolve_accessories_warehouse_id(conn)
-                acc_res = _import_accessory_z_rows(conn, acc_rows, acc_wh)
-                results["sheets"]["аксессуары (из доллари)"] = acc_res | {
-                    "warehouse_id": acc_wh, "kind": "accessory"
-                }
-        else:
-            results["sheets"][sn] = _import_z_register_rows(
-                conn, rows, wh_id, sheet_kind=kind
-            ) | {"warehouse_id": wh_id, "kind": kind}
+        results["sheets"][sn] = _import_z_register_rows(
+            conn, rows, wh_id, sheet_kind=kind
+        ) | {"warehouse_id": wh_id, "kind": kind}
     for sn in wb.sheetnames:
         low = sn.lower().replace(" ", "")
         if low in ("опу", "opu", "опиу", "opiu", "p&l", "pnl"):
