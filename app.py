@@ -1558,27 +1558,17 @@ def _rebuild_all_warehouse_stock(conn: sqlite3.Connection) -> None:
 
 def reset_z_register_import(conn: sqlite3.Connection) -> dict[str, int]:
     unit_ids: set[int] = set()
+    try:
+        bu_id = resolve_bu_warehouse_id(conn)
+        main_id = get_default_warehouse_id(conn)
+    except HTTPException:
+        return {"deleted_sales": 0, "deleted_units": 0}
+    for wh_id in (main_id, bu_id):
+        for r in conn.execute("SELECT id FROM product_units WHERE warehouse_id = ?", (wh_id,)).fetchall():
+            unit_ids.add(int(r["id"]))
     sale_ids = [int(r["id"]) for r in conn.execute(
         "SELECT id FROM sales WHERE user_name = 'Z-импорт'"
     ).fetchall()]
-    for sid in sale_ids:
-        for r in conn.execute(
-            """
-            SELECT siu.unit_id FROM sale_item_units siu
-            JOIN sale_items si ON si.id = siu.sale_item_id
-            WHERE si.sale_id = ?
-            """,
-            (sid,),
-        ).fetchall():
-            unit_ids.add(int(r["unit_id"]))
-    for r in conn.execute(
-        """
-        SELECT id FROM product_units
-        WHERE notes LIKE 'Z-импорт%' OR serial GLOB 'Z[0-9]*-*'
-        """
-    ).fetchall():
-        unit_ids.add(int(r["id"]))
-
     for sid in sale_ids:
         conn.execute("DELETE FROM receivables WHERE sale_id = ?", (sid,))
         conn.execute(
