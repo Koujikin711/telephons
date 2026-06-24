@@ -224,7 +224,12 @@
               <div id="sales-import-result" class="import-result hidden"></div>
             </div>
           </div>
-          <div class="card"><div class="table-wrap"><table class="data-table">
+          <div class="card">
+            <div class="card-header">
+              <h3>Список продаж</h3>
+              <button type="button" id="sales-toggle-all-detail" class="btn btn-secondary btn-sm" disabled>Детализация</button>
+            </div>
+            <div class="table-wrap"><table class="data-table">
             <thead><tr><th>№</th><th>Дата</th><th>Склад</th><th>Кассир</th><th>Сумма</th><th>Оплата</th><th></th></tr></thead>
             <tbody id="sales-tbody"></tbody>
           </table></div></div>
@@ -1116,6 +1121,6 @@
   </dialog>
 
   <div id="toast" class="toast"></div>
-  <script src="/static/app.js?v=33"></script>
+  <script src="/static/app.js?v=34"></script>
 </body>
 </html>

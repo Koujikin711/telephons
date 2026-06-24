@@ -1287,9 +1287,11 @@ function bindSales() {
   document.getElementById("sales-download-template")?.addEventListener("click", downloadSalesImportTemplate);
   document.getElementById("sales-import-file")?.addEventListener("change", onSalesImportFileSelected);
   document.getElementById("sales-import-form")?.addEventListener("submit", submitSalesImport);
+  document.getElementById("sales-toggle-all-detail")?.addEventListener("click", toggleAllSalesDetail);
 }
 
 let salesImportFile = null;
+let salesAllExpanded = false;
 
 function onSalesImportFileSelected(e) {
   salesImportFile = e.target.files?.[0] || null;
@@ -1398,39 +1400,47 @@ function renderSaleItemsBlock(sale) {
     <div class="sale-detail-total">Итого: ${saleFmt(sale, sale.total)}</div>`;
 }
 
-window.toggleSaleDetail = async (id, btn) => {
-  const row = btn?.closest("tr");
-  if (!row) return;
-  const next = row.nextElementSibling;
-  if (next?.classList?.contains("sale-detail-row") && next.dataset.detailFor === String(id)) {
-    next.remove();
-    btn.textContent = "Детализация";
-    row.classList.remove("sale-row-open");
-    return;
-  }
+function collapseAllSalesDetails() {
   document.querySelectorAll(".sale-detail-row").forEach((el) => el.remove());
   document.querySelectorAll(".sale-row-open").forEach((el) => el.classList.remove("sale-row-open"));
-  document.querySelectorAll("[data-sale-detail-btn]").forEach((b) => { b.textContent = "Детализация"; });
+  salesAllExpanded = false;
+  const btn = document.getElementById("sales-toggle-all-detail");
+  if (btn && btn.textContent === "Свернуть") btn.textContent = "Детализация";
+}
+
+async function toggleAllSalesDetail() {
+  const btn = document.getElementById("sales-toggle-all-detail");
+  if (!btn) return;
+  if (salesAllExpanded) {
+    collapseAllSalesDetails();
+    return;
+  }
+  const rows = [...document.querySelectorAll("#sales-tbody tr.sale-row")];
+  if (!rows.length) return;
   btn.disabled = true;
-  const prev = btn.textContent;
-  btn.textContent = "…";
+  const prevText = btn.textContent;
+  btn.textContent = "Загрузка…";
   try {
-    const sale = await api(`/api/sales/${id}`);
-    const detailRow = document.createElement("tr");
-    detailRow.className = "sale-detail-row";
-    detailRow.dataset.detailFor = String(id);
-    detailRow.innerHTML = `<td colspan="7"><div class="sale-inline-detail">${renderSaleItemsBlock(sale)}</div></td>`;
-    row.after(detailRow);
-    row.classList.add("sale-row-open");
+    const sales = await Promise.all(rows.map((r) => api(`/api/sales/${r.dataset.saleId}`)));
+    rows.forEach((row, i) => {
+      const sale = sales[i];
+      const detailRow = document.createElement("tr");
+      detailRow.className = "sale-detail-row";
+      detailRow.dataset.detailFor = String(sale.id);
+      detailRow.innerHTML = `<td colspan="7"><div class="sale-inline-detail">${renderSaleItemsBlock(sale)}</div></td>`;
+      row.after(detailRow);
+      row.classList.add("sale-row-open");
+    });
+    salesAllExpanded = true;
     btn.textContent = "Свернуть";
-    btn.dataset.saleDetailBtn = "1";
   } catch (e) {
     toast(e.message, "error");
-    btn.textContent = prev;
+    collapseAllSalesDetails();
+    btn.textContent = prevText;
   } finally {
     btn.disabled = false;
   }
-};
+}
 
 async function loadSales() {
   if (!warehouses.length) await loadWarehouses();
@@ -1453,11 +1463,16 @@ async function loadSales() {
   if (wh) url += `&warehouse_id=${encodeURIComponent(wh)}`;
   const data = await api(url);
   const tb = document.getElementById("sales-tbody");
+  const detailBtn = document.getElementById("sales-toggle-all-detail");
+  salesAllExpanded = false;
+  if (detailBtn) detailBtn.textContent = "Детализация";
   const countHint = data.total != null ? ` · найдено ${data.total}` : "";
   if (!data.items.length) {
     tb.innerHTML = `<tr><td colspan="7" style="text-align:center;color:var(--muted)">Нет продаж${countHint}</td></tr>`;
+    if (detailBtn) detailBtn.disabled = true;
     return;
   }
+  if (detailBtn) detailBtn.disabled = false;
   tb.innerHTML = data.items.map((s) => `
     <tr class="sale-row" data-sale-id="${s.id}">
       <td><strong>#${s.id}</strong></td>
@@ -1467,7 +1482,6 @@ async function loadSales() {
       <td><strong>${saleFmt(s, s.total)}</strong></td>
       <td style="font-size:.85rem">${formatPaySummary(s)}</td>
       <td class="sales-actions">
-        <button class="btn btn-ghost btn-sm" data-sale-detail-btn onclick="toggleSaleDetail(${s.id}, this)">Детализация</button>
         <button class="btn btn-ghost btn-sm" onclick="showSale(${s.id})">Детали</button>
         <button class="btn btn-ghost btn-sm" onclick="printSaleReceipt(${s.id})">Чек</button>
       </td>
