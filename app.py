@@ -323,6 +323,8 @@ def migrate_db(conn: sqlite3.Connection) -> None:
         _merge_duplicate_accessories_warehouses(conn)
         _set_warehouse_currencies(conn)
         _fix_z_register_warehouse_split(conn)
+        _reclassify_phones_from_accessories(conn)
+        _dedupe_accessory_products(conn)
         _fix_misclassified_accessories(conn)
     conn.executescript(
         """
@@ -1491,14 +1493,14 @@ def _merge_duplicate_accessories_warehouses(conn: sqlite3.Connection) -> None:
 PHONE_NAME_HINTS = (
     "iphone", "samsung", "xiaomi", "huawei", "pixel", "oneplus", "redmi",
     "honor", "oppo", "vivo", "realme", "poco", "nokia", "sony", "google", "tecno", "infinix", "meizu",
+    "ipad", "macbook", "apple watch",
 )
 
 ACCESSORY_NAME_HINTS = (
-    "dyson", "whoop", "pencil", "чехол", "case", "cover", "стекл", "glass",
+    "dyson", "whoop", "pencil", "pancil", "чехол", "case", "cover", "стекл", "glass",
     "наушник", "headphone", "earphone", "air pod", "airpod", "pods max", "pods pro", "pods ",
-    "apple watch", " watch", "watch ultra", "watch se", " aw ",
     "powerbank", "power bank", "заряд", "charger", "кабель", "cable",
-    "ipad", "macbook", "magic", "keyboard", "клавиатур",
+    "magic keyboard", "клавиатур",
     "аксессуар", "accessory", "holder", "подставк", "stand", "band", "ремеш",
 )
 
@@ -1506,8 +1508,10 @@ ACCESSORY_NAME_HINTS = (
 def _z_row_is_phone(row: dict[str, Any]) -> bool:
     name = (row.get("name") or "").lower().strip()
     nm = f" {name} "
-    if name.startswith("aw ") or any(h in name or h in nm for h in ACCESSORY_NAME_HINTS):
+    if any(h in name or h in nm for h in ACCESSORY_NAME_HINTS):
         return False
+    if name.startswith("aw ") or name.startswith("apple watch") or "ipad" in name or "macbook" in name:
+        return True
     memory = (row.get("memory") or "").strip().lower().replace("gb", "").replace("tb", "").strip()
     if memory and memory.isdigit():
         return True
@@ -1886,16 +1890,15 @@ def _import_accessory_z_rows(
         sale_price = row["sale_price"]
         sale_date = row["sale_date"]
         profit = row["profit"]
-        model = row.get("region") or row.get("comments") or ""
+        model = (row.get("comments") or "").strip()
 
         existing = conn.execute(
             """
             SELECT id FROM products
             WHERE category = 'accessory' AND LOWER(TRIM(name)) = LOWER(TRIM(?))
-              AND LOWER(TRIM(COALESCE(model, ''))) = LOWER(TRIM(?))
             LIMIT 1
             """,
-            (name, model),
+            (name,),
         ).fetchone()
         if existing:
             product_id = int(existing["id"])
@@ -2158,6 +2161,98 @@ def get_warehouse_receipt_kind(conn: sqlite3.Connection, warehouse_id: int) -> s
     if "бу" in name or "б/у" in name or "б у" in name:
         return "used"
     return "new"
+
+
+def _normalize_accessory_name(name: str) -> str:
+    return " ".join((name or "").lower().split())
+
+
+def _dedupe_accessory_products(conn: sqlite3.Connection) -> None:
+    try:
+        acc_wh = resolve_accessories_warehouse_id(conn)
+    except HTTPException:
+        return
+    groups: dict[str, list[int]] = {}
+    for r in conn.execute("SELECT id, name FROM products WHERE category = 'accessory'").fetchall():
+        key = _normalize_accessory_name(r["name"])
+        if not key:
+            continue
+        groups.setdefault(key, []).append(int(r["id"]))
+    changed = False
+    for ids in groups.values():
+        if len(ids) < 2:
+            continue
+        primary_id = min(ids)
+        for dup_id in ids:
+            if dup_id == primary_id:
+                continue
+            qty = get_warehouse_stock(conn, acc_wh, dup_id)
+            if qty > 0:
+                adjust_warehouse_stock(
+                    conn, acc_wh, dup_id, -qty, "transfer", notes="Слияние дубликата аксессуара",
+                )
+                adjust_warehouse_stock(
+                    conn, acc_wh, primary_id, qty, "transfer", notes="Слияние дубликата аксессуара",
+                )
+            conn.execute("UPDATE sale_items SET product_id = ? WHERE product_id = ?", (primary_id, dup_id))
+            conn.execute("DELETE FROM warehouse_stock WHERE product_id = ?", (dup_id,))
+            conn.execute("DELETE FROM products WHERE id = ?", (dup_id,))
+            changed = True
+    if changed:
+        for pid_row in conn.execute("SELECT id FROM products WHERE category = 'accessory'").fetchall():
+            sync_product_stock(conn, int(pid_row["id"]))
+
+
+def _reclassify_phones_from_accessories(conn: sqlite3.Connection) -> None:
+    if not _table_exists(conn, "warehouse_stock"):
+        return
+    try:
+        acc_wh = resolve_accessories_warehouse_id(conn)
+        main_id = get_default_warehouse_id(conn)
+    except HTTPException:
+        return
+    moved = False
+    rows = conn.execute(
+        "SELECT id, name, memory FROM products WHERE category = 'accessory'"
+    ).fetchall()
+    for r in rows:
+        if not _z_row_is_phone({"name": r["name"], "memory": r["memory"] or ""}):
+            continue
+        pid = int(r["id"])
+        name = r["name"] or ""
+        conn.execute(
+            "UPDATE products SET category = 'phone', track_units = 1, condition = 'new' WHERE id = ?",
+            (pid,),
+        )
+        qty = get_warehouse_stock(conn, acc_wh, pid)
+        if qty > 0:
+            adjust_warehouse_stock(
+                conn, acc_wh, pid, -qty, "transfer", notes=f"Перенос на основной склад: {name}",
+            )
+            for i in range(qty):
+                conn.execute(
+                    """
+                    INSERT INTO product_units
+                    (product_id, warehouse_id, imei, serial, status, notes, created_at,
+                     customs_status, customs_cleared, customs_price, battery_capacity,
+                     client_name, region, arrival_date)
+                    VALUES (?, ?, '', ?, 'in_stock', 'Перенос с аксессуаров', ?, 'none', 0, 0, NULL, '', '', '')
+                    """,
+                    (pid, main_id, f"ACC{pid}-{i + 1}", utc_now()),
+                )
+                adjust_warehouse_stock(
+                    conn, main_id, pid, 1, "transfer", notes=f"Перенос с аксессуаров: {name}",
+                )
+            moved = True
+        conn.execute(
+            """
+            UPDATE sales SET warehouse_id = ?
+            WHERE warehouse_id = ? AND id IN (SELECT sale_id FROM sale_items WHERE product_id = ?)
+            """,
+            (main_id, acc_wh, pid),
+        )
+    if moved:
+        _rebuild_all_warehouse_stock(conn)
 
 
 def _fix_misclassified_accessories(conn: sqlite3.Connection) -> None:
