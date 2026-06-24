@@ -390,6 +390,7 @@ def migrate_db(conn: sqlite3.Connection) -> None:
         _set_warehouse_currencies(conn)
         _fix_z_register_warehouse_split(conn)
         _sync_product_purchase_from_sales(conn)
+        _sync_receivables_for_voided_sales(conn)
         _reclassify_phones_from_accessories(conn)
         try:
             _dedupe_accessory_products(conn)
@@ -2881,6 +2882,37 @@ def create_receivable(
     return int(cur.lastrowid)
 
 
+def _close_receivables_for_return(conn: sqlite3.Connection, sale_id: int, now: str) -> None:
+    """Закрыть долг клиента при возврате (полный или частичный)."""
+    conn.execute(
+        """
+        UPDATE receivables
+        SET status = 'closed', amount_due = 0,
+            closed_at = ?,
+            notes = TRIM(COALESCE(notes, '') || ?)
+        WHERE sale_id = ?
+          AND (status = 'open' OR amount_due > 0.001)
+        """,
+        (now, f" Закрыто: возврат продажи #{sale_id}", sale_id),
+    )
+
+
+def _sync_receivables_for_voided_sales(conn: sqlite3.Connection) -> None:
+    """Убрать из дебиторки долги по уже отменённым продажам."""
+    now = utc_now()
+    conn.execute(
+        """
+        UPDATE receivables
+        SET status = 'closed', amount_due = 0,
+            closed_at = COALESCE(closed_at, ?),
+            notes = TRIM(COALESCE(notes, '') || ' [Авто: продажа отменена]')
+        WHERE sale_id IN (SELECT id FROM sales WHERE status = 'voided')
+          AND (status = 'open' OR amount_due > 0.001)
+        """,
+        (now,),
+    )
+
+
 def get_expense_warehouse_split(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     rows = conn.execute(
         """
@@ -4170,8 +4202,9 @@ async def list_receivables(
                    (SELECT GROUP_CONCAT(si.product_name, ', ')
                     FROM sale_items si WHERE si.sale_id = r.sale_id) AS products
             FROM receivables r
+            LEFT JOIN sales s ON s.id = r.sale_id
             LEFT JOIN warehouses w ON w.id = r.warehouse_id
-            WHERE 1=1
+            WHERE (r.sale_id IS NULL OR s.status != 'voided')
         """
         params: list[Any] = []
         if status:
@@ -4195,6 +4228,12 @@ async def pay_receivable(
             raise HTTPException(status_code=404, detail="Долг не найден")
         if row["status"] == "closed":
             raise HTTPException(status_code=400, detail="Долг уже закрыт")
+        if row["sale_id"]:
+            sale_row = conn.execute(
+                "SELECT status FROM sales WHERE id = ?", (row["sale_id"],)
+            ).fetchone()
+            if sale_row and sale_row["status"] == "voided":
+                raise HTTPException(status_code=400, detail="Продажа отменена — долг снят")
         due = float(row["amount_due"])
         if body.amount > due + 0.01:
             raise HTTPException(status_code=400, detail=f"Сумма больше долга ({due:.2f})")
@@ -6515,23 +6554,12 @@ async def void_sale(sale_id: int, x_pin: str | None = Header(default=None, alias
                     conn, warehouse_id, item["product_id"], item["quantity"],
                     "void", reference_id=sale_id, notes=f"Возврат продажи #{sale_id}",
                 )
-        for rec in conn.execute(
-            "SELECT * FROM receivables WHERE sale_id = ? AND status = 'open'", (sale_id,)
-        ).fetchall():
-            conn.execute(
-                """
-                UPDATE receivables
-                SET status = 'closed', amount_due = 0, paid_amount = total_amount,
-                    closed_at = ?, notes = TRIM(COALESCE(notes, '') || ?)
-                WHERE id = ?
-                """,
-                (now, f"Закрыто: возврат продажи #{sale_id}", rec["id"]),
-            )
+        _close_receivables_for_return(conn, sale_id, now)
         note_suffix = f" [Возврат {now[:10]}]"
         conn.execute(
             """
             UPDATE sales
-            SET status = 'voided', amount_due = 0,
+            SET status = 'voided', amount_due = 0, amount_paid = 0,
                 notes = TRIM(COALESCE(notes, '') || ?)
             WHERE id = ?
             """,
@@ -7053,7 +7081,12 @@ def _report_balance(conn: sqlite3.Connection) -> dict[str, Any]:
         ).fetchone()[0]
         supplier_payable += max(0, float(s["accrued"]) - float(paid))
     receivables_total = conn.execute(
-        "SELECT COALESCE(SUM(amount_due), 0) FROM receivables WHERE status = 'open'"
+        """
+        SELECT COALESCE(SUM(r.amount_due), 0)
+        FROM receivables r
+        JOIN sales s ON s.id = r.sale_id
+        WHERE r.status = 'open' AND s.status = 'completed'
+        """
     ).fetchone()[0]
     assets = cash_balance + float(inventory) + float(receivables_total)
     liabilities = supplier_payable
