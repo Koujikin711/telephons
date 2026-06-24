@@ -2059,10 +2059,13 @@ async function importWhZExcel(e) {
       throw new Error(err.detail || `Ошибка ${res.status}`);
     }
     const r = await res.json();
-    const summary = Object.entries(r.sheets || {}).map(([k, v]) =>
-      `${k}: ${v.created_units} шт, продано ${v.sold_units}`
-    ).join("; ");
-    toast(`Импорт: ${summary}`);
+    const summary = Object.entries(r.sheets || {}).map(([k, v]) => {
+      let line = `${k}: ${v.created_units} шт, продано ${v.sold_units}`;
+      if (v.skipped_duplicates) line += `, пропущено ${v.skipped_duplicates}`;
+      return line;
+    }).join("; ");
+    const warn = Object.values(r.sheets || {}).flatMap((v) => v.errors || []).slice(0, 5);
+    toast(warn.length ? `Импорт: ${summary}. ${warn.join("; ")}` : `Импорт: ${summary}`, warn.length ? "info" : "success");
     e.target.value = "";
     loadWhZReport();
     if (whViewMode !== "zreport") loadWarehouseStock();

@@ -1370,7 +1370,9 @@ def _z_cell_float(val: Any) -> float | None:
         return None
     if isinstance(val, (int, float)):
         return float(val)
-    s = str(val).strip().replace(" ", "").replace(",", ".").replace("$", "").replace("смн", "")
+    s = str(val).strip().replace(" ", "").replace(",", ".")
+    for tok in ("$", "смн", "смн.", "TJS", "tjs", "USD", "usd"):
+        s = s.replace(tok, "")
     if not s:
         return None
     try:
@@ -1690,119 +1692,175 @@ def _import_z_register_rows(
     errors: list[str] = []
     expected_condition = "new" if sheet_kind == "new" else "used"
     currency_code = get_warehouse_currency(conn, warehouse_id)["code"]
+
+    def record_sale(
+        *,
+        row: dict[str, Any],
+        product_id: int,
+        unit_id: int,
+        name: str,
+        purchase: float,
+        extra: float,
+        imei: str,
+        serial: str,
+        sale_price: float,
+        sale_date: str,
+        profit: float | None,
+    ) -> None:
+        nonlocal sold
+        shop_profit = profit if profit is not None else (sale_price - purchase - extra)
+        total = float(sale_price)
+        cur_s = conn.execute(
+            """
+            INSERT INTO sales
+            (total, discount, payment_method, status, notes, created_at,
+             warehouse_id, cash_amount, card_amount, trade_in_value, shift_id, user_id, user_name,
+             amount_paid, amount_due, currency_code)
+            VALUES (?, 0, 'cash', 'completed', ?, ?, ?, ?, 0, 0, NULL, NULL, 'Z-импорт', ?, 0, ?)
+            """,
+            (total, row["comments"] or "Z-импорт Excel", sale_date, warehouse_id, total, total, currency_code),
+        )
+        sale_id = int(cur_s.lastrowid)
+        insert_sale_payments(conn, sale_id, [{"method_code": "cash", "amount": total}])
+        cur_item = conn.execute(
+            """
+            INSERT INTO sale_items
+            (sale_id, product_id, product_name, ownership_type, supplier_name, quantity,
+             unit_price, purchase_price, supplier_due, shop_profit, subtotal)
+            VALUES (?, ?, ?, 'own', '', 1, ?, ?, 0, ?, ?)
+            """,
+            (sale_id, product_id, name, total, purchase, shop_profit, total),
+        )
+        sale_item_id = int(cur_item.lastrowid)
+        conn.execute(
+            """
+            INSERT INTO sale_item_units
+            (sale_item_id, unit_id, imei, serial, customs_cleared, customs_price, imei_pending)
+            VALUES (?, ?, ?, ?, 0, ?, 0)
+            """,
+            (sale_item_id, unit_id, imei, serial, extra),
+        )
+        mark_unit_sold_full(conn, unit_id, sale_id, imei, 0, extra)
+        adjust_warehouse_stock(conn, warehouse_id, product_id, -1, "sale", reference_id=sale_id)
+        sold += 1
+
     for row in rows:
         name = row["name"]
         imei = row["imei"]
         if imei.lower() in ("id", "none", "n/a", ""):
             imei = ""
-        if imei:
-            dup = conn.execute(
-                "SELECT id FROM product_units WHERE imei = ? AND imei != ''", (imei,)
-            ).fetchone()
-            if dup:
-                skipped += 1
-                continue
         purchase = float(row["purchase_price"])
         extra = float(row["extra_cost"])
         sale_price = row["sale_price"]
         sale_date = row["sale_date"]
         profit = row["profit"]
+        has_sale = bool(sale_price and sale_price > 0 and sale_date)
+        if sale_price and sale_price > 0 and not sale_date:
+            errors.append(f"Строка {row['row_num']}: {name} — нет даты продажи")
         condition = expected_condition
         memory = row["memory"]
         color = row["color"]
         serial = imei if imei else f"Z{row['row_num']}-{warehouse_id}"
+        reuse_unit: sqlite3.Row | None = None
 
-        existing = conn.execute(
-            """
-            SELECT id FROM products
-            WHERE category = 'phone' AND LOWER(TRIM(name)) = LOWER(TRIM(?))
-              AND LOWER(TRIM(COALESCE(model, ''))) = LOWER(TRIM(?))
-              AND LOWER(TRIM(COALESCE(memory, ''))) = LOWER(TRIM(?))
-              AND LOWER(TRIM(COALESCE(color, ''))) = LOWER(TRIM(?))
-              AND condition = ?
-            LIMIT 1
-            """,
-            (name, name, memory, color, condition),
-        ).fetchone()
-        if existing:
-            product_id = int(existing["id"])
+        if imei:
+            in_stock = conn.execute(
+                """
+                SELECT id, product_id FROM product_units
+                WHERE imei = ? AND imei != '' AND status = 'in_stock' LIMIT 1
+                """,
+                (imei,),
+            ).fetchone()
+            if in_stock:
+                if has_sale:
+                    reuse_unit = in_stock
+                else:
+                    skipped += 1
+                    errors.append(f"Строка {row['row_num']}: IMEI {imei} уже на складе")
+                    continue
+            elif conn.execute(
+                "SELECT 1 FROM product_units WHERE imei = ? AND imei != '' LIMIT 1", (imei,)
+            ).fetchone() and not has_sale:
+                skipped += 1
+                errors.append(f"Строка {row['row_num']}: IMEI {imei} уже импортирован")
+                continue
+
+        if reuse_unit:
+            unit_id = int(reuse_unit["id"])
+            product_id = int(reuse_unit["product_id"])
             conn.execute(
-                "UPDATE products SET purchase_price = ?, sale_price = COALESCE(?, sale_price), condition = ? WHERE id = ?",
-                (purchase, sale_price, condition, product_id),
+                "UPDATE products SET purchase_price = ?, sale_price = COALESCE(?, sale_price) WHERE id = ?",
+                (purchase, sale_price, product_id),
             )
         else:
-            sp = sale_price if sale_price and sale_price > 0 else round(purchase * 1.15, 2)
-            cur = conn.execute(
+            existing = conn.execute(
                 """
-                INSERT INTO products
-                (name, category, ownership_type, supplier_name, brand, sku, barcode,
-                 purchase_price, sale_price, stock, min_stock, created_at,
-                 model, color, size, memory, ram, customs_cleared, customs_price, specs_extra,
-                 condition, track_units, image_url)
-                VALUES (?, 'phone', 'own', '', '', '', '', ?, ?, 0, 0, ?,
-                        ?, ?, '', ?, '', 0, 0, '', ?, 1, '')
+                SELECT id FROM products
+                WHERE category = 'phone' AND LOWER(TRIM(name)) = LOWER(TRIM(?))
+                  AND LOWER(TRIM(COALESCE(model, ''))) = LOWER(TRIM(?))
+                  AND LOWER(TRIM(COALESCE(memory, ''))) = LOWER(TRIM(?))
+                  AND LOWER(TRIM(COALESCE(color, ''))) = LOWER(TRIM(?))
+                  AND condition = ?
+                LIMIT 1
                 """,
-                (name, purchase, sp, utc_now(), name, color, memory, condition),
-            )
-            product_id = int(cur.lastrowid)
+                (name, name, memory, color, condition),
+            ).fetchone()
+            if existing:
+                product_id = int(existing["id"])
+                conn.execute(
+                    "UPDATE products SET purchase_price = ?, sale_price = COALESCE(?, sale_price), condition = ? WHERE id = ?",
+                    (purchase, sale_price, condition, product_id),
+                )
+            else:
+                sp = sale_price if sale_price and sale_price > 0 else round(purchase * 1.15, 2)
+                cur = conn.execute(
+                    """
+                    INSERT INTO products
+                    (name, category, ownership_type, supplier_name, brand, sku, barcode,
+                     purchase_price, sale_price, stock, min_stock, created_at,
+                     model, color, size, memory, ram, customs_cleared, customs_price, specs_extra,
+                     condition, track_units, image_url)
+                    VALUES (?, 'phone', 'own', '', '', '', '', ?, ?, 0, 0, ?,
+                            ?, ?, '', ?, '', 0, 0, '', ?, 1, '')
+                    """,
+                    (name, purchase, sp, utc_now(), name, color, memory, condition),
+                )
+                product_id = int(cur.lastrowid)
 
-        unit_notes = (row["comments"] or "").strip()
-        unit_notes = f"Z-импорт: {unit_notes}" if unit_notes else "Z-импорт Excel"
-        arrival = row["arrival_date"] or utc_now()
-        cur_u = conn.execute(
-            """
-            INSERT INTO product_units
-            (product_id, warehouse_id, imei, serial, status, notes, created_at,
-             customs_status, customs_cleared, customs_price, battery_capacity,
-             client_name, region, arrival_date)
-            VALUES (?, ?, ?, ?, 'in_stock', ?, ?, 'none', 0, ?, ?, ?, ?, ?)
-            """,
-            (
-                product_id, warehouse_id, imei, serial, unit_notes,
-                utc_now(), extra, row["battery"], row["comments"] or "", row["region"] or "",
-                (row["arrival_date"] or "")[:10],
-            ),
-        )
-        unit_id = int(cur_u.lastrowid)
-        adjust_warehouse_stock(conn, warehouse_id, product_id, 1, "inbound", notes=f"Z-импорт: {name}")
-        created_units += 1
+            unit_notes = (row["comments"] or "").strip()
+            unit_notes = f"Z-импорт: {unit_notes}" if unit_notes else "Z-импорт Excel"
+            cur_u = conn.execute(
+                """
+                INSERT INTO product_units
+                (product_id, warehouse_id, imei, serial, status, notes, created_at,
+                 customs_status, customs_cleared, customs_price, battery_capacity,
+                 client_name, region, arrival_date)
+                VALUES (?, ?, ?, ?, 'in_stock', ?, ?, 'none', 0, ?, ?, ?, ?, ?)
+                """,
+                (
+                    product_id, warehouse_id, imei, serial, unit_notes,
+                    utc_now(), extra, row["battery"], row["comments"] or "", row["region"] or "",
+                    (row["arrival_date"] or "")[:10],
+                ),
+            )
+            unit_id = int(cur_u.lastrowid)
+            adjust_warehouse_stock(conn, warehouse_id, product_id, 1, "inbound", notes=f"Z-импорт: {name}")
+            created_units += 1
 
-        if sale_price and sale_price > 0 and sale_date:
-            shop_profit = profit if profit is not None else (sale_price - purchase - extra)
-            total = float(sale_price)
-            cur_s = conn.execute(
-                """
-                INSERT INTO sales
-                (total, discount, payment_method, status, notes, created_at,
-                 warehouse_id, cash_amount, card_amount, trade_in_value, shift_id, user_id, user_name,
-                 amount_paid, amount_due, currency_code)
-                VALUES (?, 0, 'cash', 'completed', ?, ?, ?, ?, 0, 0, NULL, NULL, 'Z-импорт', ?, 0, ?)
-                """,
-                (total, row["comments"] or "Z-импорт Excel", sale_date, warehouse_id, total, total, currency_code),
+        if has_sale:
+            record_sale(
+                row=row,
+                product_id=product_id,
+                unit_id=unit_id,
+                name=name,
+                purchase=purchase,
+                extra=extra,
+                imei=imei,
+                serial=serial,
+                sale_price=float(sale_price),
+                sale_date=sale_date,
+                profit=profit,
             )
-            sale_id = int(cur_s.lastrowid)
-            insert_sale_payments(conn, sale_id, [{"method_code": "cash", "amount": total}])
-            cur_item = conn.execute(
-                """
-                INSERT INTO sale_items
-                (sale_id, product_id, product_name, ownership_type, supplier_name, quantity,
-                 unit_price, purchase_price, supplier_due, shop_profit, subtotal)
-                VALUES (?, ?, ?, 'own', '', 1, ?, ?, 0, ?, ?)
-                """,
-                (sale_id, product_id, name, total, purchase, shop_profit, total),
-            )
-            sale_item_id = int(cur_item.lastrowid)
-            conn.execute(
-                """
-                INSERT INTO sale_item_units
-                (sale_item_id, unit_id, imei, serial, customs_cleared, customs_price, imei_pending)
-                VALUES (?, ?, ?, ?, 0, ?, 0)
-                """,
-                (sale_item_id, unit_id, imei, serial, extra),
-            )
-            mark_unit_sold_full(conn, unit_id, sale_id, imei, 0, extra)
-            adjust_warehouse_stock(conn, warehouse_id, product_id, -1, "sale", reference_id=sale_id)
-            sold += 1
 
     return {
         "created_units": created_units,
@@ -2036,6 +2094,7 @@ def import_z_register_excel(
     results: dict[str, Any] = {"sheets": {}}
     if replace:
         results["reset"] = reset_z_register_import(conn)
+        results["reset_accessories"] = reset_accessories_z_import(conn)
     wb = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
     targets: list[tuple[str, str, int]] = []
     if sheet and sheet in wb.sheetnames:
