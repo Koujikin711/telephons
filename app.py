@@ -5892,39 +5892,49 @@ async def list_sales(
     date_from: str = "",
     date_to: str = "",
     ownership_type: str = "",
+    warehouse_id: int | None = None,
     user_id: int | None = None,
     x_pin: str | None = Header(default=None, alias="X-Pin"),
 ):
     check_pin(x_pin)
+    joins: list[str] = []
+    wheres = ["s.status = 'completed'"]
+    params: list[Any] = []
     if ownership_type:
-        sql = """
-            SELECT DISTINCT s.* FROM sales s
-            JOIN sale_items si ON si.sale_id = s.id
-            WHERE s.status = 'completed' AND si.ownership_type = ?
-        """
-        params: list[Any] = [ownership_type]
-    else:
-        sql = "SELECT * FROM sales WHERE status = 'completed'"
-        params = []
+        joins.append("JOIN sale_items si ON si.sale_id = s.id")
+        wheres.append("si.ownership_type = ?")
+        params.append(ownership_type)
+    if warehouse_id is not None:
+        wheres.append("s.warehouse_id = ?")
+        params.append(warehouse_id)
     if user_id is not None:
-        sql += " AND s.user_id = ?" if ownership_type else " AND user_id = ?"
+        wheres.append("s.user_id = ?")
         params.append(user_id)
-    df, dp = date_filter_sql(date_from, date_to, "s.created_at" if ownership_type else "created_at")
-    sql += df.replace("s.created_at", "created_at") if not ownership_type else df
+    df, dp = date_filter_sql(date_from, date_to, "s.created_at")
     params.extend(dp)
-    sql += f" ORDER BY {'s.' if ownership_type else ''}created_at DESC LIMIT ? OFFSET ?"
+    join_sql = " " + " ".join(joins) if joins else ""
+    where_sql = " AND ".join(wheres)
+    sql = f"SELECT DISTINCT s.* FROM sales s{join_sql} WHERE {where_sql}{df} ORDER BY s.created_at DESC LIMIT ? OFFSET ?"
     params.extend([limit, offset])
+    count_sql = f"SELECT COUNT(DISTINCT s.id) FROM sales s{join_sql} WHERE {where_sql}{df}"
+    count_params = params[:-2]
     with db() as conn:
         sales = conn.execute(sql, params).fetchall()
-        total_count = conn.execute("SELECT COUNT(*) FROM sales WHERE status = 'completed'").fetchone()[0]
+        total_count = conn.execute(count_sql, count_params).fetchone()[0]
+        wh_map = {
+            int(r["id"]): r["name"]
+            for r in conn.execute("SELECT id, name FROM warehouses").fetchall()
+        }
         sale_ids = [s["id"] for s in sales]
         pay_map = payments_for_sales(conn, sale_ids)
     items = []
     for s in sales:
         d = row_to_dict(s)
         d["payments"] = pay_map.get(s["id"], [])
+        wid = int(s["warehouse_id"]) if s["warehouse_id"] else None
+        d["warehouse_name"] = wh_map.get(wid, "—") if wid else "—"
         items.append(d)
-    return {"items": items, "total": total_count}
+    return {"items": items, "total": int(total_count)}
 
 
 @app.get("/api/sales/{sale_id}")

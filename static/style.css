@@ -643,6 +643,32 @@ body {
 .kpi-detail-block { margin-bottom: 1rem; }
 .kpi-detail-block h4 { margin: 0 0 0.5rem; font-size: 0.9rem; }
 .kpi-detail-table { max-height: 420px; overflow: auto; margin-bottom: 0.5rem; }
+.sale-row-open td { border-bottom: none; }
+.sale-detail-row td {
+  padding: 0 !important;
+  background: var(--surface-2, #f6f4fb);
+  border-bottom: 1px solid var(--border);
+}
+.sale-inline-detail { padding: 0.65rem 1rem 1rem; }
+.sale-detail-meta {
+  margin: 0 0 0.6rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+.sale-detail-table { margin: 0; font-size: 0.88rem; }
+.sale-detail-table thead th {
+  background: #ece8f5;
+  font-size: 0.72rem;
+  letter-spacing: 0.04em;
+}
+.sale-detail-total {
+  margin-top: 0.75rem;
+  text-align: right;
+  font-weight: 700;
+  font-size: 1.05rem;
+}
+.sales-actions { white-space: nowrap; }
+.sales-actions .btn-sm { padding: 0.2rem 0.45rem; font-size: 0.78rem; }
 .pos-layout-3 {
   display: grid;
   grid-template-columns: 1fr 340px 360px;

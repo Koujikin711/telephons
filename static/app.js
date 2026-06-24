@@ -1277,7 +1277,7 @@ el("receipt-print")?.addEventListener("click", () => {
 /* ── Sales ── */
 function bindSales() {
   document.getElementById("refresh-sales").onclick = loadSales;
-  ["sales-from", "sales-to", "sales-ownership"].forEach((id) => {
+  ["sales-from", "sales-to", "sales-ownership", "sales-warehouse"].forEach((id) => {
     document.getElementById(id).addEventListener("change", loadSales);
   });
   document.getElementById("sale-detail-close").onclick = () => document.getElementById("sale-detail-modal").close();
@@ -1383,25 +1383,91 @@ async function submitSalesImport(e) {
   }
 }
 
+function renderSaleItemsBlock(sale) {
+  const meta = `${sale.created_at || ""}${sale.user_name ? ` · ${esc(sale.user_name)}` : ""}`;
+  const rows = (sale.items || []).map((i) => `<tr>
+      <td>${esc(i.product_name)}</td>
+      <td style="font-size:.8rem">${i.units?.length ? i.units.map((u) => esc(u.imei || u.serial || "—") + (u.imei_pending ? " ⏳" : "")).join("<br>") : "—"}</td>
+      <td><span class="tag tag-${i.ownership_type === "consignment" ? "cons" : "own"}">${ownLabel(i.ownership_type)}</span></td>
+      <td>${i.quantity}</td><td>${saleFmt(sale, i.subtotal)}</td><td>${saleFmt(sale, i.shop_profit)}</td>
+    </tr>`).join("");
+  return `
+    <p class="sale-detail-meta">${meta}</p>
+    <table class="data-table sale-detail-table"><thead><tr><th>Товар</th><th>IMEI</th><th>Тип</th><th>Кол-во</th><th>Сумма</th><th>Прибыль</th></tr></thead>
+    <tbody>${rows || '<tr><td colspan="6" style="text-align:center;color:var(--muted)">Нет позиций</td></tr>'}</tbody></table>
+    <div class="sale-detail-total">Итого: ${saleFmt(sale, sale.total)}</div>`;
+}
+
+window.toggleSaleDetail = async (id, btn) => {
+  const row = btn?.closest("tr");
+  if (!row) return;
+  const next = row.nextElementSibling;
+  if (next?.classList?.contains("sale-detail-row") && next.dataset.detailFor === String(id)) {
+    next.remove();
+    btn.textContent = "Детализация";
+    row.classList.remove("sale-row-open");
+    return;
+  }
+  document.querySelectorAll(".sale-detail-row").forEach((el) => el.remove());
+  document.querySelectorAll(".sale-row-open").forEach((el) => el.classList.remove("sale-row-open"));
+  document.querySelectorAll("[data-sale-detail-btn]").forEach((b) => { b.textContent = "Детализация"; });
+  btn.disabled = true;
+  const prev = btn.textContent;
+  btn.textContent = "…";
+  try {
+    const sale = await api(`/api/sales/${id}`);
+    const detailRow = document.createElement("tr");
+    detailRow.className = "sale-detail-row";
+    detailRow.dataset.detailFor = String(id);
+    detailRow.innerHTML = `<td colspan="7"><div class="sale-inline-detail">${renderSaleItemsBlock(sale)}</div></td>`;
+    row.after(detailRow);
+    row.classList.add("sale-row-open");
+    btn.textContent = "Свернуть";
+    btn.dataset.saleDetailBtn = "1";
+  } catch (e) {
+    toast(e.message, "error");
+    btn.textContent = prev;
+  } finally {
+    btn.disabled = false;
+  }
+};
+
 async function loadSales() {
+  if (!warehouses.length) await loadWarehouses();
+  const whSel = document.getElementById("sales-warehouse");
+  if (whSel && !whSel.dataset.ready) {
+    const cur = whSel.value;
+    whSel.innerHTML = '<option value="">Все склады</option>' +
+      phoneWarehouses().map((w) => `<option value="${w.id}">${esc(w.name)}</option>`).join("");
+    if (cur) whSel.value = cur;
+    whSel.dataset.ready = "1";
+  }
   const from = document.getElementById("sales-from").value;
   const to = document.getElementById("sales-to").value;
   const own = document.getElementById("sales-ownership").value;
-  let url = `/api/sales?limit=100`;
-  if (from) url += `&date_from=${from}`;
-  if (to) url += `&date_to=${to}`;
-  if (own) url += `&ownership_type=${own}`;
+  const wh = document.getElementById("sales-warehouse")?.value || "";
+  let url = `/api/sales?limit=200`;
+  if (from) url += `&date_from=${encodeURIComponent(from)}`;
+  if (to) url += `&date_to=${encodeURIComponent(to)}`;
+  if (own) url += `&ownership_type=${encodeURIComponent(own)}`;
+  if (wh) url += `&warehouse_id=${encodeURIComponent(wh)}`;
   const data = await api(url);
   const tb = document.getElementById("sales-tbody");
-  if (!data.items.length) { tb.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--muted)">Нет продаж</td></tr>'; return; }
+  const countHint = data.total != null ? ` · найдено ${data.total}` : "";
+  if (!data.items.length) {
+    tb.innerHTML = `<tr><td colspan="7" style="text-align:center;color:var(--muted)">Нет продаж${countHint}</td></tr>`;
+    return;
+  }
   tb.innerHTML = data.items.map((s) => `
-    <tr>
+    <tr class="sale-row" data-sale-id="${s.id}">
       <td><strong>#${s.id}</strong></td>
-      <td>${s.created_at}</td>
+      <td>${s.created_at?.slice(0, 10) || s.created_at}</td>
+      <td>${esc(s.warehouse_name || "—")}</td>
       <td>${esc(s.user_name || "—")}</td>
       <td><strong>${saleFmt(s, s.total)}</strong></td>
       <td style="font-size:.85rem">${formatPaySummary(s)}</td>
-      <td>
+      <td class="sales-actions">
+        <button class="btn btn-ghost btn-sm" data-sale-detail-btn onclick="toggleSaleDetail(${s.id}, this)">Детализация</button>
         <button class="btn btn-ghost btn-sm" onclick="showSale(${s.id})">Детали</button>
         <button class="btn btn-ghost btn-sm" onclick="printSaleReceipt(${s.id})">Чек</button>
       </td>
@@ -1430,15 +1496,7 @@ window.showSale = async (id) => {
       )).join("")}</div></div>` : "";
   document.getElementById("sale-detail-content").innerHTML = `
     <h3>Продажа #${sale.id}</h3>
-    <p style="color:var(--muted);margin:.5rem 0 1rem">${sale.created_at}${sale.user_name ? ` · ${esc(sale.user_name)}` : ""}</p>
-    <table class="data-table"><thead><tr><th>Товар</th><th>IMEI</th><th>Тип</th><th>Кол-во</th><th>Сумма</th><th>Прибыль</th></tr></thead>
-    <tbody>${sale.items.map((i) => `<tr>
-      <td>${esc(i.product_name)}</td>
-      <td style="font-size:.8rem">${i.units?.length ? i.units.map((u) => esc(u.imei || u.serial || "—") + (u.imei_pending ? " ⏳" : "")).join("<br>") : "—"}</td>
-      <td><span class="tag tag-${i.ownership_type === "consignment" ? "cons" : "own"}">${ownLabel(i.ownership_type)}</span></td>
-      <td>${i.quantity}</td><td>${saleFmt(sale, i.subtotal)}</td><td>${saleFmt(sale, i.shop_profit)}</td>
-    </tr>`).join("")}</tbody></table>
-    <div style="margin-top:1rem;text-align:right;font-size:1.1rem;font-weight:700">Итого: ${saleFmt(sale, sale.total)}</div>
+    ${renderSaleItemsBlock(sale)}
     ${unitsExtra}
     ${payHtml}
     ${isOwner ? `<button class="btn btn-danger" style="margin-top:1rem" onclick="voidSale(${id})">Отменить продажу</button>` : ""}`;
