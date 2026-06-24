@@ -818,41 +818,32 @@
       <label>Название<input id="pf-name" class="input" required></label>
       <div class="form-row">
         <label>Категория<select id="pf-category" class="select"><option value="phone">Телефон</option><option value="accessory">Аксессуар</option></select></label>
-        <label>Бренд<input id="pf-brand" class="input"></label>
+        <label>Модель<input id="pf-model" class="input" placeholder="iPhone 15 Pro"></label>
       </div>
       <div id="pf-supplier-row" class="form-row hidden">
         <label>Поставщик<input id="pf-supplier" class="input" placeholder="ООО / ИП"></label>
       </div>
       <div class="form-row">
-        <label>Модель<input id="pf-model" class="input" placeholder="iPhone 15 Pro"></label>
         <label>Цвет<input id="pf-color" class="input"></label>
-      </div>
-      <div class="form-row">
-        <label>Размер<input id="pf-size" class="input"></label>
         <label>Память<input id="pf-memory" class="input" placeholder="256 ГБ"></label>
       </div>
       <div class="form-row">
-        <label>RAM<input id="pf-ram" class="input"></label>
         <label>Состояние<select id="pf-condition" class="select">
           <option value="new">Новый</option>
           <option value="used">Б/у</option>
           <option value="refurbished">Восстановленный</option>
         </select></label>
-      </div>
-      <div class="form-row">
         <label class="check" style="align-self:end;padding-bottom:.5rem">
           <input type="checkbox" id="pf-customs-cleared"> Растаможен
         </label>
-        <label>Таможенная стоимость, ₽<input type="number" id="pf-customs-price" class="input" min="0" value="0"></label>
+      </div>
+      <div class="form-row">
+        <label>Таможенная стоимость<input type="number" id="pf-customs-price" class="input" min="0" step="0.01" value="0"></label>
       </div>
       <label>Доп. характеристики<textarea id="pf-specs-extra" class="input textarea" rows="2"></textarea></label>
       <div class="form-row">
-        <label>Артикул<input id="pf-sku" class="input"></label>
-        <label>Штрихкод<input id="pf-barcode" class="input"></label>
-      </div>
-      <div class="form-row">
-        <label id="pf-purchase-label">Закупочная цена, ₽<input type="number" id="pf-purchase" class="input" min="0" required></label>
-        <label>Цена продажи, ₽<input type="number" id="pf-sale" class="input" min="0" required></label>
+        <label><span id="pf-purchase-label-text">Закупочная цена</span><input type="number" id="pf-purchase" class="input" min="0" step="0.01" required></label>
+        <label><span id="pf-sale-label-text">Цена продажи</span><input type="number" id="pf-sale" class="input" min="0" step="0.01" required></label>
       </div>
       <div id="pf-stock-create-row" class="form-row">
         <label>Остаток<input type="number" id="pf-stock" class="input" min="0" required></label>
@@ -1122,6 +1113,6 @@
   </dialog>
 
   <div id="toast" class="toast"></div>
-  <script src="/static/app.js?v=30"></script>
+  <script src="/static/app.js?v=31"></script>
 </body>
 </html>

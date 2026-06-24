@@ -3038,16 +3038,15 @@ function updateMarginHint() {
   const purchaseEl = el("pf-purchase");
   const saleEl = el("pf-sale");
   const hint = el("pf-margin-hint");
-  const pl = el("pf-purchase-label");
-  if (!ownEl || !purchaseEl || !saleEl || !hint || !pl) return;
+  const pl = el("pf-purchase-label-text");
+  if (!ownEl || !purchaseEl || !saleEl || !hint) return;
   const own = ownEl.value;
   const purchase = +purchaseEl.value || 0;
   const sale = +saleEl.value || 0;
+  if (pl) pl.textContent = own === "consignment" ? "Сумма поставщику за ед." : "Закупочная цена";
   if (own === "consignment") {
-    pl.textContent = "Сумма поставщику за ед., ₽";
     hint.textContent = `Комиссия магазина: ${fmt(sale - purchase)} (${pct(sale - purchase, sale)}%) · Поставщику: ${fmt(purchase)}`;
   } else {
-    pl.textContent = "Закупочная цена, ₽";
     hint.textContent = `Маржа: ${fmt(sale - purchase)} (${pct(sale - purchase, sale)}%)`;
   }
 }
@@ -3095,9 +3094,7 @@ function fillProductCardFields(p = {}) {
   const setCheck = (id, val) => { const node = el(id); if (node) node.checked = val; };
   set("pf-model", p.model || "");
   set("pf-color", p.color || "");
-  set("pf-size", p.size || "");
   set("pf-memory", p.memory || "");
-  set("pf-ram", p.ram || "");
   setCheck("pf-customs-cleared", !!p.customs_cleared);
   set("pf-customs-price", p.customs_price ?? 0);
   set("pf-specs-extra", p.specs_extra || "");
@@ -3110,9 +3107,7 @@ function productCardBody() {
   return {
     model: v("pf-model"),
     color: v("pf-color"),
-    size: v("pf-size"),
     memory: v("pf-memory"),
-    ram: v("pf-ram"),
     customs_cleared: el("pf-customs-cleared")?.checked ? 1 : 0,
     customs_price: n("pf-customs-price"),
     specs_extra: v("pf-specs-extra"),
@@ -3197,7 +3192,7 @@ window.openProductModal = (ownership) => {
     if (el("pf-id")) el("pf-id").value = "";
     if (el("pf-ownership")) el("pf-ownership").value = type;
     el("pf-supplier-row")?.classList.toggle("hidden", type !== "consignment");
-    ["pf-name", "pf-brand", "pf-sku", "pf-barcode", "pf-purchase", "pf-sale", "pf-stock", "pf-supplier"].forEach((id) => {
+    ["pf-name", "pf-purchase", "pf-sale", "pf-stock", "pf-supplier"].forEach((id) => {
       const node = el(id);
       if (node) node.value = id === "pf-stock" ? "0" : "";
     });
@@ -3227,12 +3222,9 @@ window.editProduct = async (id) => {
     document.getElementById("pf-supplier-row").classList.toggle("hidden", p.ownership_type !== "consignment");
     document.getElementById("pf-name").value = p.name;
     document.getElementById("pf-category").value = p.category;
-    document.getElementById("pf-brand").value = p.brand || "";
     document.getElementById("pf-supplier").value = p.supplier_name || "";
-    document.getElementById("pf-sku").value = p.sku || "";
-    document.getElementById("pf-barcode").value = p.barcode || "";
-    document.getElementById("pf-purchase").value = p.purchase_price;
-    document.getElementById("pf-sale").value = p.sale_price;
+    document.getElementById("pf-purchase").value = p.purchase_price ?? "";
+    document.getElementById("pf-sale").value = p.sale_price ?? "";
     document.getElementById("pf-min-stock").value = p.min_stock;
     fillProductCardFields(p);
     setProductFormMode(true, p);
@@ -3285,9 +3277,9 @@ async function saveProduct(e) {
     category: document.getElementById("pf-category").value,
     ownership_type: ownership,
     supplier_name: supplier,
-    brand: document.getElementById("pf-brand").value,
-    sku: document.getElementById("pf-sku").value,
-    barcode: document.getElementById("pf-barcode").value,
+    brand: "",
+    sku: "",
+    barcode: "",
     purchase_price: purchase,
     sale_price: sale,
     min_stock: id
