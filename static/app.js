@@ -65,6 +65,13 @@ const fmtCurrency = (n, cur) => {
     return `${Number(n).toFixed(digits)} ${cur?.symbol || code}`;
   }
 };
+const saleFmt = (s, n) => fmtCurrency(n, currency_meta(s?.currency_code));
+const currency_meta = (code) => {
+  const c = (code || "TJS").toUpperCase();
+  return c === "USD"
+    ? { code: "USD", symbol: "$", name: "Доллар США" }
+    : { code: "TJS", symbol: "смн", name: "Сомони" };
+};
 const pct = (a, b) => b ? Math.round((a / b) * 100) : 0;
 const catLabel = (c) => ({ phone: "Телефон", accessory: "Аксессуар" }[c] || c);
 const ownLabel = (o) => ({ own: "Собственный", consignment: "Реализация" }[o] || o);
@@ -625,8 +632,9 @@ async function loadDashboard() {
     el.addEventListener("click", () => openKpiDetail(el.dataset.kpi));
   });
   document.getElementById("dash-today").innerHTML = `
-    <div class="metric-row"><span>Выручка</span><strong>${fmt(d.today.gross_revenue)}</strong></div>
-    <div class="metric-row"><span>Прибыль магазина</span><strong>${fmt(d.today.shop_profit)}</strong></div>
+    ${renderCurrencyBreakdown(d.month.by_currency)}
+    <div class="metric-row"><span>Выручка сегодня</span><strong>${fmt(d.today.gross_revenue)}</strong></div>
+    <div class="metric-row"><span>Прибыль сегодня</span><strong>${fmt(d.today.shop_profit)}</strong></div>
     <div class="metric-row"><span>К оплате поставщикам</span><strong>${fmt(d.today.supplier_due)}</strong></div>
     <div class="metric-row"><span>Себестоимость (свои)</span><strong>${fmt(d.today.own_cogs)}</strong></div>
   `;
@@ -1344,7 +1352,7 @@ async function loadSales() {
       <td><strong>#${s.id}</strong></td>
       <td>${s.created_at}</td>
       <td>${esc(s.user_name || "—")}</td>
-      <td><strong>${fmt(s.total)}</strong></td>
+      <td><strong>${saleFmt(s, s.total)}</strong></td>
       <td style="font-size:.85rem">${formatPaySummary(s)}</td>
       <td>
         <button class="btn btn-ghost btn-sm" onclick="showSale(${s.id})">Детали</button>
@@ -1911,12 +1919,16 @@ async function loadWhZReport() {
 async function importWhZExcel(e) {
   const file = e.target.files?.[0];
   if (!file) return;
+  if (!confirm("Перезаписать данные Z-отчёта из Excel? Старые импортированные строки будут удалены.")) {
+    e.target.value = "";
+    return;
+  }
   try {
     const fd = new FormData();
     fd.append("file", file);
     const headers = {};
     if (pin) headers["X-Pin"] = pin;
-    const res = await fetch("/api/import/z-register", { method: "POST", headers, body: fd });
+    const res = await fetch("/api/import/z-register?replace=1", { method: "POST", headers, body: fd });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
       throw new Error(err.detail || `Ошибка ${res.status}`);
@@ -3856,17 +3868,33 @@ function bindReports() {
   };
 }
 
+function renderCurrencyBreakdown(byCurrency) {
+  if (!byCurrency?.length) return "";
+  return `<div class="card" style="margin-bottom:1rem"><div class="card-header"><h3>По валютам</h3></div><div class="card-body"><div class="report-kpi">
+    ${byCurrency.map((c) => `
+      <div class="report-box">
+        <div class="lbl">${esc(c.name || c.code)}</div>
+        <div class="val">${fmtCurrency(c.gross_revenue, c)}</div>
+        <div class="sub">${c.sales_count} продаж · прибыль ${fmtCurrency(c.shop_profit, c)} · маржа ${c.margin_pct || 0}%</div>
+      </div>`).join("")}
+  </div></div></div>`;
+}
+
 function renderReportBlock(r, title) {
+  const multiCur = (r.by_currency?.length || 0) > 1;
+  const primary = r.by_currency?.[0];
+  const money = (n) => (primary && multiCur ? "—" : (primary ? fmtCurrency(n, primary) : fmt(n)));
   return `
     <div class="report-header"><h3>${title}</h3><p>${r.period_label}</p></div>
+    ${multiCur ? renderCurrencyBreakdown(r.by_currency) : (r.by_currency?.length ? renderCurrencyBreakdown(r.by_currency) : "")}
     <div class="report-kpi">
-      <div class="report-box"><div class="lbl">Выручка</div><div class="val">${fmt(r.gross_revenue)}</div></div>
+      <div class="report-box"><div class="lbl">Выручка</div><div class="val">${money(r.gross_revenue)}</div></div>
       <div class="report-box"><div class="lbl">Продаж</div><div class="val">${r.sales_count}</div></div>
       <div class="report-box"><div class="lbl">Единиц</div><div class="val">${r.items_sold}</div></div>
-      <div class="report-box"><div class="lbl">Прибыль магазина</div><div class="val" style="color:var(--success)">${fmt(r.shop_profit)}</div></div>
-      <div class="report-box"><div class="lbl">Маржа</div><div class="val">${r.margin_pct}%</div></div>
-      ${r.scope !== "consignment" ? `<div class="report-box"><div class="lbl">Себестоимость (свои)</div><div class="val">${fmt(r.own_cogs)}</div></div>` : ""}
-      ${r.scope !== "own" ? `<div class="report-box"><div class="lbl">К оплате поставщикам</div><div class="val" style="color:var(--consignment)">${fmt(r.supplier_due)}</div></div>` : ""}
+      <div class="report-box"><div class="lbl">Прибыль магазина</div><div class="val" style="color:var(--success)">${money(r.shop_profit)}</div></div>
+      <div class="report-box"><div class="lbl">Маржа</div><div class="val">${multiCur ? "—" : `${r.margin_pct}%`}</div></div>
+      ${r.scope !== "consignment" ? `<div class="report-box"><div class="lbl">Себестоимость (свои)</div><div class="val">${money(r.own_cogs)}</div></div>` : ""}
+      ${r.scope !== "own" ? `<div class="report-box"><div class="lbl">К оплате поставщикам</div><div class="val" style="color:var(--consignment)">${money(r.supplier_due)}</div></div>` : ""}
     </div>
     ${r.by_payment?.length ? `<div class="card"><div class="card-header"><h3>Оплата</h3></div><div class="card-body"><table class="data-table"><thead><tr><th>Способ</th><th>Чеков</th><th>Сумма</th></tr></thead><tbody>
       ${r.by_payment.map((p) => `<tr><td>${payLabel(p.method)}</td><td>${p.count}</td><td>${fmt(p.amount)}</td></tr>`).join("")}
@@ -3877,9 +3905,16 @@ function renderReportBlock(r, title) {
 }
 
 function renderCompareCard(r, cls, title) {
+  const multi = (r.by_currency?.length || 0) > 1;
+  const curBlock = multi ? r.by_currency.map((c) =>
+    `<div class="metric-row"><span>${esc(c.code)}</span><strong>${fmtCurrency(c.gross_revenue, c)} / ${fmtCurrency(c.shop_profit, c)}</strong></div>`
+  ).join("") : "";
+  const p = r.by_currency?.[0];
+  const m = (n) => p ? fmtCurrency(n, p) : fmt(n);
   return `<div class="compare-card ${cls}"><h4>${title}</h4>
-    <div class="metric-row"><span>Выручка</span><strong>${fmt(r.gross_revenue)}</strong></div>
-    <div class="metric-row"><span>Прибыль</span><strong>${fmt(r.shop_profit)}</strong></div>
+    ${curBlock}
+    <div class="metric-row"><span>Выручка</span><strong>${multi ? "см. валюты" : m(r.gross_revenue)}</strong></div>
+    <div class="metric-row"><span>Прибыль</span><strong>${multi ? "см. валюты" : m(r.shop_profit)}</strong></div>
     <div class="metric-row"><span>Маржа</span><strong>${r.margin_pct}%</strong></div>
     <div class="metric-row"><span>Продаж</span><strong>${r.sales_count}</strong></div>
     ${cls !== "own" ? `<div class="metric-row"><span>Поставщикам</span><strong>${fmt(r.supplier_due)}</strong></div>` : ""}

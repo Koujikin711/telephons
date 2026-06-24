@@ -386,6 +386,7 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     )
     _add_column(conn, "sales", "amount_paid", "REAL")
     _add_column(conn, "sales", "amount_due", "REAL NOT NULL DEFAULT 0")
+    _add_column(conn, "sales", "currency_code", "TEXT NOT NULL DEFAULT 'TJS'")
     _add_column(conn, "expenses", "department", "TEXT NOT NULL DEFAULT 'main'")
     if _table_exists(conn, "warehouses") and not conn.execute(
         "SELECT 1 FROM warehouses WHERE LOWER(name) LIKE '%аксесс%'"
@@ -1536,6 +1537,72 @@ def _parse_z_register_sheet(ws: Any, sheet_kind: str) -> list[dict[str, Any]]:
     return rows
 
 
+def _rebuild_all_warehouse_stock(conn: sqlite3.Connection) -> None:
+    conn.execute("DELETE FROM warehouse_stock")
+    for row in conn.execute(
+        """
+        SELECT warehouse_id, product_id, COUNT(*) AS qty
+        FROM product_units WHERE status = 'in_stock'
+        GROUP BY warehouse_id, product_id
+        """
+    ).fetchall():
+        qty = int(row["qty"])
+        if qty > 0:
+            conn.execute(
+                "INSERT INTO warehouse_stock (warehouse_id, product_id, quantity) VALUES (?, ?, ?)",
+                (int(row["warehouse_id"]), int(row["product_id"]), qty),
+            )
+    for pid_row in conn.execute("SELECT id FROM products WHERE IFNULL(track_units, 0) = 1").fetchall():
+        sync_product_stock(conn, int(pid_row["id"]))
+
+
+def reset_z_register_import(conn: sqlite3.Connection) -> dict[str, int]:
+    unit_ids: set[int] = set()
+    sale_ids = [int(r["id"]) for r in conn.execute(
+        "SELECT id FROM sales WHERE user_name = 'Z-импорт'"
+    ).fetchall()]
+    for sid in sale_ids:
+        for r in conn.execute(
+            """
+            SELECT siu.unit_id FROM sale_item_units siu
+            JOIN sale_items si ON si.id = siu.sale_item_id
+            WHERE si.sale_id = ?
+            """,
+            (sid,),
+        ).fetchall():
+            unit_ids.add(int(r["unit_id"]))
+    for r in conn.execute(
+        """
+        SELECT id FROM product_units
+        WHERE notes LIKE 'Z-импорт%' OR serial GLOB 'Z[0-9]*-*'
+        """
+    ).fetchall():
+        unit_ids.add(int(r["id"]))
+
+    for sid in sale_ids:
+        conn.execute("DELETE FROM receivables WHERE sale_id = ?", (sid,))
+        conn.execute(
+            "DELETE FROM sale_item_units WHERE sale_item_id IN (SELECT id FROM sale_items WHERE sale_id = ?)",
+            (sid,),
+        )
+        conn.execute("DELETE FROM sale_items WHERE sale_id = ?", (sid,))
+        conn.execute("DELETE FROM sale_payments WHERE sale_id = ?", (sid,))
+        conn.execute("DELETE FROM sales WHERE id = ?", (sid,))
+
+    deleted_units = 0
+    for uid in unit_ids:
+        conn.execute("DELETE FROM sale_item_units WHERE unit_id = ?", (uid,))
+        conn.execute("DELETE FROM unit_reservations WHERE unit_id = ?", (uid,))
+        if conn.execute("DELETE FROM product_units WHERE id = ?", (uid,)).rowcount:
+            deleted_units += 1
+    conn.execute(
+        "DELETE FROM product_units WHERE sale_id IS NOT NULL AND sale_id NOT IN (SELECT id FROM sales)"
+    )
+    _rebuild_all_warehouse_stock(conn)
+    _fix_z_register_warehouse_split(conn)
+    return {"deleted_sales": len(sale_ids), "deleted_units": deleted_units}
+
+
 def _import_z_register_rows(
     conn: sqlite3.Connection,
     rows: list[dict[str, Any]],
@@ -1546,6 +1613,7 @@ def _import_z_register_rows(
     created_units = sold = skipped = 0
     errors: list[str] = []
     expected_condition = "new" if sheet_kind == "new" else "used"
+    currency_code = get_warehouse_currency(conn, warehouse_id)["code"]
     for row in rows:
         name = row["name"]
         imei = row["imei"]
@@ -1602,6 +1670,8 @@ def _import_z_register_rows(
             )
             product_id = int(cur.lastrowid)
 
+        unit_notes = (row["comments"] or "").strip()
+        unit_notes = f"Z-импорт: {unit_notes}" if unit_notes else "Z-импорт Excel"
         arrival = row["arrival_date"] or utc_now()
         cur_u = conn.execute(
             """
@@ -1612,7 +1682,7 @@ def _import_z_register_rows(
             VALUES (?, ?, ?, ?, 'in_stock', ?, ?, 'none', 0, ?, ?, ?, ?, ?)
             """,
             (
-                product_id, warehouse_id, imei, serial, row["comments"] or "",
+                product_id, warehouse_id, imei, serial, unit_notes,
                 utc_now(), extra, row["battery"], row["comments"] or "", row["region"] or "",
                 (row["arrival_date"] or "")[:10],
             ),
@@ -1629,10 +1699,10 @@ def _import_z_register_rows(
                 INSERT INTO sales
                 (total, discount, payment_method, status, notes, created_at,
                  warehouse_id, cash_amount, card_amount, trade_in_value, shift_id, user_id, user_name,
-                 amount_paid, amount_due)
-                VALUES (?, 0, 'cash', 'completed', ?, ?, ?, ?, 0, 0, NULL, NULL, 'Z-импорт', ?, 0)
+                 amount_paid, amount_due, currency_code)
+                VALUES (?, 0, 'cash', 'completed', ?, ?, ?, ?, 0, 0, NULL, NULL, 'Z-импорт', ?, 0, ?)
                 """,
-                (total, row["comments"] or "Z-импорт Excel", sale_date, warehouse_id, total, total),
+                (total, row["comments"] or "Z-импорт Excel", sale_date, warehouse_id, total, total, currency_code),
             )
             sale_id = int(cur_s.lastrowid)
             insert_sale_payments(conn, sale_id, [{"method_code": "cash", "amount": total}])
@@ -1668,12 +1738,14 @@ def _import_z_register_rows(
 
 
 def import_z_register_excel(
-    conn: sqlite3.Connection, raw: bytes, filename: str, sheet: str = ""
+    conn: sqlite3.Connection, raw: bytes, filename: str, sheet: str = "", *, replace: bool = False
 ) -> dict[str, Any]:
     from openpyxl import load_workbook
 
-    wb = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
     results: dict[str, Any] = {"sheets": {}}
+    if replace:
+        results["reset"] = reset_z_register_import(conn)
+    wb = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
     targets: list[tuple[str, str, int]] = []
     if sheet and sheet in wb.sheetnames:
         kind = "used" if sheet.lower() in ("бу", "bu", "б/у") else "new"
@@ -1711,6 +1783,17 @@ def get_warehouse_receipt_kind(conn: sqlite3.Connection, warehouse_id: int) -> s
     return "new"
 
 
+CURRENCY_META: dict[str, dict[str, str]] = {
+    "USD": {"code": "USD", "symbol": "$", "name": "Доллар США"},
+    "TJS": {"code": "TJS", "symbol": "смн", "name": "Сомони"},
+}
+
+
+def currency_meta(code: str) -> dict[str, str]:
+    c = (code or "TJS").upper()
+    return CURRENCY_META.get(c, {"code": c, "symbol": c, "name": c})
+
+
 def get_warehouse_currency(conn: sqlite3.Connection, warehouse_id: int) -> dict[str, str]:
     row = conn.execute(
         "SELECT currency_code, warehouse_type, name FROM warehouses WHERE id = ?", (warehouse_id,)
@@ -1718,9 +1801,7 @@ def get_warehouse_currency(conn: sqlite3.Connection, warehouse_id: int) -> dict[
     code = (row["currency_code"] or "").strip().upper() if row else ""
     if not code:
         code = "TJS" if get_warehouse_receipt_kind(conn, warehouse_id) == "used" else "USD"
-    if code == "USD":
-        return {"code": "USD", "symbol": "$", "name": "Доллар США"}
-    return {"code": "TJS", "symbol": "смн", "name": "Сомони"}
+    return currency_meta(code)
 
 
 def _set_warehouse_currencies(conn: sqlite3.Connection) -> None:
@@ -4364,6 +4445,7 @@ async def warehouse_z_report(
 async def import_z_register_file(
     file: UploadFile = File(...),
     sheet: str = Query(default=""),
+    replace: bool = Query(default=False),
     x_pin: str | None = Header(default=None, alias="X-Pin"),
 ):
     check_pin(x_pin, min_role="warehouse")
@@ -4372,7 +4454,7 @@ async def import_z_register_file(
         raise HTTPException(status_code=400, detail="Пустой файл")
     try:
         with db() as conn:
-            result = import_z_register_excel(conn, raw, file.filename or "import.xlsx", sheet)
+            result = import_z_register_excel(conn, raw, file.filename or "import.xlsx", sheet, replace=replace)
     except HTTPException:
         raise
     except Exception as exc:
@@ -5337,18 +5419,19 @@ async def create_sale(body: SaleIn, x_pin: str | None = Header(default=None, ali
                 amount_paid = total
                 amount_due = 0.0
 
+        sale_currency = get_warehouse_currency(conn, warehouse_id)["code"]
         cur = conn.execute(
             """
             INSERT INTO sales
             (total, discount, payment_method, status, notes, created_at,
              warehouse_id, cash_amount, card_amount, trade_in_value, shift_id, user_id, user_name,
-             amount_paid, amount_due)
-            VALUES (?, ?, ?, 'completed', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
+             amount_paid, amount_due, currency_code)
+            VALUES (?, ?, ?, 'completed', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
             """,
             (total, body.discount, payment_method, body.notes, now,
              warehouse_id, cash_amount, card_amount, shift_id,
              user.get("id") if user else None, user.get("name", "") if user else "",
-             amount_paid, amount_due),
+             amount_paid, amount_due, sale_currency),
         )
         sale_id = cur.lastrowid
         if pay_payload:
@@ -6107,6 +6190,45 @@ async def report_cashiers(
         return _report_by_cashier(conn, period, date_from, date_to)
 
 
+def _finance_by_currency(
+    conn: sqlite3.Connection,
+    since_clause: str,
+    params: list[Any],
+    own_clause: str,
+    own_params: list[Any],
+) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        f"""
+        SELECT COALESCE(NULLIF(TRIM(s.currency_code), ''), 'TJS') AS currency_code,
+               COUNT(DISTINCT s.id) AS sales_count,
+               COALESCE(SUM(si.subtotal), 0) AS gross_revenue,
+               COALESCE(SUM(si.shop_profit), 0) AS shop_profit,
+               COALESCE(SUM(si.quantity), 0) AS items_sold
+        FROM sale_items si
+        JOIN sales s ON s.id = si.sale_id
+        WHERE s.status = 'completed' {since_clause} {own_clause}
+        GROUP BY COALESCE(NULLIF(TRIM(s.currency_code), ''), 'TJS')
+        ORDER BY currency_code
+        """,
+        params + own_params,
+    ).fetchall()
+    result: list[dict[str, Any]] = []
+    for r in rows:
+        code = (r["currency_code"] or "TJS").upper()
+        meta = currency_meta(code)
+        rev = float(r["gross_revenue"])
+        profit = float(r["shop_profit"])
+        result.append({
+            **meta,
+            "sales_count": int(r["sales_count"]),
+            "gross_revenue": rev,
+            "shop_profit": profit,
+            "items_sold": int(r["items_sold"]),
+            "margin_pct": round(profit / rev * 100, 1) if rev else 0,
+        })
+    return result
+
+
 def _finance_report(conn: sqlite3.Connection, period: str, scope: str, date_from: str, date_to: str) -> dict[str, Any]:
     if date_from or date_to:
         since_clause, params = date_filter_sql(date_from, date_to)
@@ -6214,6 +6336,7 @@ def _finance_report(conn: sqlite3.Connection, period: str, scope: str, date_from
             {"method": r["payment_method"], "count": r["cnt"], "amount": float(r["amount"])}
             for r in payment_rows
         ],
+        "by_currency": _finance_by_currency(conn, since_clause, params, own_clause, own_params),
     }
 
 
