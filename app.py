@@ -1664,6 +1664,7 @@ def reset_z_register_import(conn: sqlite3.Connection) -> dict[str, int]:
     )
     _rebuild_all_warehouse_stock(conn)
     _fix_z_register_warehouse_split(conn)
+    conn.execute("DELETE FROM expenses WHERE description = 'Excel импорт ОПиУ'")
     return {"deleted_sales": len(sale_ids), "deleted_units": deleted_units}
 
 
@@ -1943,6 +1944,79 @@ def import_accessories_excel(
     return results
 
 
+def _parse_opu_expenses_sheet(ws: Any) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    in_expenses = False
+    for r in range(1, ws.max_row + 1):
+        c1 = ws.cell(r, 1).value
+        c2 = ws.cell(r, 2).value
+        c3 = ws.cell(r, 3).value
+        c1s = str(c1 or "").strip().lower()
+        c2s = str(c2 or "").strip()
+        if c1s in ("расходы", "расход", "expenses"):
+            in_expenses = True
+            amount = _z_cell_float(c3)
+            if c2s and amount and amount > 0 and not c2s.lower().startswith("итого"):
+                rows.append({"category": c2s, "amount": float(amount)})
+            continue
+        if not in_expenses:
+            continue
+        if c2s.lower().startswith("итого"):
+            break
+        amount = _z_cell_float(c3)
+        if c2s and amount and amount > 0:
+            rows.append({"category": c2s, "amount": float(amount)})
+    return rows
+
+
+def _expense_date_from_filename(filename: str) -> str:
+    low = (filename or "").lower()
+    year = "2026"
+    for y in range(2024, 2031):
+        if str(y) in low:
+            year = str(y)
+            break
+    month_map = {
+        "jan": "01", "feb": "02", "mar": "03", "apr": "04", "may": "05", "jun": "06",
+        "jul": "07", "aug": "08", "sep": "09", "oct": "10", "nov": "11", "dec": "12",
+        "янв": "01", "фев": "02", "мар": "03", "апр": "04", "май": "05", "мая": "05",
+        "июн": "06", "июл": "07", "авг": "08", "сен": "09", "окт": "10", "ноя": "11", "дек": "12",
+    }
+    for key, mm in month_map.items():
+        if key in low:
+            import calendar
+            last = calendar.monthrange(int(year), int(mm))[1]
+            return f"{year}-{mm}-{last:02d}"
+    return utc_now()[:10]
+
+
+def import_opu_expenses(
+    conn: sqlite3.Connection,
+    rows: list[dict[str, Any]],
+    expense_date: str,
+    *,
+    replace: bool = False,
+) -> dict[str, Any]:
+    if replace:
+        conn.execute("DELETE FROM expenses WHERE description = 'Excel импорт ОПиУ'")
+    created = 0
+    total = 0.0
+    for row in rows:
+        cat = row["category"]
+        amount = float(row["amount"])
+        dept = "accessories" if "аксесс" in cat.lower() else "main"
+        conn.execute(
+            """
+            INSERT INTO expenses (category, amount, description, payment_method_code, expense_date, created_at, department)
+            VALUES (?, ?, 'Excel импорт ОПиУ', 'cash', ?, ?, ?)
+            """,
+            (cat, amount, expense_date[:10], utc_now(), dept),
+        )
+        created += 1
+        total += amount
+    return {"created": created, "total": round(total, 2), "expense_date": expense_date[:10]}
+
+
 def import_z_register_excel(
     conn: sqlite3.Connection, raw: bytes, filename: str, sheet: str = "", *, replace: bool = False
 ) -> dict[str, Any]:
@@ -1986,6 +2060,16 @@ def import_z_register_excel(
             results["sheets"][sn] = _import_z_register_rows(
                 conn, rows, wh_id, sheet_kind=kind
             ) | {"warehouse_id": wh_id, "kind": kind}
+    for sn in wb.sheetnames:
+        low = sn.lower().replace(" ", "")
+        if low in ("опу", "opu", "опиу", "opiu", "p&l", "pnl"):
+            expense_rows = _parse_opu_expenses_sheet(wb[sn])
+            if expense_rows:
+                exp_date = _expense_date_from_filename(filename)
+                results["expenses"] = import_opu_expenses(
+                    conn, expense_rows, exp_date, replace=replace
+                )
+            break
     return results
 
 
@@ -6094,12 +6178,24 @@ def _report_opiu(conn: sqlite3.Connection, period: str, date_from: str, date_to:
     else:
         exp_params = []
     expenses = conn.execute(
-        f"SELECT category, COALESCE(SUM(amount), 0) AS total FROM expenses WHERE 1=1 {exp_clause} GROUP BY category",
+        f"SELECT category, department, COALESCE(SUM(amount), 0) AS total FROM expenses WHERE 1=1 {exp_clause} GROUP BY category, department",
         exp_params,
     ).fetchall()
     total_expenses = sum(float(r["total"]) for r in expenses)
+    main_expenses = sum(float(r["total"]) for r in expenses if (r["department"] or "main") != "accessories")
+    by_currency: list[dict[str, Any]] = []
+    for c in fin.get("by_currency") or []:
+        cur = dict(c)
+        if cur.get("code") == "TJS":
+            cur["operating_expenses"] = total_expenses
+            cur["net_profit"] = float(cur.get("gross_profit", cur.get("shop_profit", 0))) - total_expenses
+        else:
+            cur["operating_expenses"] = 0.0
+            cur["net_profit"] = float(cur.get("gross_profit", cur.get("shop_profit", 0)))
+        by_currency.append(cur)
+    multi = len(by_currency) > 1
     gross_profit = fin["gross_revenue"] - fin["own_cogs"] - fin["supplier_due"]
-    operating_profit = gross_profit - total_expenses
+    operating_profit = gross_profit - total_expenses if not multi else None
     return {
         "period_label": label,
         "revenue": fin["gross_revenue"],
@@ -6109,10 +6205,13 @@ def _report_opiu(conn: sqlite3.Connection, period: str, date_from: str, date_to:
         "supplier_due": fin["supplier_due"],
         "gross_profit": gross_profit,
         "operating_expenses": total_expenses,
-        "expenses_by_category": [{"category": r["category"], "amount": float(r["total"])} for r in expenses],
+        "main_operating_expenses": main_expenses,
+        "expenses_by_category": [{"category": r["category"], "amount": float(r["total"]), "department": r["department"] or "main"} for r in expenses],
         "operating_profit": operating_profit,
         "shop_profit": fin["shop_profit"],
         "net_profit": operating_profit,
+        "by_currency": by_currency,
+        "multi_currency": multi,
     }
 
 
@@ -6511,6 +6610,8 @@ def _finance_by_currency(
                COUNT(DISTINCT s.id) AS sales_count,
                COALESCE(SUM(si.subtotal), 0) AS gross_revenue,
                COALESCE(SUM(si.shop_profit), 0) AS shop_profit,
+               COALESCE(SUM(CASE WHEN si.ownership_type = 'own' THEN si.purchase_price * si.quantity ELSE 0 END), 0) AS own_cogs,
+               COALESCE(SUM(CASE WHEN si.ownership_type = 'consignment' THEN si.supplier_due ELSE 0 END), 0) AS supplier_due,
                COALESCE(SUM(si.quantity), 0) AS items_sold
         FROM sale_items si
         JOIN sales s ON s.id = si.sale_id
@@ -6526,11 +6627,16 @@ def _finance_by_currency(
         meta = currency_meta(code)
         rev = float(r["gross_revenue"])
         profit = float(r["shop_profit"])
+        cogs = float(r["own_cogs"] or 0)
+        sup_due = float(r["supplier_due"] or 0)
         result.append({
             **meta,
             "sales_count": int(r["sales_count"]),
             "gross_revenue": rev,
             "shop_profit": profit,
+            "own_cogs": cogs,
+            "supplier_due": sup_due,
+            "gross_profit": rev - cogs - sup_due,
             "items_sold": int(r["items_sold"]),
             "margin_pct": round(profit / rev * 100, 1) if rev else 0,
         })
@@ -6798,6 +6904,7 @@ async def analytics_summary(
     check_pin(x_pin, min_role="owner")
     with db() as conn:
         report = _finance_report(conn, period, scope, "", "")
+        opiu = _report_opiu(conn, period, "", "")
         low_sql = "SELECT COUNT(*) FROM products WHERE stock <= min_stock"
         params: list[Any] = []
         if scope != "all":
@@ -6805,14 +6912,21 @@ async def analytics_summary(
             params.append(scope)
         low_stock = conn.execute(low_sql, params).fetchone()[0]
         stock_sql = """
-            SELECT COALESCE(SUM(p.purchase_price * ws.quantity), 0)
+            SELECT COALESCE(w.currency_code, 'TJS') AS currency_code,
+                   COALESCE(SUM(p.purchase_price * ws.quantity), 0) AS val
             FROM products p
             JOIN warehouse_stock ws ON ws.product_id = p.id
-            WHERE 1=1
+            JOIN warehouses w ON w.id = ws.warehouse_id
+            WHERE ws.quantity > 0
         """
         if scope != "all":
             stock_sql += " AND p.ownership_type = ?"
-        stock_value = conn.execute(stock_sql, params).fetchone()[0]
+        stock_sql += " GROUP BY COALESCE(w.currency_code, 'TJS')"
+        stock_by_cur = []
+        for row in conn.execute(stock_sql, params).fetchall():
+            code = (row["currency_code"] or "TJS").strip().upper() or "TJS"
+            stock_by_cur.append({**currency_meta(code), "value": float(row["val"])})
+        stock_value = sum(s["value"] for s in stock_by_cur)
         products_count = conn.execute(
             f"SELECT COUNT(*) FROM products {'WHERE ownership_type = ?' if scope != 'all' else ''}",
             params,
@@ -6829,10 +6943,15 @@ async def analytics_summary(
         "margin_pct": report["margin_pct"],
         "low_stock_count": low_stock,
         "stock_value": float(stock_value),
+        "stock_by_currency": stock_by_cur,
         "products_count": products_count,
         "total_cash": report["total_cash"],
         "total_card": report["total_card"],
         "total_trade_in": report["total_trade_in"],
+        "by_currency": report["by_currency"],
+        "expenses": opiu["operating_expenses"],
+        "expenses_by_category": opiu["expenses_by_category"],
+        "multi_currency": len(report.get("by_currency") or []) > 1,
     }
 
 
@@ -6851,13 +6970,14 @@ async def analytics_top(
         rows = conn.execute(
             f"""
             SELECT si.product_name AS name, si.ownership_type,
+                   COALESCE(NULLIF(TRIM(s.currency_code), ''), 'TJS') AS currency_code,
                    SUM(si.quantity) AS qty,
                    SUM(si.subtotal) AS revenue,
                    SUM(si.shop_profit) AS profit
             FROM sale_items si
             JOIN sales s ON s.id = si.sale_id
             WHERE s.status = 'completed' {since_clause} {own_clause}
-            GROUP BY si.product_name, si.ownership_type
+            GROUP BY si.product_name, si.ownership_type, COALESCE(NULLIF(TRIM(s.currency_code), ''), 'TJS')
             ORDER BY revenue DESC
             LIMIT ?
             """,

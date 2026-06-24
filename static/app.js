@@ -3964,7 +3964,8 @@ function renderCurrencyBreakdown(byCurrency) {
       <div class="report-box">
         <div class="lbl">${esc(c.name || c.code)}</div>
         <div class="val">${fmtCurrency(c.gross_revenue, c)}</div>
-        <div class="sub">${c.sales_count} продаж · прибыль ${fmtCurrency(c.shop_profit, c)} · маржа ${c.margin_pct || 0}%</div>
+        <div class="sub">${c.sales_count} продаж · прибыль ${fmtCurrency(c.net_profit ?? c.shop_profit, c)}${c.operating_expenses ? ` · расходы ${fmtCurrency(c.operating_expenses, currency_meta("TJS"))}` : ""}${c.margin_pct != null ? ` · маржа ${c.margin_pct}%` : ""}</div>
+        ${c.gross_profit != null ? `<div class="sub">валовая ${fmtCurrency(c.gross_profit, c)}</div>` : ""}
       </div>`).join("")}
   </div></div></div>`;
 }
@@ -4021,16 +4022,19 @@ async function loadReport() {
   if (reportType === "opiu") {
     const r = await api(q("/api/reports/opiu"));
     combinedEl.classList.add("hidden");
+    const multi = r.multi_currency;
+    const money = (n, cur) => (multi && !cur ? "—" : fmtCurrency(n, cur || currency_meta("TJS")));
     document.getElementById("report-content").innerHTML = `
       <div class="report-header"><h3>ОПиУ</h3><p>${r.period_label || ""}</p></div>
+      ${renderCurrencyBreakdown(r.by_currency)}
       <div class="report-kpi">
-        <div class="report-box"><div class="lbl">Выручка</div><div class="val">${fmt(r.revenue)}</div></div>
-        <div class="report-box"><div class="lbl">Валовая прибыль</div><div class="val">${fmt(r.gross_profit)}</div></div>
-        <div class="report-box"><div class="lbl">Расходы</div><div class="val">${fmt(r.operating_expenses)}</div></div>
-        <div class="report-box"><div class="lbl">Чистая прибыль</div><div class="val" style="color:var(--success)">${fmt(r.net_profit)}</div></div>
+        <div class="report-box"><div class="lbl">Выручка</div><div class="val">${multi ? "см. валюты" : money(r.revenue, r.by_currency?.[0])}</div></div>
+        <div class="report-box"><div class="lbl">Валовая прибыль</div><div class="val">${multi ? "см. валюты" : money(r.gross_profit, r.by_currency?.[0])}</div></div>
+        <div class="report-box"><div class="lbl">Расходы</div><div class="val">${money(r.operating_expenses, currency_meta("TJS"))}</div></div>
+        <div class="report-box"><div class="lbl">Чистая прибыль</div><div class="val" style="color:var(--success)">${multi ? "см. валюты" : money(r.net_profit, r.by_currency?.[0])}</div></div>
       </div>
-      ${(r.expenses_by_category || []).length ? `<div class="card"><div class="card-header"><h3>Расходы по категориям</h3></div><div class="card-body table-wrap"><table class="data-table"><thead><tr><th>Категория</th><th>Сумма</th></tr></thead><tbody>
-        ${r.expenses_by_category.map((e) => `<tr><td>${esc(e.category)}</td><td>${fmt(e.amount)}</td></tr>`).join("")}
+      ${(r.expenses_by_category || []).length ? `<div class="card"><div class="card-header"><h3>Расходы по категориям</h3></div><div class="card-body table-wrap"><table class="data-table"><thead><tr><th>Категория</th><th>Отдел</th><th>Сумма</th></tr></thead><tbody>
+        ${r.expenses_by_category.map((e) => `<tr><td>${esc(e.category)}</td><td>${e.department === "accessories" ? "Аксессуары" : "Основной"}</td><td>${fmtCurrency(e.amount, currency_meta("TJS"))}</td></tr>`).join("")}
       </tbody></table></div></div>` : ""}`;
     return;
   }
@@ -4292,12 +4296,16 @@ async function loadAnalytics() {
     api(`/api/analytics/daily?days=30&scope=${analyticsScope}`),
   ]);
 
+  const finBlock = (s) => ({ ...s, gross_revenue: s.revenue ?? s.gross_revenue, shop_profit: s.profit ?? s.shop_profit });
+
   document.getElementById("analytics-kpi").innerHTML = `
-    <div class="kpi accent-blue"><div class="label">Выручка</div><div class="value">${fmt(summary.revenue)}</div><div class="sub">${summary.sales_count} продаж</div></div>
-    <div class="kpi accent-green"><div class="label">Прибыль</div><div class="value">${fmt(summary.profit)}</div><div class="sub">маржа ${summary.margin_pct}%</div></div>
-    ${analyticsScope !== "own" ? `<div class="kpi accent-cons"><div class="label">Поставщикам</div><div class="value">${fmt(summary.supplier_due)}</div></div>` : ""}
-    ${analyticsScope !== "consignment" ? `<div class="kpi"><div class="label">Себестоимость</div><div class="value">${fmt(summary.own_cogs)}</div></div>` : ""}
-    <div class="kpi"><div class="label">На складе</div><div class="value">${summary.products_count}</div><div class="sub">${fmt(summary.stock_value)} закупка</div></div>
+    ${summary.by_currency?.length ? `<div style="grid-column:1/-1">${renderCurrencyBreakdown(summary.by_currency)}</div>` : ""}
+    <div class="kpi accent-blue"><div class="label">Выручка</div><div class="value">${finFmt(finBlock(summary), "gross_revenue")}</div><div class="sub">${summary.sales_count} продаж</div></div>
+    <div class="kpi accent-green"><div class="label">Прибыль</div><div class="value">${finFmt(finBlock(summary), "shop_profit")}</div><div class="sub">маржа ${summary.margin_pct}%</div></div>
+    <div class="kpi accent-warn"><div class="label">Расходы</div><div class="value">${fmtCurrency(summary.expenses || 0, currency_meta("TJS"))}</div><div class="sub">${(summary.expenses_by_category || []).length} категорий</div></div>
+    ${analyticsScope !== "own" ? `<div class="kpi accent-cons"><div class="label">Поставщикам</div><div class="value">${summary.multi_currency ? "—" : fmt(summary.supplier_due)}</div></div>` : ""}
+    ${analyticsScope !== "consignment" ? `<div class="kpi"><div class="label">Себестоимость</div><div class="value">${finFmt(finBlock(summary), "own_cogs")}</div></div>` : ""}
+    <div class="kpi"><div class="label">На складе</div><div class="value">${summary.products_count}</div><div class="sub">${(summary.stock_by_currency || []).map((s) => fmtCurrency(s.value, s)).join(" · ") || fmt(summary.stock_value)} закупка</div></div>
     <div class="kpi accent-warn"><div class="label">Мало остатков</div><div class="value">${summary.low_stock_count}</div></div>
   `;
 
@@ -4308,7 +4316,7 @@ async function loadAnalytics() {
   }).join("") || '<div class="empty-state">Нет данных за выбранный период</div>';
 
   document.getElementById("top-products").innerHTML = top.length
-    ? top.map((t) => `<div class="top-item"><span>${esc(t.name)} <span class="tag tag-${t.ownership_type === "consignment" ? "cons" : "own"}" style="font-size:.6rem">${t.qty} шт</span></span><span class="rev">${fmt(t.revenue)}</span></div>`).join("")
+    ? top.map((t) => `<div class="top-item"><span>${esc(t.name)} <span class="tag tag-${t.ownership_type === "consignment" ? "cons" : "own"}" style="font-size:.6rem">${t.qty} шт · ${(t.currency_code || "TJS").toUpperCase()}</span></span><span class="rev">${fmtCurrency(t.revenue, currency_meta(t.currency_code))}</span></div>`).join("")
     : '<div class="empty-state">Нет продаж за период</div>';
 
   if (analyticsScope === "all") {
@@ -4318,7 +4326,7 @@ async function loadAnalytics() {
     ]);
     const total = ownS.revenue + consS.revenue || 1;
     document.getElementById("scope-split").innerHTML = `
-      <div class="split-row"><span class="tag tag-own">Свои</span> ${fmt(ownS.revenue)} (${pct(ownS.revenue, total)}%)</div>
+      <div class="split-row"><span class="tag tag-own">Свои</span> ${finFmt(finBlock(ownS), "gross_revenue")} (${pct(ownS.revenue, total)}%)</div>
       <div class="split-bar"><div class="split-bar-fill"><div style="width:${pct(ownS.revenue, total)}%;background:var(--own)"></div></div></div>
       <div class="split-row"><span class="tag tag-cons">Реализация</span> ${fmt(consS.revenue)} (${pct(consS.revenue, total)}%)</div>
       <div class="split-bar"><div class="split-bar-fill"><div style="width:${pct(consS.revenue, total)}%;background:var(--consignment)"></div></div></div>
