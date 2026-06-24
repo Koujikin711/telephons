@@ -703,9 +703,9 @@ def set_setting(conn: sqlite3.Connection, key: str, value: str) -> None:
 
 
 IMPORT_PRODUCT_HEADERS = [
-    "название", "категория", "тип", "поставщик", "бренд", "модель", "цвет", "память",
-    "ram", "состояние", "закупка", "цена", "количество", "мин_остаток", "артикул",
-    "штрихкод", "imei", "серийник", "батарея_%", "комментарий",
+    "название", "категория", "тип", "поставщик", "цвет", "память",
+    "состояние", "закупка", "цена", "количество", "мин_остаток",
+    "imei", "серийник", "батарея_%", "комментарий",
 ]
 
 IMPORT_HEADER_ALIASES: dict[str, tuple[str, ...]] = {
@@ -713,21 +713,33 @@ IMPORT_HEADER_ALIASES: dict[str, tuple[str, ...]] = {
     "категория": ("категория", "category"),
     "тип": ("тип", "ownership_type", "ownership"),
     "поставщик": ("поставщик", "supplier_name", "supplier"),
-    "бренд": ("бренд", "brand"),
-    "модель": ("модель", "model"),
     "цвет": ("цвет", "color"),
     "память": ("память", "memory"),
-    "ram": ("ram",),
     "состояние": ("состояние", "condition"),
     "закупка": ("закупка", "purchase_price", "закупочная"),
     "цена": ("цена", "sale_price", "продажа"),
     "количество": ("количество", "quantity", "qty", "кол-во"),
     "мин_остаток": ("мин_остаток", "min_stock"),
-    "артикул": ("артикул", "sku"),
-    "штрихкод": ("штрихкод", "barcode"),
     "imei": ("imei", "imei1"),
     "серийник": ("серийник", "serial", "serial_number"),
     "батарея_%": ("батарея_%", "battery_capacity", "батарея", "battery"),
+    "комментарий": ("комментарий", "notes", "примечание"),
+}
+
+IMPORT_SALE_HEADERS = [
+    "дата", "чек", "название", "imei", "количество", "цена", "скидка", "оплата", "кассир", "комментарий",
+]
+
+IMPORT_SALE_ALIASES: dict[str, tuple[str, ...]] = {
+    "дата": ("дата", "date", "datetime", "время"),
+    "чек": ("чек", "номер_чека", "receipt", "номер"),
+    "название": ("название", "name", "product_name", "товар"),
+    "imei": ("imei", "imei1"),
+    "количество": ("количество", "quantity", "qty", "кол-во"),
+    "цена": ("цена", "sale_price", "продажа", "сумма"),
+    "скидка": ("скидка", "discount"),
+    "оплата": ("оплата", "payment", "payment_method", "способ_оплаты"),
+    "кассир": ("кассир", "cashier", "user", "сотрудник"),
     "комментарий": ("комментарий", "notes", "примечание"),
 }
 
@@ -755,21 +767,36 @@ def _norm_condition(raw: str) -> str:
     return "new"
 
 
-def _import_row_cell(row: dict[str, Any], fields: dict[str, str], canonical: str) -> str:
-    for alias in IMPORT_HEADER_ALIASES.get(canonical, (canonical,)):
+def _import_row_cell(
+    row: dict[str, Any],
+    fields: dict[str, str],
+    canonical: str,
+    aliases: dict[str, tuple[str, ...]] | None = None,
+) -> str:
+    alias_map = aliases or IMPORT_HEADER_ALIASES
+    for alias in alias_map.get(canonical, (canonical,)):
         key = fields.get(alias.lower())
         if key and row.get(key) not in (None, ""):
             return str(row[key]).strip()
     return ""
 
 
-def _parse_import_file(raw: bytes, filename: str) -> list[dict[str, Any]]:
+def _parse_import_file(raw: bytes, filename: str, sheet: str | None = None) -> list[dict[str, Any]]:
     name = (filename or "").lower()
     if name.endswith(".xlsx"):
         from openpyxl import load_workbook
 
         wb = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
-        ws = wb["Товары"] if "Товары" in wb.sheetnames else wb.active
+        if sheet and sheet in wb.sheetnames:
+            ws = wb[sheet]
+        elif sheet == "Продажи" and "Продажи" in wb.sheetnames:
+            ws = wb["Продажи"]
+        elif "Товары" in wb.sheetnames:
+            ws = wb["Товары"]
+        elif "Продажи" in wb.sheetnames:
+            ws = wb["Продажи"]
+        else:
+            ws = wb.active
         rows_iter = ws.iter_rows(values_only=True)
         header_row = next(rows_iter, None)
         if not header_row:
@@ -809,14 +836,12 @@ def build_products_import_xlsx() -> bytes:
         cell.fill = header_fill
     examples = [
         [
-            "iPhone 15 Pro 256 Black", "телефон", "собственный", "", "Apple", "iPhone 15 Pro",
-            "Чёрный", "256GB", "8GB", "новый", 85000, 99990, 1, 2, "IP15P-256-BLK", "",
-            "123456789012345", "IP15P-BLK-001", "", "пример — удалите строку",
+            "iPhone 15 Pro 256GB Black", "телефон", "собственный", "", "Чёрный", "256GB",
+            "новый", 85000, 99990, 1, 2, "123456789012345", "SN-001", "", "пример — удалите строку",
         ],
         [
-            "Чехол силикон iPhone 15", "аксессуар", "собственный", "", "Generic", "",
-            "Чёрный", "", "", "новый", 150, 590, 20, 5, "CASE-IP15", "4600000000001",
-            "", "", "", "",
+            "Чехол силикон iPhone 15", "аксессуар", "собственный", "", "Чёрный", "",
+            "новый", 150, 590, 20, 5, "", "", "", "",
         ],
     ]
     for r, ex in enumerate(examples, start=2):
@@ -831,14 +856,60 @@ def build_products_import_xlsx() -> bytes:
         "Как заполнять шаблон TeleStore",
         "",
         "• Одна строка = одна позиция на складе.",
+        "• Название — полное имя товара (бренд и модель в одном поле).",
         "• Телефон: укажите IMEI или серийник (количество всегда 1).",
         "• Аксессуар: IMEI не нужен — укажите количество.",
         "• Б/у телефон: состояние «б/у» + обязательно батарея_% (например 87).",
         "• тип: собственный или реализация (для реализации — поставщик).",
         "• категория: телефон или аксессуар.",
-        "• Если товар с таким артикулом уже есть — добавится остаток / новое устройство.",
+        "• Если товар с таким названием уже есть — добавится остаток / новое устройство.",
         "",
         "После загрузки: Склады → остатки, отчёты и касса обновятся автоматически.",
+    ]
+    for i, line in enumerate(lines, start=1):
+        help_ws.cell(row=i, column=1, value=line)
+    help_ws.column_dimensions["A"].width = 72
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def build_sales_import_xlsx() -> bytes:
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Продажи"
+    header_fill = PatternFill("solid", fgColor="E8F4FF")
+    for col, title in enumerate(IMPORT_SALE_HEADERS, start=1):
+        cell = ws.cell(row=1, column=col, value=title)
+        cell.font = Font(bold=True)
+        cell.fill = header_fill
+    examples = [
+        ["2025-06-01 14:30", "1", "iPhone 15 Pro 256GB Black", "123456789012345", 1, 99990, 0, "наличные", "Али", ""],
+        ["2025-06-01 14:30", "1", "Чехол силикон iPhone 15", "", 2, 590, 0, "наличные", "Али", ""],
+        ["2025-06-02 11:00", "2", "Samsung Galaxy A54 128", "987654321098765", 1, 45000, 500, "карта", "", "пример — удалите"],
+    ]
+    for r, ex in enumerate(examples, start=2):
+        for c, val in enumerate(ex, start=1):
+            ws.cell(row=r, column=c, value=val)
+    for col in range(1, len(IMPORT_SALE_HEADERS) + 1):
+        ws.column_dimensions[get_column_letter(col)].width = 16
+
+    help_ws = wb.create_sheet("Инструкция")
+    lines = [
+        "Как заполнять шаблон продаж TeleStore",
+        "",
+        "• Сначала импортируйте товары (Склады → шаблон товаров).",
+        "• Строки с одинаковыми «дата» + «чек» = одна продажа (несколько позиций).",
+        "• название — должно совпадать с товаром в каталоге.",
+        "• imei — для телефонов (необязательно при загрузке истории).",
+        "• цена — пусто = цена из каталога; скидка — на весь чек (укажите в первой строке чека).",
+        "• оплата: наличные, карта, ds, alif, eskhata, перевод.",
+        "• Склад не списывается — данные для отчётов и аналитики.",
     ]
     for i, line in enumerate(lines, start=1):
         help_ws.cell(row=i, column=1, value=line)
@@ -871,24 +942,63 @@ def wipe_catalog_data(conn: sqlite3.Connection) -> None:
 
 
 def _find_product_for_import(
-    conn: sqlite3.Connection, sku: str, name: str, model: str, color: str, memory: str
+    conn: sqlite3.Connection, name: str, color: str = "", memory: str = ""
 ) -> sqlite3.Row | None:
-    if sku:
-        row = conn.execute("SELECT * FROM products WHERE sku = ? LIMIT 1", (sku,)).fetchone()
-        if row:
-            return row
-    if name:
+    if not name:
+        return None
+    if color or memory:
         row = conn.execute(
             """
             SELECT * FROM products
-            WHERE name = ? AND COALESCE(model,'') = ? AND COALESCE(color,'') = ? AND COALESCE(memory,'') = ?
+            WHERE name = ? AND COALESCE(color,'') = ? AND COALESCE(memory,'') = ?
             LIMIT 1
             """,
-            (name, model, color, memory),
+            (name, color, memory),
         ).fetchone()
         if row:
             return row
-    return None
+    return conn.execute("SELECT * FROM products WHERE name = ? LIMIT 1", (name,)).fetchone()
+
+
+def _find_product_by_name(conn: sqlite3.Connection, name: str) -> sqlite3.Row | None:
+    if not name:
+        return None
+    row = conn.execute("SELECT * FROM products WHERE name = ? LIMIT 1", (name,)).fetchone()
+    if row:
+        return row
+    return conn.execute("SELECT * FROM products WHERE name LIKE ? LIMIT 1", (f"%{name}%",)).fetchone()
+
+
+def _norm_payment(raw: str) -> str:
+    v = raw.strip().lower()
+    mapping = {
+        "наличные": "cash", "нал": "cash", "cash": "cash", "кэш": "cash",
+        "карта": "card", "card": "card", "банковская": "card", "банк": "card",
+        "ds": "ds", "дс": "ds",
+        "alif": "alif", "алиф": "alif",
+        "eskhata": "eskhata", "эсхата": "eskhata",
+        "перевод": "transfer", "transfer": "transfer",
+    }
+    return mapping.get(v, "cash")
+
+
+def _parse_import_datetime(val: Any) -> str:
+    from datetime import datetime as dt
+
+    if isinstance(val, dt):
+        return val.strftime("%Y-%m-%d %H:%M:%S")
+    s = str(val or "").strip()
+    if not s:
+        return utc_now()
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",
+        "%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M", "%d.%m.%Y",
+    ):
+        try:
+            return dt.strptime(s, fmt).strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+    return utc_now()
 
 
 def _import_products_rows(
@@ -910,18 +1020,13 @@ def _import_products_rows(
         category = _norm_category(_import_row_cell(row, fields, "категория") or "аксессуар")
         ownership = _norm_ownership(_import_row_cell(row, fields, "тип") or "own")
         supplier = _import_row_cell(row, fields, "поставщик")
-        brand = _import_row_cell(row, fields, "бренд")
-        model = _import_row_cell(row, fields, "модель")
         color = _import_row_cell(row, fields, "цвет")
         memory = _import_row_cell(row, fields, "память")
-        ram = _import_row_cell(row, fields, "ram")
         condition = _norm_condition(_import_row_cell(row, fields, "состояние") or "new")
         purchase_raw = _import_row_cell(row, fields, "закупка")
         sale_raw = _import_row_cell(row, fields, "цена")
         qty_raw = _import_row_cell(row, fields, "количество") or "1"
         min_stock_raw = _import_row_cell(row, fields, "мин_остаток") or "2"
-        sku = _import_row_cell(row, fields, "артикул")
-        barcode = _import_row_cell(row, fields, "штрихкод")
         imei = _import_row_cell(row, fields, "imei")
         serial = _import_row_cell(row, fields, "серийник")
         notes = _import_row_cell(row, fields, "комментарий")
@@ -959,7 +1064,7 @@ def _import_products_rows(
         if track:
             qty = 1
 
-        existing = _find_product_for_import(conn, sku, name, model, color, memory)
+        existing = _find_product_for_import(conn, name, color, memory)
         if existing:
             product_id = int(existing["id"])
             if purchase > 0 or sale > 0:
@@ -987,9 +1092,9 @@ def _import_products_rows(
                         ?, ?, '', ?, ?, 0, 0, '', ?, ?, '')
                 """,
                 (
-                    name, category, ownership, supplier, brand, sku, barcode,
+                    name, category, ownership, supplier, "", "", "",
                     purchase, sale, min_stock, utc_now(),
-                    model, color, memory, ram, condition, track_val,
+                    "", color, memory, "", condition, track_val,
                 ),
             )
             product_id = int(cur.lastrowid)
@@ -1030,6 +1135,167 @@ def _import_products_rows(
         "stock_added": updated_stock,
         "errors": errors,
         "total_rows": len(rows),
+    }
+
+
+def _import_sales_rows(
+    conn: sqlite3.Connection, rows: list[dict[str, Any]], warehouse_id: int
+) -> dict[str, Any]:
+    from collections import defaultdict
+
+    if not rows:
+        raise HTTPException(status_code=400, detail="Нет строк для импорта")
+    first = rows[0]
+    fields = {str(k).strip().lower(): k for k in first.keys()}
+    parsed: list[tuple[int, dict[str, Any], str, str, str]] = []
+    errors: list[str] = []
+
+    for i, row in enumerate(rows, start=2):
+        name = _import_row_cell(row, fields, "название", IMPORT_SALE_ALIASES)
+        if not name:
+            continue
+        notes = _import_row_cell(row, fields, "комментарий", IMPORT_SALE_ALIASES)
+        if "удалите" in notes.lower() or "пример" in notes.lower():
+            continue
+        date_raw = row.get(fields.get("дата", "")) if fields.get("дата") else None
+        if date_raw is None:
+            for alias in IMPORT_SALE_ALIASES["дата"]:
+                key = fields.get(alias)
+                if key and row.get(key) not in (None, ""):
+                    date_raw = row[key]
+                    break
+        date_key = _parse_import_datetime(date_raw)
+        check = _import_row_cell(row, fields, "чек", IMPORT_SALE_ALIASES) or str(i)
+        parsed.append((i, row, date_key, check, name))
+
+    if not parsed:
+        raise HTTPException(status_code=400, detail="Нет строк с названием товара")
+
+    groups: dict[tuple[str, str], list[tuple[int, dict[str, Any]]]] = defaultdict(list)
+    for i, row, date_key, check, _name in parsed:
+        groups[(date_key, check)].append((i, row))
+
+    created_sales = 0
+    created_lines = 0
+
+    for (date_key, _check), group_rows in groups.items():
+        discount = 0.0
+        payment_method = "cash"
+        user_name = "Импорт"
+        notes = ""
+        lines: list[dict[str, Any]] = []
+
+        for idx, (i, row) in enumerate(group_rows):
+            name = _import_row_cell(row, fields, "название", IMPORT_SALE_ALIASES)
+            imei = _import_row_cell(row, fields, "imei", IMPORT_SALE_ALIASES)
+            qty_raw = _import_row_cell(row, fields, "количество", IMPORT_SALE_ALIASES) or "1"
+            price_raw = _import_row_cell(row, fields, "цена", IMPORT_SALE_ALIASES)
+            disc_raw = _import_row_cell(row, fields, "скидка", IMPORT_SALE_ALIASES)
+            pay_raw = _import_row_cell(row, fields, "оплата", IMPORT_SALE_ALIASES)
+            cashier = _import_row_cell(row, fields, "кассир", IMPORT_SALE_ALIASES)
+            row_notes = _import_row_cell(row, fields, "комментарий", IMPORT_SALE_ALIASES)
+
+            if idx == 0:
+                if pay_raw:
+                    payment_method = _norm_payment(pay_raw)
+                if cashier:
+                    user_name = cashier
+                if row_notes:
+                    notes = row_notes
+            try:
+                qty = max(1, int(float(str(qty_raw).replace(",", "."))))
+            except ValueError:
+                errors.append(f"Строка {i}: неверное количество")
+                continue
+            unit_price: float | None = None
+            if price_raw:
+                try:
+                    unit_price = float(str(price_raw).replace(",", "."))
+                except ValueError:
+                    errors.append(f"Строка {i}: неверная цена")
+                    continue
+            if disc_raw and idx == 0:
+                try:
+                    discount = max(0.0, float(str(disc_raw).replace(",", ".")))
+                except ValueError:
+                    errors.append(f"Строка {i}: неверная скидка")
+                    continue
+
+            product = _find_product_by_name(conn, name)
+            if not product:
+                errors.append(f"Строка {i}: товар «{name}» не найден — сначала импортируйте товары")
+                continue
+            calc = calc_line(product, qty, unit_price)
+            lines.append({"product": product, "qty": qty, "imei": imei, **calc})
+
+        if not lines:
+            continue
+
+        subtotal = sum(float(l["subtotal"]) for l in lines)
+        total = max(0.0, subtotal - discount)
+        pay_payload = [{"method_code": payment_method, "amount": total}]
+        try:
+            cash_amount, card_amount, payment_method, pay_payload = validate_sale_payments(
+                conn, pay_payload, total
+            )
+        except HTTPException as exc:
+            errors.append(f"Чек {date_key}: {exc.detail}")
+            continue
+
+        sale_notes = notes or "Импорт продаж"
+        cur = conn.execute(
+            """
+            INSERT INTO sales
+            (total, discount, payment_method, status, notes, created_at,
+             warehouse_id, cash_amount, card_amount, trade_in_value, shift_id, user_id, user_name)
+            VALUES (?, ?, ?, 'completed', ?, ?, ?, ?, ?, 0, NULL, NULL, ?)
+            """,
+            (
+                total, discount, payment_method, sale_notes, date_key,
+                warehouse_id, cash_amount, card_amount, user_name,
+            ),
+        )
+        sale_id = int(cur.lastrowid)
+        insert_sale_payments(conn, sale_id, pay_payload)
+
+        for line in lines:
+            p = line["product"]
+            cur_item = conn.execute(
+                """
+                INSERT INTO sale_items
+                (sale_id, product_id, product_name, ownership_type, supplier_name, quantity,
+                 unit_price, purchase_price, supplier_due, shop_profit, subtotal)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    sale_id, p["id"], p["name"], line["ownership_type"], line["supplier_name"],
+                    line["qty"], line["unit_price"], line["purchase_price"],
+                    line["supplier_due"], line["shop_profit"], line["subtotal"],
+                ),
+            )
+            sale_item_id = int(cur_item.lastrowid)
+            imei = line.get("imei") or ""
+            if imei:
+                unit = conn.execute(
+                    "SELECT id FROM product_units WHERE imei = ? LIMIT 1", (imei,)
+                ).fetchone()
+                if unit:
+                    conn.execute(
+                        """
+                        INSERT INTO sale_item_units
+                        (sale_item_id, unit_id, imei, serial, customs_cleared, customs_price, imei_pending)
+                        VALUES (?, ?, ?, '', 0, 0, 0)
+                        """,
+                        (sale_item_id, unit["id"], imei),
+                    )
+            created_lines += 1
+        created_sales += 1
+
+    return {
+        "created_sales": created_sales,
+        "created_lines": created_lines,
+        "errors": errors,
+        "total_rows": len(parsed),
     }
 
 
@@ -3059,6 +3325,34 @@ async def import_products_file(
     with db() as conn:
         wh_id = resolve_warehouse_id(conn, warehouse_id)
         result = _import_products_rows(conn, rows, wh_id)
+    return result
+
+
+@app.get("/api/import/sales/template")
+async def import_sales_template(x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin, min_role="cashier")
+    data = build_sales_import_xlsx()
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="telestore_sales_import.xlsx"'},
+    )
+
+
+@app.post("/api/import/sales")
+async def import_sales_file(
+    file: UploadFile = File(...),
+    warehouse_id: int | None = Query(default=None),
+    x_pin: str | None = Header(default=None, alias="X-Pin"),
+):
+    check_pin(x_pin, min_role="cashier")
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Пустой файл")
+    rows = _parse_import_file(raw, file.filename or "import.csv", sheet="Продажи")
+    with db() as conn:
+        wh_id = resolve_warehouse_id(conn, warehouse_id)
+        result = _import_sales_rows(conn, rows, wh_id)
     return result
 
 

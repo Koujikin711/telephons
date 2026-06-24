@@ -187,6 +187,24 @@
             </select>
             <button id="refresh-sales" class="btn btn-secondary">Обновить</button>
           </div>
+          <div class="card import-card">
+            <div class="card-header"><h3>Импорт продаж из Excel</h3></div>
+            <div class="card-body import-card-body">
+              <p class="muted import-hint">Сначала загрузите товары. Заполните шаблон — отчёты и аналитика обновятся автоматически (склад не списывается).</p>
+              <div class="import-actions">
+                <button type="button" id="sales-download-template" class="btn btn-secondary">Скачать шаблон Excel</button>
+                <label class="import-file-label">
+                  <span class="btn btn-ghost">Выбрать файл…</span>
+                  <input type="file" id="sales-import-file" accept=".xlsx,.csv" hidden>
+                </label>
+                <span id="sales-import-filename" class="muted import-filename">Файл не выбран</span>
+              </div>
+              <form id="sales-import-form" class="form-stack import-form">
+                <button type="submit" class="btn btn-primary" id="sales-import-submit" disabled>Загрузить продажи</button>
+              </form>
+              <div id="sales-import-result" class="import-result hidden"></div>
+            </div>
+          </div>
           <div class="card"><div class="table-wrap"><table class="data-table">
             <thead><tr><th>№</th><th>Дата</th><th>Кассир</th><th>Сумма</th><th>Оплата</th><th></th></tr></thead>
             <tbody id="sales-tbody"></tbody>
@@ -830,28 +848,20 @@
         <label id="ib-supplier-row" class="hidden">Поставщик<input id="ib-supplier" class="input"></label>
         <label>Название<input id="ib-name" class="input" required placeholder="iPhone 15 Pro 256GB Black"></label>
         <div class="form-row">
-          <label>Бренд<input id="ib-brand" class="input"></label>
-          <label>Модель<input id="ib-model" class="input"></label>
-        </div>
-        <div class="form-row">
           <label>Цвет<input id="ib-color" class="input"></label>
           <label>Память<input id="ib-memory" class="input" placeholder="256 ГБ"></label>
         </div>
         <div class="form-row">
-          <label>RAM<input id="ib-ram" class="input"></label>
           <label>Состояние<select id="ib-condition" class="select">
             <option value="new">Новый</option>
             <option value="used">Б/у</option>
             <option value="refurbished">Восстановленный</option>
           </select></label>
+          <span></span>
         </div>
         <div class="form-row">
           <label>Закупочная цена<input type="number" id="ib-purchase" class="input" min="0" step="0.01" required></label>
           <label>Цена продажи<input type="number" id="ib-sale" class="input" min="0" step="0.01" required></label>
-        </div>
-        <div class="form-row">
-          <label>Артикул<input id="ib-sku" class="input"></label>
-          <label>Штрихкод<input id="ib-barcode" class="input"></label>
         </div>
         <label id="ib-qty-row">Количество<input type="number" id="ib-qty" class="input" min="1" value="1"></label>
       </div>
@@ -979,6 +989,6 @@
   </dialog>
 
   <div id="toast" class="toast"></div>
-  <script src="/static/app.js?v=17"></script>
+  <script src="/static/app.js?v=18"></script>
 </body>
 </html>

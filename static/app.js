@@ -1052,6 +1052,103 @@ function bindSales() {
   document.getElementById("sale-detail-print").onclick = () => {
     if (lastSaleDetail) printReceiptHtml(renderReceiptHtml(lastSaleDetail));
   };
+  document.getElementById("sales-download-template")?.addEventListener("click", downloadSalesImportTemplate);
+  document.getElementById("sales-import-file")?.addEventListener("change", onSalesImportFileSelected);
+  document.getElementById("sales-import-form")?.addEventListener("submit", submitSalesImport);
+}
+
+let salesImportFile = null;
+
+function onSalesImportFileSelected(e) {
+  salesImportFile = e.target.files?.[0] || null;
+  const nameEl = document.getElementById("sales-import-filename");
+  const submitBtn = document.getElementById("sales-import-submit");
+  if (nameEl) nameEl.textContent = salesImportFile ? salesImportFile.name : "Файл не выбран";
+  if (submitBtn) submitBtn.disabled = !salesImportFile;
+}
+
+async function downloadSalesImportTemplate() {
+  try {
+    const headers = {};
+    if (pin) headers["X-Pin"] = pin;
+    const res = await fetch("/api/import/sales/template", { headers });
+    if (res.status === 401) {
+      pin = "";
+      localStorage.removeItem(PIN_KEY);
+      showLogin();
+      throw new Error("Неверный PIN — войдите снова");
+    }
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(typeof err.detail === "string" ? err.detail : "Не удалось скачать шаблон");
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "telestore_sales_import.xlsx";
+    a.click();
+    URL.revokeObjectURL(url);
+    toast("Шаблон продаж скачан");
+  } catch (err) {
+    toast(err.message, "error");
+  }
+}
+
+async function submitSalesImport(e) {
+  e.preventDefault();
+  if (!salesImportFile) {
+    toast("Выберите файл Excel или CSV", "error");
+    return;
+  }
+  const resultEl = document.getElementById("sales-import-result");
+  const submitBtn = document.getElementById("sales-import-submit");
+  if (submitBtn) submitBtn.disabled = true;
+  try {
+    const headers = {};
+    if (pin) headers["X-Pin"] = pin;
+    const fd = new FormData();
+    fd.append("file", salesImportFile);
+    const res = await fetch("/api/import/sales", { method: "POST", headers, body: fd });
+    if (res.status === 401) {
+      pin = "";
+      localStorage.removeItem(PIN_KEY);
+      showLogin();
+      throw new Error("Неверный PIN — войдите снова");
+    }
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(typeof data.detail === "string" ? data.detail : "Ошибка импорта");
+    }
+    const errLines = (data.errors || []).slice(0, 8);
+    const more = (data.errors || []).length > 8 ? `<br>…и ещё ${data.errors.length - 8}` : "";
+    if (resultEl) {
+      resultEl.classList.remove("hidden", "has-errors");
+      resultEl.innerHTML = `
+        <strong>Импорт завершён</strong><br>
+        Чеков: ${data.created_sales || 0} · Позиций: ${data.created_lines || 0}
+        ${errLines.length ? `<br><span style="color:var(--danger)">Предупреждения:<br>${errLines.map(esc).join("<br>")}${more}</span>` : ""}`;
+      if (!errLines.length) resultEl.classList.remove("has-errors");
+      else resultEl.classList.add("has-errors");
+    }
+    toast(`Импорт: ${data.created_sales || 0} продаж`);
+    salesImportFile = null;
+    const fileInput = document.getElementById("sales-import-file");
+    if (fileInput) fileInput.value = "";
+    onSalesImportFileSelected({ target: { files: [] } });
+    loadSales();
+    if (currentPage === "dashboard") loadDashboard();
+    if (currentPage === "analytics") loadAnalytics();
+  } catch (err) {
+    toast(err.message, "error");
+    if (resultEl) {
+      resultEl.classList.remove("hidden");
+      resultEl.classList.add("has-errors");
+      resultEl.textContent = err.message;
+    }
+  } finally {
+    if (submitBtn) submitBtn.disabled = !salesImportFile;
+  }
 }
 
 async function loadSales() {
@@ -1568,7 +1665,7 @@ async function openInboundModal() {
   document.querySelectorAll("#inbound-mode-tabs .seg").forEach((x) => x.classList.toggle("active", x.dataset.inboundMode === "new"));
   document.getElementById("inbound-panel-new").classList.remove("hidden");
   document.getElementById("inbound-panel-existing").classList.add("hidden");
-  ["ib-name", "ib-brand", "ib-model", "ib-color", "ib-memory", "ib-ram", "ib-sku", "ib-barcode", "ib-imei", "ib-serial", "ib-notes", "ib-supplier"].forEach((id) => {
+  ["ib-name", "ib-color", "ib-memory", "ib-imei", "ib-serial", "ib-notes", "ib-supplier"].forEach((id) => {
     const el = document.getElementById(id);
     if (el) el.value = "";
   });
@@ -1612,16 +1709,11 @@ async function submitInboundReceipt(e) {
       category: document.getElementById("ib-category").value,
       ownership_type: document.getElementById("ib-ownership").value,
       supplier_name: document.getElementById("ib-supplier").value.trim(),
-      brand: document.getElementById("ib-brand").value.trim(),
-      model: document.getElementById("ib-model").value.trim(),
       color: document.getElementById("ib-color").value.trim(),
       memory: document.getElementById("ib-memory").value.trim(),
-      ram: document.getElementById("ib-ram").value.trim(),
       condition: document.getElementById("ib-condition").value,
       purchase_price: +document.getElementById("ib-purchase").value,
       sale_price: +document.getElementById("ib-sale").value,
-      sku: document.getElementById("ib-sku").value.trim(),
-      barcode: document.getElementById("ib-barcode").value.trim(),
     };
     if (isUsedCondition(body.product.condition) && battery == null) {
       toast("Для Б/у укажите ёмкость батареи", "error");
