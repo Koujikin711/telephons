@@ -4,3 +4,9 @@ __pycache__/
 *.db
 data/
 .venv/
+
+node_modules
+
+*.session
+
+demo-desktop/runtime/.venv
