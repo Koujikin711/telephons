@@ -1330,7 +1330,50 @@ body {
   .content { padding: 1rem; }
 }
 
-/* ── Catalog gallery ── */
+/* ── Simple UI mode ── */
+body.simple-ui .toolbar-advanced { display: none !important; }
+body.simple-ui .input-lg {
+  font-size: 1.05rem;
+  padding: 0.85rem 1rem;
+  min-height: 48px;
+}
+body.simple-ui .product-grid {
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 0.85rem;
+}
+body.simple-ui .product-card {
+  padding: 1rem;
+  min-height: 110px;
+  cursor: pointer;
+}
+body.simple-ui .product-card .name {
+  font-size: 1rem;
+  font-weight: 600;
+  line-height: 1.25;
+}
+body.simple-ui .product-card .price {
+  font-size: 1.15rem;
+  font-weight: 700;
+  margin-top: 0.35rem;
+}
+body.simple-ui .pos-empty {
+  padding: 2rem 1rem;
+  text-align: center;
+  color: var(--muted);
+  font-size: 1rem;
+}
+body.simple-ui .sidebar-nav .nav-item {
+  font-size: 0.95rem;
+  padding: 0.65rem 0.85rem;
+}
+.toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  cursor: pointer;
+  user-select: none;
+}
+.toggle-row input { width: 1.1rem; height: 1.1rem; }
 .catalog-hero {
   display: flex;
   align-items: center;

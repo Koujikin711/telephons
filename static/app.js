@@ -1,5 +1,9 @@
 const PIN_KEY = "telephons_pin";
+const ADVANCED_UI_KEY = "telephons_advanced";
 let pin = localStorage.getItem(PIN_KEY) || "";
+let simpleUi = true;
+let serverSimpleUi = true;
+let fullRolePages = null;
 let products = [];
 let warehouses = [];
 let cart = [];
@@ -49,6 +53,19 @@ let pendingProductImage = null;
 let pendingProductImageUrl = null;
 
 const ROLE_LABELS = { owner: "Владелец", warehouse: "Кладовщик", cashier: "Кассир", accessories: "Аксессуары" };
+
+const ADVANCED_PAGES = new Set([
+  "dashboard", "products-own", "products-consignment", "imei", "stocktake",
+  "debtors", "creditors", "analytics", "users",
+]);
+
+function effectiveSimpleUi() {
+  return serverSimpleUi && simpleUi && !localStorage.getItem(ADVANCED_UI_KEY);
+}
+
+function syncSimpleBodyClass() {
+  document.body.classList.toggle("simple-ui", effectiveSimpleUi());
+}
 
 const fmt = (n) => {
   const code = storeConfig.currency?.code || "TJS";
@@ -376,13 +393,13 @@ const PAGE_TITLES = {
   dashboard: "Обзор",
   pos: "Касса",
   sales: "Продажи",
-  warehouses: "Склады",
+  warehouses: "Склад",
   "products-own": "Собственные товары",
   "products-consignment": "Под реализацию",
   accessories: "Аксессуары",
   imei: "IMEI / Серийники",
   users: "Пользователи",
-  reports: "Финансовые отчёты",
+  reports: "Отчёты",
   debtors: "Дебиторка",
   creditors: "Кредиторка",
   analytics: "Аналитика",
@@ -405,14 +422,24 @@ function whStock(p, whId) {
   return +(p.stock_by_warehouse[String(whId)] ?? p.stock_by_warehouse[whId] ?? 0);
 }
 
+function pagesForCurrentUser() {
+  if (!effectiveSimpleUi() && fullRolePages && currentUser?.role) {
+    return fullRolePages[currentUser.role] || allowedPages;
+  }
+  return allowedPages;
+}
+
 function canAccess(page) {
-  return !allowedPages || allowedPages.includes(page);
+  const pages = pagesForCurrentUser();
+  return !pages || pages.includes(page);
 }
 
 function firstAllowedPage() {
-  if (!allowedPages?.length) return "dashboard";
-  if (currentUser?.role === "accessories" && allowedPages.includes("accessories")) return "accessories";
-  return allowedPages.includes("dashboard") ? "dashboard" : allowedPages[0];
+  const pages = pagesForCurrentUser();
+  if (!pages?.length) return effectiveSimpleUi() ? "pos" : "dashboard";
+  if (currentUser?.role === "accessories" && pages.includes("accessories")) return "accessories";
+  if (effectiveSimpleUi() && pages.includes("pos")) return "pos";
+  return pages.includes("dashboard") ? "dashboard" : pages[0];
 }
 
 async function refreshSession() {
@@ -422,6 +449,7 @@ async function refreshSession() {
     currentUser = data.user;
     allowedPages = data.pages;
     openShift = data.open_shift;
+    if (typeof data.simple_ui === "boolean") serverSimpleUi = data.simple_ui;
   } catch {
     if (authRequired) throw new Error("auth");
     const shiftData = await api("/api/shifts/current").catch(() => ({ shift: null }));
@@ -429,6 +457,37 @@ async function refreshSession() {
   }
   updateTopbar();
   applyRoleNav();
+  applySimpleNav();
+}
+
+function applySimpleNav() {
+  syncSimpleBodyClass();
+  if (!effectiveSimpleUi()) return;
+  document.querySelectorAll(".nav-advanced").forEach((el) => el.classList.add("hidden"));
+  document.querySelectorAll(".nav-item").forEach((btn) => {
+    const page = btn.dataset.page;
+    if (ADVANCED_PAGES.has(page)) btn.classList.add("hidden");
+  });
+  document.querySelectorAll(".nav-group-label").forEach((label) => {
+    let el = label.nextElementSibling;
+    let anyVisible = false;
+    while (el && !el.classList.contains("nav-group-label")) {
+      if (el.classList.contains("nav-item") && !el.classList.contains("hidden")) anyVisible = true;
+      el = el.nextElementSibling;
+    }
+    label.classList.toggle("hidden", !anyVisible);
+  });
+  const whSel = document.getElementById("pos-warehouse");
+  const whWrap = whSel?.closest(".toolbar-optional");
+  if (whWrap && phoneWarehouses().length <= 1) whWrap.classList.add("hidden");
+}
+
+function updateAdvancedUiToggle() {
+  const cb = document.getElementById("toggle-advanced-ui");
+  if (!cb) return;
+  cb.checked = !!localStorage.getItem(ADVANCED_UI_KEY);
+  const card = document.getElementById("simple-mode-card");
+  if (card) card.classList.toggle("hidden", !serverSimpleUi || currentUser?.role !== "owner");
 }
 
 function updateTopbar() {
@@ -449,9 +508,10 @@ function updateTopbar() {
 }
 
 function applyRoleNav() {
+  const pages = pagesForCurrentUser();
   document.querySelectorAll(".nav-item").forEach((btn) => {
     const page = btn.dataset.page;
-    btn.classList.toggle("hidden", allowedPages && !allowedPages.includes(page));
+    btn.classList.toggle("hidden", pages && !pages.includes(page));
   });
   document.querySelectorAll(".nav-group-label").forEach((label) => {
     let el = label.nextElementSibling;
@@ -592,6 +652,9 @@ async function init() {
     if (!res.ok) throw new Error("config");
     const cfg = await res.json();
     authRequired = cfg.auth_required;
+    serverSimpleUi = cfg.simple_ui !== false;
+    simpleUi = serverSimpleUi;
+    fullRolePages = cfg.role_pages || null;
     document.getElementById("store-name").textContent = cfg.store_name || "TeleStore";
     if (cfg.currency) storeConfig.currency = cfg.currency;
     if (cfg.payment_methods?.length) storeConfig.payment_methods = cfg.payment_methods;
@@ -612,6 +675,8 @@ async function init() {
 
     if (!authRequired) allowedPages = null;
     showApp();
+    syncSimpleBodyClass();
+    updateAdvancedUiToggle();
     startClock();
     bindNav();
     bindGlobalActions();
@@ -938,20 +1003,28 @@ async function loadProducts() {
 function renderPosProducts() {
   const grid = document.getElementById("pos-products");
   const whId = +document.getElementById("pos-warehouse")?.value;
-  if (!products.length) { grid.innerHTML = '<p style="padding:1rem;color:var(--muted)">Товары не найдены</p>'; return; }
+  const compact = effectiveSimpleUi();
+  if (!products.length) {
+    grid.innerHTML = `<p class="pos-empty">${compact ? "Ничего не найдено — измените поиск" : "Товары не найдены"}</p>`;
+    return;
+  }
   grid.innerHTML = products.map((p) => {
     const stock = whStock(p, whId);
     const out = stock <= 0;
     const margin = p.sale_price - p.purchase_price;
     const meta = [p.model, p.color, p.memory].filter(Boolean).join(" · ");
-    const imeiTag = p.track_units ? ' · <span class="tag" style="font-size:.6rem">IMEI</span>' : "";
+    const ownTag = compact ? "" : `<span class="tag tag-${p.ownership_type === "consignment" ? "cons" : "own"}">${ownLabel(p.ownership_type)}</span>`;
+    const metaLine = compact
+      ? (out ? "Нет в наличии" : `В наличии: ${stock}`)
+      : `${esc(p.brand)} · ${catLabel(p.category)}${meta ? ` · ${esc(meta)}` : ""}${p.track_units ? ' · <span class="tag" style="font-size:.6rem">IMEI</span>' : ""}`;
+    const marginLine = compact ? "" : `<div class="meta">${out ? "Нет в наличии" : `Ост: ${stock} · +${posMoney(margin)}`}</div>`;
     return `<div class="product-card ${out ? "out" : ""}" data-id="${p.id}">
-      ${p.image_url ? `<div class="product-card-thumb"><img src="${esc(p.image_url)}" alt="" loading="lazy"></div>` : ""}
-      <span class="tag tag-${p.ownership_type === "consignment" ? "cons" : "own"}">${ownLabel(p.ownership_type)}</span>
+      ${p.image_url && !compact ? `<div class="product-card-thumb"><img src="${esc(p.image_url)}" alt="" loading="lazy"></div>` : ""}
+      ${ownTag}
       <div class="name">${esc(p.name)}</div>
-      <div class="meta">${esc(p.brand)} · ${catLabel(p.category)}${meta ? ` · ${esc(meta)}` : ""}${imeiTag}</div>
+      ${compact && meta ? `<div class="meta">${esc(meta)}</div>` : `<div class="meta">${metaLine}</div>`}
       <div class="price">${posMoney(p.sale_price)}</div>
-      <div class="meta">${out ? "Нет в наличии" : `Ост: ${stock} · +${posMoney(margin)}`}</div>
+      ${marginLine}
     </div>`;
   }).join("");
   grid.querySelectorAll(".product-card:not(.out)").forEach((c) => {
@@ -3904,6 +3977,18 @@ function collectSplitPayments() {
 }
 
 function bindSettings() {
+  document.getElementById("toggle-advanced-ui")?.addEventListener("change", (e) => {
+    if (e.target.checked) localStorage.setItem(ADVANCED_UI_KEY, "1");
+    else localStorage.removeItem(ADVANCED_UI_KEY);
+    applySimpleNav();
+    const page = currentPage;
+    if (!canAccess(page) || (effectiveSimpleUi() && ADVANCED_PAGES.has(page))) {
+      navigate(firstAllowedPage());
+    } else {
+      navigate(page);
+    }
+    toast(e.target.checked ? "Расширенный интерфейс включён" : "Простой режим");
+  });
   document.getElementById("currency-form")?.addEventListener("submit", async (e) => {
     e.preventDefault();
     try {
@@ -3980,6 +4065,7 @@ async function wipeCatalogData() {
 }
 
 async function loadSettingsPage() {
+  updateAdvancedUiToggle();
   const data = await api("/api/settings");
   document.getElementById("catalog-wipe-card")?.classList.toggle("hidden", currentUser?.role !== "owner");
   document.getElementById("expense-allocation-card")?.classList.toggle("hidden", currentUser?.role !== "owner");

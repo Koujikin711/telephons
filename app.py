@@ -51,7 +51,21 @@ ROLE_PAGES: dict[str, list[str]] = {
     "accessories": ["accessories"],
 }
 
+# Упрощённый интерфейс: только ежедневные задачи (касса, продажи, склад, отчёты).
+SIMPLE_ROLE_PAGES: dict[str, list[str]] = {
+    "owner": ["pos", "sales", "warehouses", "accessories", "reports", "settings"],
+    "warehouse": ["warehouses"],
+    "cashier": ["pos", "sales"],
+    "accessories": ["accessories"],
+}
+
 ROLE_LEVEL = {"cashier": 1, "accessories": 2, "warehouse": 2, "owner": 3}
+
+
+def pages_for_role(role: str, *, simple: bool) -> list[str]:
+    if simple:
+        return list(SIMPLE_ROLE_PAGES.get(role, ["pos"]))
+    return list(ROLE_PAGES.get(role, ["dashboard"]))
 
 
 class Settings(BaseSettings):
@@ -60,6 +74,7 @@ class Settings(BaseSettings):
     store_pin: str = ""
     store_name: str = "Магазин телефонов"
     port: int = 80
+    simple_ui: bool = True
 
 
 settings = Settings()
@@ -3996,7 +4011,9 @@ async def config():
     return {
         "auth_required": user_count > 0 or bool(settings.store_pin),
         "store_name": settings.store_name,
+        "simple_ui": settings.simple_ui,
         "role_pages": ROLE_PAGES,
+        "simple_role_pages": SIMPLE_ROLE_PAGES,
         "currency": currency,
         "payment_methods": payment_methods,
     }
@@ -4013,7 +4030,8 @@ async def auth_check(body: dict):
         return {
             "ok": True,
             "user": {"id": user["id"], "name": user["name"], "role": user["role"]},
-            "pages": ROLE_PAGES.get(user["role"], []),
+            "pages": pages_for_role(user["role"], simple=settings.simple_ui),
+            "simple_ui": settings.simple_ui,
             "open_shift": row_to_dict(shift) if shift else None,
         }
 

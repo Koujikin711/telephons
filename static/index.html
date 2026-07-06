@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/style.css?v=24">
+  <link rel="stylesheet" href="/static/style.css?v=25">
 </head>
 <body>
   <div class="mesh-bg" aria-hidden="true"></div>
@@ -18,11 +18,11 @@
     <div class="login-card">
       <div class="login-brand">
         <div class="brand-icon brand-glow">TS</div>
-        <h1>TeleStore</h1>
-        <p>Управление магазином нового поколения</p>
+        <h1>Магазин</h1>
+        <p>Касса и учёт — просто и быстро</p>
       </div>
       <div class="login-field">
-        <label for="pin-input">PIN-код доступа</label>
+        <label for="pin-input">PIN (если задан)</label>
         <input type="password" id="pin-input" placeholder="••••" maxlength="12" autocomplete="off">
       </div>
       <button id="pin-submit" class="btn btn-primary btn-block btn-glow">Войти в систему</button>
@@ -40,53 +40,53 @@
         </div>
       </div>
       <nav class="sidebar-nav" id="sidebar-nav">
-        <button class="nav-item active" data-page="dashboard">
-          <span class="nav-icon">◫</span> Обзор
+        <button class="nav-item nav-advanced" data-page="dashboard">
+          <span class="nav-icon">◫</span> <span class="nav-label">Обзор</span>
         </button>
         <button class="nav-item" data-page="pos">
-          <span class="nav-icon">⊞</span> Касса
+          <span class="nav-icon">⊞</span> <span class="nav-label">Касса</span>
         </button>
         <button class="nav-item" data-page="sales">
-          <span class="nav-icon">☰</span> Продажи
+          <span class="nav-icon">☰</span> <span class="nav-label">Продажи</span>
         </button>
-        <div class="nav-group-label">Склад</div>
+        <div class="nav-group-label nav-advanced">Склад</div>
         <button class="nav-item" data-page="warehouses">
-          <span class="nav-icon">▦</span> Склады
+          <span class="nav-icon">▦</span> <span class="nav-label">Склад</span>
         </button>
-        <button class="nav-item" data-page="products-own">
-          <span class="nav-icon">▣</span> Собственные товары
+        <button class="nav-item nav-advanced" data-page="products-own">
+          <span class="nav-icon">▣</span> <span class="nav-label">Собственные</span>
         </button>
-        <button class="nav-item" data-page="products-consignment">
-          <span class="nav-icon">⇄</span> Под реализацию
+        <button class="nav-item nav-advanced" data-page="products-consignment">
+          <span class="nav-icon">⇄</span> <span class="nav-label">Реализация</span>
         </button>
-        <button class="nav-item" data-page="imei">
-          <span class="nav-icon">#</span> IMEI / Серийники
+        <button class="nav-item nav-advanced" data-page="imei">
+          <span class="nav-icon">#</span> <span class="nav-label">IMEI</span>
         </button>
-                <button class="nav-item" data-page="stocktake">
-          <span class="nav-icon">☑</span> Инвентаризация
+        <button class="nav-item nav-advanced" data-page="stocktake">
+          <span class="nav-icon">☑</span> <span class="nav-label">Инвентаризация</span>
         </button>
         <button class="nav-item" data-page="accessories">
-          <span class="nav-icon">◎</span> Аксессуары
+          <span class="nav-icon">◎</span> <span class="nav-label">Аксессуары</span>
         </button>
-        <div class="nav-group-label">Финансы</div>
+        <div class="nav-group-label">Ещё</div>
         <button class="nav-item" data-page="reports">
-          <span class="nav-icon">₽</span> Фин. отчёты
+          <span class="nav-icon">₽</span> <span class="nav-label">Отчёты</span>
         </button>
-        <button class="nav-item" data-page="debtors">
-          <span class="nav-icon">📋</span> Дебиторка
+        <button class="nav-item nav-advanced" data-page="debtors">
+          <span class="nav-icon">📋</span> <span class="nav-label">Дебиторка</span>
         </button>
-        <button class="nav-item" data-page="creditors">
-          <span class="nav-icon">📑</span> Кредиторка
+        <button class="nav-item nav-advanced" data-page="creditors">
+          <span class="nav-icon">📑</span> <span class="nav-label">Кредиторка</span>
         </button>
-        <button class="nav-item" data-page="analytics">
-          <span class="nav-icon">↗</span> Аналитика
+        <button class="nav-item nav-advanced" data-page="analytics">
+          <span class="nav-icon">↗</span> <span class="nav-label">Аналитика</span>
         </button>
-        <div class="nav-group-label">Админ</div>
-        <button class="nav-item" data-page="users">
-          <span class="nav-icon">👤</span> Пользователи
+        <div class="nav-group-label nav-advanced">Админ</div>
+        <button class="nav-item nav-advanced" data-page="users">
+          <span class="nav-icon">👤</span> <span class="nav-label">Пользователи</span>
         </button>
         <button class="nav-item" data-page="settings">
-          <span class="nav-icon">⚙</span> Настройки
+          <span class="nav-icon">⚙</span> <span class="nav-label">Настройки</span>
         </button>
       </nav>
       <div class="sidebar-footer">
@@ -98,7 +98,7 @@
       <header class="topbar">
         <div class="topbar-left">
           <h2 id="page-title">Обзор</h2>
-          <p class="topbar-sub">TeleStore · панель управления</p>
+          <p class="topbar-sub" id="topbar-sub">Касса · продажи · склад</p>
         </div>
         <div class="topbar-actions" id="topbar-actions"></div>
       </header>
@@ -132,14 +132,14 @@
           <div class="pos-layout pos-layout-3">
             <div class="pos-left card">
               <div class="toolbar">
-                <select id="pos-warehouse" class="select" title="Склад отгрузки"></select>
-                <span id="pos-currency-hint" class="muted" style="font-size:.8rem;white-space:nowrap"></span>
-                <input type="search" id="pos-search" class="input" placeholder="Поиск, IMEI (5 цифр)…" autofocus>
-                <select id="pos-category" class="select">
+                <select id="pos-warehouse" class="select toolbar-optional" title="Склад отгрузки"></select>
+                <span id="pos-currency-hint" class="muted toolbar-optional" style="font-size:.8rem;white-space:nowrap"></span>
+                <input type="search" id="pos-search" class="input input-lg" placeholder="Найти телефон или введите IMEI…" autofocus>
+                <select id="pos-category" class="select toolbar-advanced">
                   <option value="">Все категории</option>
                   <option value="phone">Телефоны</option>
                 </select>
-                <select id="pos-ownership" class="select">
+                <select id="pos-ownership" class="select toolbar-advanced">
                   <option value="">Все товары</option>
                   <option value="own">Собственные</option>
                   <option value="consignment">Реализация</option>
@@ -587,6 +587,16 @@
 
         <!-- SETTINGS -->
         <section id="page-settings" class="page">
+          <div class="card simple-only-card" id="simple-mode-card">
+            <div class="card-header"><h3>Режим интерфейса</h3></div>
+            <div class="card-body">
+              <p class="muted" style="margin-bottom:0.75rem">Простой режим — только касса, продажи и склад. Расширенный — все разделы ERP.</p>
+              <label class="toggle-row">
+                <input type="checkbox" id="toggle-advanced-ui">
+                <span>Расширенный интерфейс (все разделы меню)</span>
+              </label>
+            </div>
+          </div>
           <div class="grid-2">
             <div class="card">
               <div class="card-header"><h3>Валюта</h3></div>
@@ -1177,6 +1187,6 @@
   </dialog>
 
   <div id="toast" class="toast"></div>
-  <script src="/static/app.js?v=43"></script>
+  <script src="/static/app.js?v=44"></script>
 </body>
 </html>
