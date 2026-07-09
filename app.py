@@ -39,7 +39,7 @@ DEFAULT_WAREHOUSE_NAME = "Основной склад"
 
 ROLE_PAGES: dict[str, list[str]] = {
     "owner": [
-        "dashboard", "pos", "sales", "warehouses", "products-own",
+        "dashboard", "pos", "shifts", "sales", "warehouses", "products-own",
         "products-consignment", "accessories", "reports", "analytics", "debtors", "creditors",
         "imei", "stocktake", "settings",
     ],
@@ -47,15 +47,15 @@ ROLE_PAGES: dict[str, list[str]] = {
         "dashboard", "warehouses", "products-own", "products-consignment",
         "accessories", "imei", "stocktake",
     ],
-    "cashier": ["dashboard", "pos", "sales", "debtors"],
+    "cashier": ["dashboard", "pos", "shifts", "sales", "debtors"],
     "accessories": ["accessories"],
 }
 
 # Упрощённый интерфейс: касса, склад, взаиморасчёты — без отдельного раздела «Продажи».
 SIMPLE_ROLE_PAGES: dict[str, list[str]] = {
-    "owner": ["pos", "warehouses", "debtors", "stocktake", "accessories", "reports", "settings"],
+    "owner": ["pos", "shifts", "warehouses", "debtors", "stocktake", "accessories", "reports", "settings"],
     "warehouse": ["warehouses", "stocktake", "imei"],
-    "cashier": ["pos", "debtors"],
+    "cashier": ["pos", "shifts", "debtors"],
     "accessories": ["accessories"],
 }
 
@@ -4107,7 +4107,7 @@ async def web_manifest():
 async def health():
     return {
         "status": "ok",
-        "build": "client-tz-v1",
+        "build": "client-tz-v2",
         "db": str(DB_PATH),
         "db_exists": DB_PATH.exists(),
     }
@@ -6574,7 +6574,9 @@ async def create_sale(body: SaleIn, x_pin: str | None = Header(default=None, ali
         warehouse_id = resolve_warehouse_id(conn, body.warehouse_id)
         user = resolve_user(conn, x_pin)
         shift = get_open_shift(conn)
-        shift_id = body.shift_id or (shift["id"] if shift else None)
+        if not shift:
+            raise HTTPException(status_code=400, detail="Сначала откройте смену")
+        shift_id = body.shift_id or shift["id"]
 
         subtotal = 0.0
         lines: list[dict[str, Any]] = []

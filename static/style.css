@@ -1378,6 +1378,34 @@ body.simple-ui .table-actions {
   flex-wrap: wrap;
   gap: 0.35rem;
 }
+.topbar-status {
+  font-size: 0.78rem;
+  font-weight: 600;
+  padding: 0.25rem 0.55rem;
+  border-radius: 999px;
+  margin-right: 0.5rem;
+}
+.topbar-status.is-offline {
+  background: rgba(239, 68, 68, 0.15);
+  color: #f87171;
+}
+.topbar-status.is-sync {
+  background: rgba(234, 179, 8, 0.15);
+  color: #fbbf24;
+}
+.sunday-banner {
+  border-color: rgba(99, 102, 241, 0.45);
+  background: rgba(99, 102, 241, 0.08);
+}
+.link-btn {
+  background: none;
+  border: none;
+  color: var(--accent);
+  text-decoration: underline;
+  cursor: pointer;
+  font: inherit;
+  padding: 0;
+}
 .toggle-row {
   display: flex;
   align-items: center;

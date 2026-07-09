@@ -53,11 +53,20 @@ let pendingProductImage = null;
 let pendingProductImageUrl = null;
 
 const OFFLINE_QUEUE_KEY = "telestore_offline_sales";
+const PRODUCTS_CACHE_KEY = "telestore_products_cache";
 
+function offlineQueueCount() {
+  try {
+    return JSON.parse(localStorage.getItem(OFFLINE_QUEUE_KEY) || "[]").length;
+  } catch {
+    return 0;
+  }
+}
 function enqueueOfflineSale(payload) {
   const q = JSON.parse(localStorage.getItem(OFFLINE_QUEUE_KEY) || "[]");
   q.push({ payload, queued_at: new Date().toISOString() });
   localStorage.setItem(OFFLINE_QUEUE_KEY, JSON.stringify(q));
+  updateTopbar();
 }
 
 async function flushOfflineQueue() {
@@ -77,6 +86,7 @@ async function flushOfflineQueue() {
   localStorage.setItem(OFFLINE_QUEUE_KEY, JSON.stringify(remain));
   if (ok) {
     toast(`Синхронизировано офлайн-продаж: ${ok}`);
+    updateTopbar();
     if (currentPage === "pos") {
       await loadProducts();
       loadPosCashRegister();
@@ -430,6 +440,7 @@ function sortCatalogItems(items, sort) {
 const PAGE_TITLES = {
   dashboard: "Обзор",
   pos: "Касса",
+  shifts: "Смена",
   sales: "Продажи",
   warehouses: "Склад",
   "products-own": "Собственные товары",
@@ -438,7 +449,7 @@ const PAGE_TITLES = {
   imei: "IMEI / Серийники",
   users: "Пользователи",
   reports: "Отчёты",
-  debtors: "Дебиторка",
+  debtors: "Взаиморасчёты",
   creditors: "Кредиторка",
   analytics: "Аналитика",
   settings: "Настройки",
@@ -496,6 +507,7 @@ async function refreshSession() {
   updateTopbar();
   applyRoleNav();
   applySimpleNav();
+  updatePosShiftHint();
 }
 
 function applySimpleNav() {
@@ -534,10 +546,15 @@ function updateAdvancedUiToggle() {
 function updateTopbar() {
   const actions = document.getElementById("topbar-actions");
   if (!actions) return;
+  const offline = !navigator.onLine;
+  const qn = offlineQueueCount();
+  const statusBadge = offline || qn
+    ? `<span class="topbar-status ${offline ? "is-offline" : "is-sync"}">${offline ? "Офлайн" : "Онлайн"}${qn ? ` · ${qn} в очереди` : ""}</span>`
+    : "";
   const userBadge = currentUser
     ? `<span class="topbar-user">${esc(currentUser.name)} · ${ROLE_LABELS[currentUser.role] || currentUser.role}</span>`
     : "";
-  actions.innerHTML = `${userBadge}<button class="btn btn-ghost btn-sm" id="btn-logout">Выход</button>`;
+  actions.innerHTML = `${statusBadge}${userBadge}<button class="btn btn-ghost btn-sm" id="btn-logout">Выход</button>`;
   document.getElementById("btn-logout")?.addEventListener("click", () => {
     pin = "";
     localStorage.removeItem(PIN_KEY);
@@ -546,6 +563,21 @@ function updateTopbar() {
     openShift = null;
     showLogin();
   });
+}
+
+function updatePosShiftHint() {
+  const hint = document.getElementById("pos-shift-hint");
+  const btn = document.getElementById("checkout-btn");
+  if (!hint) return;
+  if (openShift) {
+    hint.classList.add("hidden");
+    hint.textContent = "";
+  } else {
+    hint.classList.remove("hidden");
+    hint.innerHTML = 'Смена не открыта — <button type="button" class="link-btn" id="pos-goto-shift">открыть смену</button>';
+    document.getElementById("pos-goto-shift")?.addEventListener("click", () => navigate("shifts"));
+    if (btn) btn.disabled = true;
+  }
 }
 
 function applyRoleNav() {
@@ -633,6 +665,7 @@ function navigate(page) {
   const loaders = {
     dashboard: loadDashboard,
     pos: loadPos,
+    shifts: loadShiftsPage,
     sales: loadSales,
     warehouses: loadWarehousesPage,
     "products-own": loadOwnProducts,
@@ -737,7 +770,9 @@ async function init() {
     bindUsers();
     bindSettings();
     bindStocktake();
-    window.addEventListener("online", flushOfflineQueue);
+    bindShifts();
+    window.addEventListener("online", () => { updateTopbar(); flushOfflineQueue(); });
+    window.addEventListener("offline", updateTopbar);
     if ("serviceWorker" in navigator) {
       navigator.serviceWorker.ready.then(() => flushOfflineQueue()).catch(() => {});
     }
@@ -1028,6 +1063,7 @@ async function loadPos() {
     curHint.textContent = cur.code === "USD" ? "Цены в $" : "Цены в смн";
   }
   focusScanInput("pos-search");
+  updatePosShiftHint();
 }
 
 async function loadProducts() {
@@ -1040,7 +1076,18 @@ async function loadProducts() {
   if (cat) url += `&category=${cat}`;
   if (own) url += `&ownership_type=${own}`;
   if (wh) url += `&warehouse_id=${wh}`;
-  products = await api(url);
+  try {
+    products = await api(url);
+    localStorage.setItem(PRODUCTS_CACHE_KEY, JSON.stringify({ url, products, ts: Date.now() }));
+  } catch (e) {
+    if (isNetworkError(e)) {
+      const cached = JSON.parse(localStorage.getItem(PRODUCTS_CACHE_KEY) || "null");
+      if (cached?.products?.length) {
+        products = cached.products;
+        toast("Офлайн — показан сохранённый каталог");
+      } else throw e;
+    } else throw e;
+  }
   renderPosProducts();
   renderCart();
 }
@@ -1276,7 +1323,7 @@ function renderCart() {
   document.getElementById("cart-total").textContent = posMoney(Math.max(0, sub - disc));
   renderSplitPayments();
   updateSplitSummary();
-  document.getElementById("checkout-btn").disabled = false;
+  document.getElementById("checkout-btn").disabled = !openShift;
 }
 
 window.removeCartLine = (idx) => {
@@ -1328,6 +1375,11 @@ function bindDebtorCheckout() {
 }
 
 async function checkout() {
+  if (!openShift) {
+    toast("Сначала откройте смену", "error");
+    navigate("shifts");
+    return;
+  }
   const discount = +document.getElementById("cart-discount").value || 0;
   const warehouse_id = +document.getElementById("pos-warehouse").value;
   const total = cartTotalDue();
@@ -1370,6 +1422,7 @@ async function checkout() {
         cart = [];
         document.getElementById("cart-discount").value = "0";
         renderCart();
+        updateTopbar();
         toast("Продажа сохранена офлайн — отправится при связи");
         return;
       }
@@ -2790,7 +2843,7 @@ async function loadTiHistory() {
 
 /* ── Shifts ── */
 function bindShifts() {
-  document.getElementById("shift-close-form").onsubmit = async (e) => {
+  document.getElementById("shift-close-form")?.addEventListener("submit", async (e) => {
     e.preventDefault();
     if (!openShift) return;
     const actualPayments = [...document.querySelectorAll("#shift-actual-payments [data-method]")].map((inp) => ({
@@ -2815,7 +2868,7 @@ function bindShifts() {
       await refreshSession();
       loadShiftsPage();
     } catch (err) { toast(err.message, "error"); }
-  };
+  });
 }
 
 function renderShiftPaymentTable(byPayment, title) {
@@ -4601,7 +4654,37 @@ async function loadDebtorsPage() {
     rUrl += `?status=${status}`;
     mUrl += `?status=${status}`;
   }
-  const [receivables, mutual] = await Promise.all([api(rUrl), api(mUrl)]);
+  const [receivables, mutual, creditorsData] = await Promise.all([
+    api(rUrl),
+    api(mUrl),
+    api("/api/creditors").catch(() => ({ creditors: [], total_balance: 0 })),
+  ]);
+  creditorsCache = creditorsData.creditors || [];
+  const recvOpen = receivables.filter((d) => d.status === "open").reduce((s, d) => s + d.amount_due, 0);
+  const mutualOweUs = mutual.filter((m) => m.direction === "owe_us" && m.status === "open").reduce((s, m) => s + m.amount_due, 0);
+  const mutualWeOwe = mutual.filter((m) => m.direction === "we_owe" && m.status === "open").reduce((s, m) => s + m.amount_due, 0);
+  const summaryEl = document.getElementById("debtors-summary");
+  if (summaryEl) {
+    summaryEl.innerHTML = `
+      <div class="kpi accent-green"><div class="label">Клиенты должны</div><div class="value">${fmt(recvOpen + mutualOweUs)}</div></div>
+      <div class="kpi accent-warn"><div class="label">Мы должны людям</div><div class="value">${fmt(mutualWeOwe)}</div></div>
+      <div class="kpi accent-blue"><div class="label">Поставщикам</div><div class="value">${fmt(creditorsData.total_balance || 0)}</div></div>`;
+  }
+  const supplierRows = (status === "closed" ? [] : creditorsCache.filter((c) => c.balance > 0.01)).map((c) => ({
+    kind: "supplier",
+    id: c.supplier_name,
+    name: c.supplier_name,
+    phone: "—",
+    product: `Реализация · ${c.sales_count || 0} продаж`,
+    warehouse: "Поставщик",
+    total: c.accrued_due,
+    paid: c.paid,
+    due: c.balance,
+    status: c.balance > 0.01 ? "open" : "closed",
+    date: "",
+    currency: "TJS",
+    direction: "we_owe",
+  }));
   const rows = [
     ...receivables.map((d) => ({
       kind: "sale",
@@ -4633,12 +4716,22 @@ async function loadDebtorsPage() {
       currency: m.currency_code,
       direction: m.direction,
     })),
+    ...supplierRows,
   ].sort((a, b) => String(b.date).localeCompare(String(a.date)));
   document.getElementById("debtors-tbody").innerHTML = rows.map((d) => {
     const typeLabel = d.kind === "sale"
       ? `<span class="tag">Продажа</span>`
+      : d.kind === "supplier"
+      ? `<span class="tag">Поставщик</span>`
       : `<span class="tag">${d.direction === "we_owe" ? "Мы должны" : "Займ"}</span>`;
     const money = (n) => d.kind === "mutual" ? mutualFmt(n, d.currency) : fmt(n);
+    const actions = d.kind === "supplier"
+      ? `<button type="button" class="btn btn-ghost btn-sm" onclick='openCreditorSalesModal(${JSON.stringify(d.name)})'>Продажи</button>
+         ${d.status === "open" ? `<button class="btn btn-primary btn-sm" onclick='openCreditorPayModal(${JSON.stringify(d.name)})'>Выплатить</button>` : `<span class="tag">Закрыт</span>`}`
+      : `<button type="button" class="btn btn-ghost btn-sm" onclick="showDebtHistory('${d.kind}', ${typeof d.id === "number" ? d.id : `'${String(d.id).replace(/'/g, "\\'")}'`})">История</button>
+         ${d.status === "open"
+           ? `<button class="btn btn-primary btn-sm" onclick="openDebtorPayModal('${d.kind}', ${typeof d.id === "number" ? d.id : `'${String(d.id).replace(/'/g, "\\'")}'`})">Оплата</button>`
+           : `<span class="tag">Закрыт</span>`}`;
     return `
     <tr>
       <td>${typeLabel}</td>
@@ -4649,12 +4742,7 @@ async function loadDebtorsPage() {
       <td>${money(d.paid)}</td>
       <td class="${d.due > 0 ? "stock-low" : ""}"><strong>${money(d.due)}</strong></td>
       <td>${esc(d.date?.slice(0, 10) || "")}</td>
-      <td class="table-actions">
-        <button type="button" class="btn btn-ghost btn-sm" onclick="showDebtHistory('${d.kind}', ${d.id})">История</button>
-        ${d.status === "open"
-          ? `<button class="btn btn-primary btn-sm" onclick="openDebtorPayModal('${d.kind}', ${d.id})">Оплата</button>`
-          : `<span class="tag">Закрыт</span>`}
-      </td>
+      <td class="table-actions">${actions}</td>
     </tr>`;
   }).join("") || '<tr><td colspan="9" style="text-align:center;color:var(--muted)">Нет записей</td></tr>';
 }
@@ -4869,6 +4957,7 @@ function bindStocktake() {
 
 async function loadStocktakePage() {
   if (!warehouses.length) await loadWarehouses();
+  renderStocktakeSundayBanner();
   try {
     stocktakeData = await api("/api/stocktake/current");
   } catch {
@@ -4876,6 +4965,35 @@ async function loadStocktakePage() {
   }
   renderStocktakeSessionPanel();
   renderStocktake();
+  await loadStocktakeHistory();
+}
+
+function renderStocktakeSundayBanner() {
+  const el = document.getElementById("st-sunday-banner");
+  if (!el) return;
+  const isSunday = new Date().getDay() === 0;
+  el.classList.toggle("hidden", !isSunday);
+  if (isSunday) {
+    el.innerHTML = `<div class="card-body"><strong>📅 Воскресная инвентаризация.</strong> Сканируйте каждый телефон по IMEI — расхождения будут в отчёте ниже.</div>`;
+  }
+}
+
+async function loadStocktakeHistory() {
+  const tb = document.getElementById("st-history-tbody");
+  if (!tb) return;
+  try {
+    const rows = await api("/api/stocktake/history?limit=20");
+    tb.innerHTML = rows.map((s) => `
+      <tr>
+        <td>${esc(s.started_at?.slice(0, 16) || "")}</td>
+        <td>${esc(s.warehouse_name || "—")}</td>
+        <td>${esc(s.user_name || "—")}</td>
+        <td><span class="tag">${s.status === "closed" ? "Завершена" : "Открыта"}</span></td>
+        <td>${esc(s.notes || "—")}</td>
+      </tr>`).join("") || '<tr><td colspan="5" style="text-align:center;color:var(--muted)">История пуста</td></tr>';
+  } catch {
+    tb.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--muted)">Нет доступа к истории</td></tr>';
+  }
 }
 
 function renderStocktakeSessionPanel() {
@@ -4926,6 +5044,7 @@ async function completeStocktake() {
     stocktakeData = { session: null };
     renderStocktakeSessionPanel();
     renderStocktake();
+    loadStocktakeHistory();
   } catch (e) { toast(e.message, "error"); }
 }
 

@@ -10,7 +10,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/style.css?v=26">
+  <link rel="stylesheet" href="/static/style.css?v=27">
 </head>
 <body>
   <div class="mesh-bg" aria-hidden="true"></div>
@@ -47,6 +47,9 @@
         </button>
         <button class="nav-item" data-page="pos">
           <span class="nav-icon">⊞</span> <span class="nav-label">Касса</span>
+        </button>
+        <button class="nav-item" data-page="shifts">
+          <span class="nav-icon">⏱</span> <span class="nav-label">Смена</span>
         </button>
         <button class="nav-item nav-advanced" data-page="sales">
           <span class="nav-icon">☰</span> <span class="nav-label">Продажи</span>
@@ -506,7 +509,8 @@
             </select>
             <button type="button" id="debtors-refresh" class="btn btn-ghost btn-sm">Обновить</button>
           </div>
-          <p class="hint" style="margin:-0.5rem 0 1rem">Кто кому должен: продажи в долг и личные займы между людьми.</p>
+          <div id="debtors-summary" class="kpi-grid" style="margin-bottom:1rem"></div>
+          <p class="hint" style="margin:-0.5rem 0 1rem">Кто кому должен: клиенты, сотрудники, поставщики — все расчёты в одном месте.</p>
           <div class="card">
             <div class="table-wrap"><table class="data-table">
               <thead><tr><th>Тип</th><th>Кто</th><th>Телефон</th><th>Товар / причина</th><th>Сумма</th><th>Оплачено</th><th>Долг</th><th>Дата</th><th></th></tr></thead>
@@ -712,8 +716,38 @@
         </section>
 
 
+        <!-- SHIFTS -->
+        <section id="page-shifts" class="page">
+          <div class="grid-2">
+            <div class="card">
+              <div class="card-header"><h3>Текущая смена</h3></div>
+              <div class="card-body" id="shift-current"><p style="color:var(--muted)">Загрузка…</p></div>
+            </div>
+            <div class="card hidden" id="shift-close-card">
+              <div class="card-header"><h3>Закрытие смены</h3></div>
+              <div class="card-body">
+                <div id="shift-summary"></div>
+                <form id="shift-close-form" class="form-stack" novalidate>
+                  <label id="shift-actual-cash-text">Наличные в кассе<input type="number" id="shift-actual-cash" class="input" min="0" step="0.01" required></label>
+                  <div id="shift-actual-payments"></div>
+                  <label>Комментарий<input id="shift-close-notes" class="input"></label>
+                  <button type="submit" class="btn btn-primary" id="shift-close-btn">Закрыть смену</button>
+                </form>
+              </div>
+            </div>
+          </div>
+          <div class="card" style="margin-top:1rem">
+            <div class="card-header"><h3>История смен</h3></div>
+            <div class="table-wrap card-body"><table class="data-table">
+              <thead><tr><th>#</th><th>Кассир</th><th>Открыта</th><th>Закрыта</th><th>Продаж</th><th>Ожидалось</th><th>Разница</th></tr></thead>
+              <tbody id="shifts-history-tbody"></tbody>
+            </table></div>
+          </div>
+        </section>
+
         <!-- STOCKTAKE -->
         <section id="page-stocktake" class="page">
+          <div id="st-sunday-banner" class="card sunday-banner hidden" style="margin-bottom:1rem"></div>
           <div class="grid-2">
             <div class="card">
               <div class="card-header"><h3>Инвентаризация</h3></div>
@@ -752,6 +786,13 @@
           <div class="card" style="margin-top:1rem" id="st-variance-card">
             <div class="card-header"><h3>Расхождения</h3></div>
             <div class="card-body" id="st-variance-body"></div>
+          </div>
+          <div class="card" style="margin-top:1rem">
+            <div class="card-header"><h3>История инвентаризаций</h3></div>
+            <div class="table-wrap card-body"><table class="data-table">
+              <thead><tr><th>Дата</th><th>Склад</th><th>Кассир</th><th>Статус</th><th>Комментарий</th></tr></thead>
+              <tbody id="st-history-tbody"></tbody>
+            </table></div>
           </div>
         </section>
 
@@ -1234,7 +1275,7 @@
   </dialog>
 
   <div id="toast" class="toast"></div>
-  <script src="/static/app.js?v=45"></script>
+  <script src="/static/app.js?v=46"></script>
   <script>
     if ("serviceWorker" in navigator) {
       navigator.serviceWorker.register("/sw.js").catch(() => {});
