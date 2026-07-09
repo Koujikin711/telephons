@@ -1366,6 +1366,18 @@ body.simple-ui .sidebar-nav .nav-item {
   font-size: 0.95rem;
   padding: 0.65rem 0.85rem;
 }
+body.simple-ui #pos-cash-panel {
+  display: none !important;
+}
+body.simple-ui .pos-layout-simple {
+  grid-template-columns: 1fr min(420px, 38vw) !important;
+}
+body.simple-ui .table-actions {
+  white-space: nowrap;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
 .toggle-row {
   display: flex;
   align-items: center;

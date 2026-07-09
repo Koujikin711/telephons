@@ -5,10 +5,12 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
   <title>TeleStore ERP — Управление магазином</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <meta name="theme-color" content="#6366f1">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/style.css?v=25">
+  <link rel="stylesheet" href="/static/style.css?v=26">
 </head>
 <body>
   <div class="mesh-bg" aria-hidden="true"></div>
@@ -46,7 +48,7 @@
         <button class="nav-item" data-page="pos">
           <span class="nav-icon">⊞</span> <span class="nav-label">Касса</span>
         </button>
-        <button class="nav-item" data-page="sales">
+        <button class="nav-item nav-advanced" data-page="sales">
           <span class="nav-icon">☰</span> <span class="nav-label">Продажи</span>
         </button>
         <div class="nav-group-label nav-advanced">Склад</div>
@@ -62,7 +64,7 @@
         <button class="nav-item nav-advanced" data-page="imei">
           <span class="nav-icon">#</span> <span class="nav-label">IMEI</span>
         </button>
-        <button class="nav-item nav-advanced" data-page="stocktake">
+        <button class="nav-item" data-page="stocktake">
           <span class="nav-icon">☑</span> <span class="nav-label">Инвентаризация</span>
         </button>
         <button class="nav-item" data-page="accessories">
@@ -72,8 +74,8 @@
         <button class="nav-item" data-page="reports">
           <span class="nav-icon">₽</span> <span class="nav-label">Отчёты</span>
         </button>
-        <button class="nav-item nav-advanced" data-page="debtors">
-          <span class="nav-icon">📋</span> <span class="nav-label">Дебиторка</span>
+        <button class="nav-item" data-page="debtors">
+          <span class="nav-icon">📋</span> <span class="nav-label">Взаиморасчёты</span>
         </button>
         <button class="nav-item nav-advanced" data-page="creditors">
           <span class="nav-icon">📑</span> <span class="nav-label">Кредиторка</span>
@@ -493,9 +495,10 @@
           </div>
         </section>
 
-        <!-- DEBTORS -->
+        <!-- DEBTORS / MUTUAL -->
         <section id="page-debtors" class="page">
           <div class="toolbar">
+            <button type="button" id="mutual-add-btn" class="btn btn-primary btn-sm">+ Запись</button>
             <select id="debtors-filter" class="select">
               <option value="">Все</option>
               <option value="open" selected>Открытые</option>
@@ -503,10 +506,18 @@
             </select>
             <button type="button" id="debtors-refresh" class="btn btn-ghost btn-sm">Обновить</button>
           </div>
+          <p class="hint" style="margin:-0.5rem 0 1rem">Кто кому должен: продажи в долг и личные займы между людьми.</p>
           <div class="card">
             <div class="table-wrap"><table class="data-table">
-              <thead><tr><th>Клиент</th><th>Телефон</th><th>Товар</th><th>Склад</th><th>Сумма</th><th>Оплачено</th><th>Долг</th><th>Дата</th><th></th></tr></thead>
+              <thead><tr><th>Тип</th><th>Кто</th><th>Телефон</th><th>Товар / причина</th><th>Сумма</th><th>Оплачено</th><th>Долг</th><th>Дата</th><th></th></tr></thead>
               <tbody id="debtors-tbody"></tbody>
+            </table></div>
+          </div>
+          <div id="debtor-history-panel" class="card hidden" style="margin-top:1rem">
+            <div class="card-header"><h3 id="debtor-history-title">История оплат</h3></div>
+            <div class="table-wrap card-body"><table class="data-table">
+              <thead><tr><th>Дата</th><th>Сумма</th><th>Способ</th><th>Комментарий</th></tr></thead>
+              <tbody id="debtor-history-tbody"></tbody>
             </table></div>
           </div>
         </section>
@@ -918,6 +929,17 @@
       <h3 id="warehouse-modal-title">Склад</h3>
       <input type="hidden" id="wf-id">
       <label>Название<input id="wf-name" class="input" required></label>
+      <div class="form-row">
+        <label>Тип<select id="wf-type" class="select">
+          <option value="new">Основной (новые)</option>
+          <option value="used">Б/У</option>
+          <option value="partnership">Партнёрство</option>
+        </select></label>
+        <label>Валюта<select id="wf-currency" class="select">
+          <option value="USD">USD ($)</option>
+          <option value="TJS">TJS (сомони)</option>
+        </select></label>
+      </div>
       <label>Адрес<input id="wf-address" class="input"></label>
       <label>Примечание<input id="wf-notes" class="input"></label>
       <label class="check"><input type="checkbox" id="wf-default"> Склад по умолчанию</label>
@@ -1079,6 +1101,31 @@
     </div>
   </dialog>
 
+  <dialog id="mutual-entry-modal" class="modal">
+    <form id="mutual-entry-form" novalidate>
+      <h3>Новая запись — взаиморасчёт</h3>
+      <label>Имя<input id="mutual-name" class="input" required placeholder="Кто должен / кому должны"></label>
+      <label>Телефон<input id="mutual-phone" class="input" placeholder="+992…"></label>
+      <label>Направление<select id="mutual-direction" class="select">
+        <option value="owe_us">Нам должны</option>
+        <option value="we_owe">Мы должны</option>
+      </select></label>
+      <label>Товар / причина<input id="mutual-product" class="input" placeholder="iPhone 14, займ…"></label>
+      <div class="form-row">
+        <label>Сумма<input type="number" id="mutual-amount" class="input" min="0.01" step="0.01" required></label>
+        <label>Валюта<select id="mutual-currency" class="select">
+          <option value="TJS">TJS</option>
+          <option value="USD">USD</option>
+        </select></label>
+      </div>
+      <label>Комментарий<input id="mutual-notes" class="input"></label>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-ghost" id="mutual-entry-cancel">Отмена</button>
+        <button type="submit" class="btn btn-primary">Сохранить</button>
+      </div>
+    </form>
+  </dialog>
+
   <dialog id="debtor-pay-modal" class="modal">
     <form id="debtor-pay-form" novalidate>
       <h3>Приём оплаты по долгу</h3>
@@ -1187,6 +1234,11 @@
   </dialog>
 
   <div id="toast" class="toast"></div>
-  <script src="/static/app.js?v=44"></script>
+  <script src="/static/app.js?v=45"></script>
+  <script>
+    if ("serviceWorker" in navigator) {
+      navigator.serviceWorker.register("/sw.js").catch(() => {});
+    }
+  </script>
 </body>
 </html>

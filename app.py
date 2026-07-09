@@ -51,11 +51,11 @@ ROLE_PAGES: dict[str, list[str]] = {
     "accessories": ["accessories"],
 }
 
-# Упрощённый интерфейс: только ежедневные задачи (касса, продажи, склад, отчёты).
+# Упрощённый интерфейс: касса, склад, взаиморасчёты — без отдельного раздела «Продажи».
 SIMPLE_ROLE_PAGES: dict[str, list[str]] = {
-    "owner": ["pos", "sales", "warehouses", "accessories", "reports", "settings"],
-    "warehouse": ["warehouses"],
-    "cashier": ["pos", "sales"],
+    "owner": ["pos", "warehouses", "debtors", "stocktake", "accessories", "reports", "settings"],
+    "warehouse": ["warehouses", "stocktake", "imei"],
+    "cashier": ["pos", "debtors"],
     "accessories": ["accessories"],
 }
 
@@ -358,6 +358,32 @@ def migrate_db(conn: sqlite3.Connection) -> None:
             FOREIGN KEY (session_id) REFERENCES stocktake_sessions(id) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_stocktake_wh ON stocktake_sessions(warehouse_id, status);
+        CREATE TABLE IF NOT EXISTS mutual_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            person_name TEXT NOT NULL,
+            person_phone TEXT DEFAULT '',
+            direction TEXT NOT NULL DEFAULT 'owe_us',
+            amount REAL NOT NULL,
+            paid_amount REAL NOT NULL DEFAULT 0,
+            amount_due REAL NOT NULL,
+            currency_code TEXT NOT NULL DEFAULT 'TJS',
+            payment_method_code TEXT DEFAULT '',
+            product_note TEXT DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'open',
+            notes TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            closed_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS mutual_payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entry_id INTEGER NOT NULL,
+            amount REAL NOT NULL,
+            payment_method_code TEXT DEFAULT 'cash',
+            notes TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (entry_id) REFERENCES mutual_entries(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_mutual_status ON mutual_entries(status, created_at);
         """
     )
     if _table_exists(conn, "product_units"):
@@ -403,6 +429,7 @@ def migrate_db(conn: sqlite3.Connection) -> None:
         except Exception as exc:
             logger.warning("Partnership warehouse setup skipped: %s", exc)
         _set_warehouse_currencies(conn)
+        _ensure_three_core_warehouses(conn)
         _fix_z_register_warehouse_split(conn)
         _sync_product_purchase_from_sales(conn)
         _sync_receivables_for_voided_sales(conn)
@@ -1693,6 +1720,54 @@ def resolve_partnership_warehouse_id(conn: sqlite3.Connection) -> int:
         (utc_now(),),
     )
     return int(cur.lastrowid)
+
+
+def _ensure_three_core_warehouses(conn: sqlite3.Connection) -> None:
+    """Б/У (TJS), Основной (USD), Партнёрство (USD)."""
+    if not _table_exists(conn, "warehouses"):
+        return
+    bu_id = resolve_bu_warehouse_id(conn)
+    conn.execute(
+        """
+        UPDATE warehouses SET name = 'Б/У', warehouse_type = 'used', currency_code = 'TJS',
+               notes = COALESCE(NULLIF(notes, ''), 'Б/у устройства, сомони')
+        WHERE id = ?
+        """,
+        (bu_id,),
+    )
+    part_id = resolve_partnership_warehouse_id(conn)
+    main = conn.execute(
+        f"""
+        SELECT id FROM warehouses
+        WHERE id NOT IN (?, ?) AND warehouse_type != 'accessories'
+        AND NOT ({_accessories_warehouse_clause()})
+        ORDER BY is_default DESC, id LIMIT 1
+        """,
+        (bu_id, part_id),
+    ).fetchone()
+    if main:
+        main_id = int(main["id"])
+        conn.execute("UPDATE warehouses SET is_default = 0")
+        conn.execute(
+            """
+            UPDATE warehouses SET is_default = 1, warehouse_type = 'new', currency_code = 'USD',
+                   name = CASE
+                     WHEN name IN (?, 'БУ', 'Основной склад') OR LOWER(name) LIKE '%снов%' THEN 'Основной'
+                     ELSE name END,
+                   notes = COALESCE(NULLIF(notes, ''), 'Новые устройства, USD')
+            WHERE id = ?
+            """,
+            (DEFAULT_WAREHOUSE_NAME, main_id),
+        )
+    else:
+        conn.execute("UPDATE warehouses SET is_default = 0")
+        conn.execute(
+            """
+            INSERT INTO warehouses (name, address, notes, is_default, warehouse_type, currency_code, created_at)
+            VALUES ('Основной', '', 'Новые устройства', 1, 'new', 'USD', ?)
+            """,
+            (utc_now(),),
+        )
 
 
 def _parse_z_register_sheet(ws: Any, sheet_kind: str) -> list[dict[str, Any]]:
@@ -3802,6 +3877,23 @@ class ReceivablePaymentIn(BaseModel):
     notes: str = ""
 
 
+class MutualEntryIn(BaseModel):
+    person_name: str = Field(min_length=1, max_length=200)
+    person_phone: str = ""
+    direction: Literal["owe_us", "we_owe"] = "owe_us"
+    amount: float = Field(gt=0)
+    currency_code: str = "TJS"
+    payment_method_code: str = ""
+    product_note: str = ""
+    notes: str = ""
+
+
+class MutualPaymentIn(BaseModel):
+    amount: float = Field(gt=0)
+    payment_method_code: str = "cash"
+    notes: str = ""
+
+
 class UnitIn(BaseModel):
     product_id: int
     warehouse_id: int
@@ -3877,6 +3969,8 @@ class WarehouseIn(BaseModel):
     address: str = ""
     notes: str = ""
     is_default: bool = False
+    warehouse_type: str = Field(default="new", pattern="^(new|used|partnership|accessories)$")
+    currency_code: str = Field(default="", pattern="^(|TJS|USD)$")
 
 
 class WarehouseUpdate(BaseModel):
@@ -3884,6 +3978,8 @@ class WarehouseUpdate(BaseModel):
     address: str | None = None
     notes: str | None = None
     is_default: bool | None = None
+    warehouse_type: str | None = Field(default=None, pattern="^(new|used|partnership|accessories)$")
+    currency_code: str | None = Field(default=None, pattern="^(|TJS|USD)$")
 
 
 class StockMovementIn(BaseModel):
@@ -3997,9 +4093,24 @@ async def index():
     )
 
 
+@app.get("/sw.js")
+async def service_worker():
+    return FileResponse(STATIC_DIR / "sw.js", media_type="application/javascript")
+
+
+@app.get("/manifest.webmanifest")
+async def web_manifest():
+    return FileResponse(STATIC_DIR / "manifest.webmanifest", media_type="application/manifest+json")
+
+
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "db": str(DB_PATH), "db_exists": DB_PATH.exists()}
+    return {
+        "status": "ok",
+        "build": "client-tz-v1",
+        "db": str(DB_PATH),
+        "db_exists": DB_PATH.exists(),
+    }
 
 
 @app.get("/api/config")
@@ -4284,6 +4395,135 @@ async def pay_receivable(
                 (body.amount, new_due, row["sale_id"]),
             )
         updated = conn.execute("SELECT * FROM receivables WHERE id = ?", (receivable_id,)).fetchone()
+    return row_to_dict(updated)
+
+
+@app.get("/api/receivables/{receivable_id}/payments")
+async def list_receivable_payments(
+    receivable_id: int,
+    x_pin: str | None = Header(default=None, alias="X-Pin"),
+):
+    check_pin(x_pin)
+    with db() as conn:
+        if not conn.execute("SELECT id FROM receivables WHERE id = ?", (receivable_id,)).fetchone():
+            raise HTTPException(status_code=404, detail="Долг не найден")
+        rows = conn.execute(
+            """
+            SELECT * FROM receivable_payments
+            WHERE receivable_id = ?
+            ORDER BY created_at DESC
+            """,
+            (receivable_id,),
+        ).fetchall()
+    return [row_to_dict(r) for r in rows]
+
+
+@app.get("/api/mutual-entries")
+async def list_mutual_entries(
+    status: str = Query(default="", pattern="^(|open|closed)$"),
+    x_pin: str | None = Header(default=None, alias="X-Pin"),
+):
+    check_pin(x_pin)
+    with db() as conn:
+        sql = "SELECT * FROM mutual_entries WHERE 1=1"
+        params: list[Any] = []
+        if status:
+            sql += " AND status = ?"
+            params.append(status)
+        sql += " ORDER BY status ASC, created_at DESC"
+        rows = conn.execute(sql, params).fetchall()
+    return [row_to_dict(r) for r in rows]
+
+
+@app.post("/api/mutual-entries")
+async def create_mutual_entry(
+    body: MutualEntryIn,
+    x_pin: str | None = Header(default=None, alias="X-Pin"),
+):
+    check_pin(x_pin)
+    now = utc_now()
+    cur_code = (body.currency_code or "TJS").strip().upper()
+    with db() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO mutual_entries
+            (person_name, person_phone, direction, amount, paid_amount, amount_due,
+             currency_code, payment_method_code, product_note, status, notes, created_at)
+            VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, 'open', ?, ?)
+            """,
+            (
+                body.person_name.strip(),
+                body.person_phone.strip(),
+                body.direction,
+                body.amount,
+                body.amount,
+                cur_code,
+                body.payment_method_code,
+                body.product_note,
+                body.notes,
+                now,
+            ),
+        )
+        row = conn.execute("SELECT * FROM mutual_entries WHERE id = ?", (cur.lastrowid,)).fetchone()
+    return row_to_dict(row)
+
+
+@app.get("/api/mutual-entries/{entry_id}/payments")
+async def list_mutual_payments(
+    entry_id: int,
+    x_pin: str | None = Header(default=None, alias="X-Pin"),
+):
+    check_pin(x_pin)
+    with db() as conn:
+        if not conn.execute("SELECT id FROM mutual_entries WHERE id = ?", (entry_id,)).fetchone():
+            raise HTTPException(status_code=404, detail="Запись не найдена")
+        rows = conn.execute(
+            "SELECT * FROM mutual_payments WHERE entry_id = ? ORDER BY created_at DESC",
+            (entry_id,),
+        ).fetchall()
+    return [row_to_dict(r) for r in rows]
+
+
+@app.post("/api/mutual-entries/{entry_id}/pay")
+async def pay_mutual_entry(
+    entry_id: int,
+    body: MutualPaymentIn,
+    x_pin: str | None = Header(default=None, alias="X-Pin"),
+):
+    check_pin(x_pin)
+    with db() as conn:
+        row = conn.execute("SELECT * FROM mutual_entries WHERE id = ?", (entry_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Запись не найдена")
+        if row["status"] == "closed":
+            raise HTTPException(status_code=400, detail="Запись уже закрыта")
+        due = float(row["amount_due"])
+        if body.amount > due + 0.01:
+            raise HTTPException(status_code=400, detail=f"Сумма больше долга ({due:.2f})")
+        pm = get_payment_method(conn, body.payment_method_code)
+        if not pm:
+            raise HTTPException(status_code=400, detail="Способ оплаты не найден")
+        now = utc_now()
+        conn.execute(
+            """
+            INSERT INTO mutual_payments (entry_id, amount, payment_method_code, notes, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (entry_id, body.amount, body.payment_method_code, body.notes, now),
+        )
+        new_paid = float(row["paid_amount"]) + body.amount
+        new_due = max(0.0, float(row["amount"]) - new_paid)
+        new_status = "closed" if new_due <= 0.01 else "open"
+        conn.execute(
+            """
+            UPDATE mutual_entries
+            SET paid_amount = ?, amount_due = ?, status = ?,
+                closed_at = CASE WHEN ? = 'closed' THEN ? ELSE closed_at END
+            WHERE id = ?
+            """,
+            (new_paid, new_due, new_status, new_status, now, entry_id),
+        )
+        updated = conn.execute("SELECT * FROM mutual_entries WHERE id = ?", (entry_id,)).fetchone()
     return row_to_dict(updated)
 
 
@@ -5106,15 +5346,21 @@ async def create_warehouse(body: WarehouseIn, x_pin: str | None = Header(default
                 )
         if body.is_default:
             conn.execute("UPDATE warehouses SET is_default = 0")
+        wh_type = body.warehouse_type or "new"
+        cur_code = (body.currency_code or "").strip().upper()
+        if not cur_code:
+            cur_code = "TJS" if wh_type == "used" else "USD"
         cur = conn.execute(
             """
-            INSERT INTO warehouses (name, address, notes, is_default, created_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO warehouses (name, address, notes, is_default, warehouse_type, currency_code, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (body.name.strip(), body.address, body.notes, int(body.is_default), utc_now()),
+            (body.name.strip(), body.address, body.notes, int(body.is_default), wh_type, cur_code, utc_now()),
         )
         row = conn.execute("SELECT * FROM warehouses WHERE id = ?", (cur.lastrowid,)).fetchone()
-    return row_to_dict(row)
+        wh_id = int(row["id"])
+        currency = get_warehouse_currency(conn, wh_id)
+    return row_to_dict(row) | {"currency": currency}
 
 
 @app.put("/api/warehouses/{warehouse_id}")
@@ -5137,7 +5383,8 @@ async def update_warehouse(
         sets = ", ".join(f"{k} = ?" for k in fields)
         conn.execute(f"UPDATE warehouses SET {sets} WHERE id = ?", (*fields.values(), warehouse_id))
         row = conn.execute("SELECT * FROM warehouses WHERE id = ?", (warehouse_id,)).fetchone()
-    return row_to_dict(row)
+        currency = get_warehouse_currency(conn, warehouse_id)
+    return row_to_dict(row) | {"currency": currency}
 
 
 @app.delete("/api/warehouses/{warehouse_id}")

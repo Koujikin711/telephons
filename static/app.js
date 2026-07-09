@@ -52,11 +52,49 @@ let catalogDetailId = null;
 let pendingProductImage = null;
 let pendingProductImageUrl = null;
 
+const OFFLINE_QUEUE_KEY = "telestore_offline_sales";
+
+function enqueueOfflineSale(payload) {
+  const q = JSON.parse(localStorage.getItem(OFFLINE_QUEUE_KEY) || "[]");
+  q.push({ payload, queued_at: new Date().toISOString() });
+  localStorage.setItem(OFFLINE_QUEUE_KEY, JSON.stringify(q));
+}
+
+async function flushOfflineQueue() {
+  if (!navigator.onLine || !pin) return;
+  const q = JSON.parse(localStorage.getItem(OFFLINE_QUEUE_KEY) || "[]");
+  if (!q.length) return;
+  const remain = [];
+  let ok = 0;
+  for (const item of q) {
+    try {
+      await api("/api/sales", { method: "POST", body: JSON.stringify(item.payload) });
+      ok++;
+    } catch {
+      remain.push(item);
+    }
+  }
+  localStorage.setItem(OFFLINE_QUEUE_KEY, JSON.stringify(remain));
+  if (ok) {
+    toast(`Синхронизировано офлайн-продаж: ${ok}`);
+    if (currentPage === "pos") {
+      await loadProducts();
+      loadPosCashRegister();
+    }
+    if (currentPage === "debtors") loadDebtorsPage();
+  }
+}
+
+function isNetworkError(err) {
+  return !navigator.onLine || err instanceof TypeError
+    || /failed|network|fetch/i.test(String(err?.message || ""));
+}
+
 const ROLE_LABELS = { owner: "Владелец", warehouse: "Кладовщик", cashier: "Кассир", accessories: "Аксессуары" };
 
 const ADVANCED_PAGES = new Set([
-  "dashboard", "products-own", "products-consignment", "imei", "stocktake",
-  "debtors", "creditors", "analytics", "users",
+  "dashboard", "products-own", "products-consignment", "imei",
+  "creditors", "analytics", "users", "sales",
 ]);
 
 function effectiveSimpleUi() {
@@ -462,6 +500,9 @@ async function refreshSession() {
 
 function applySimpleNav() {
   syncSimpleBodyClass();
+  document.querySelectorAll("#page-pos .pos-layout-3").forEach((el) => {
+    el.classList.toggle("pos-layout-simple", effectiveSimpleUi());
+  });
   if (!effectiveSimpleUi()) return;
   document.querySelectorAll(".nav-advanced").forEach((el) => el.classList.add("hidden"));
   document.querySelectorAll(".nav-item").forEach((btn) => {
@@ -696,6 +737,10 @@ async function init() {
     bindUsers();
     bindSettings();
     bindStocktake();
+    window.addEventListener("online", flushOfflineQueue);
+    if ("serviceWorker" in navigator) {
+      navigator.serviceWorker.ready.then(() => flushOfflineQueue()).catch(() => {});
+    }
     await loadWarehouses();
     navigate(firstAllowedPage());
   } catch (e) {
@@ -1301,24 +1346,35 @@ async function checkout() {
       toast("Сумма оплат не совпадает с итогом", "error");
       return;
     }
-    const sale = await api("/api/sales", {
-      method: "POST",
-      body: JSON.stringify({
-        items: cart.map((c) => ({
-          product_id: c.product_id,
-          quantity: c.quantity,
-          unit_ids: c.unit_ids || [],
-          units: (c.unit_metas || []).map((m) => ({
-            unit_id: m.unit_id,
-            imei: m.imei || "",
-            activate_later: m.activate_later || 0,
-            customs_cleared: m.customs_cleared || 0,
-            customs_price: m.customs_price || 0,
-          })),
+    const payload = {
+      items: cart.map((c) => ({
+        product_id: c.product_id,
+        quantity: c.quantity,
+        unit_ids: c.unit_ids || [],
+        units: (c.unit_metas || []).map((m) => ({
+          unit_id: m.unit_id,
+          imei: m.imei || "",
+          activate_later: m.activate_later || 0,
+          customs_cleared: m.customs_cleared || 0,
+          customs_price: m.customs_price || 0,
         })),
-        discount, payments, warehouse_id, debtor_name, debtor_phone,
-      }),
-    });
+      })),
+      discount, payments, warehouse_id, debtor_name, debtor_phone,
+    };
+    let sale;
+    try {
+      sale = await api("/api/sales", { method: "POST", body: JSON.stringify(payload) });
+    } catch (e) {
+      if (isNetworkError(e)) {
+        enqueueOfflineSale(payload);
+        cart = [];
+        document.getElementById("cart-discount").value = "0";
+        renderCart();
+        toast("Продажа сохранена офлайн — отправится при связи");
+        return;
+      }
+      throw e;
+    }
     cart = [];
     document.getElementById("cart-discount").value = "0";
     renderCart();
@@ -2198,6 +2254,12 @@ window.openWarehouseModal = (wh = null) => {
     if (el("wf-address")) el("wf-address").value = wh?.address || "";
     if (el("wf-notes")) el("wf-notes").value = wh?.notes || "";
     if (el("wf-default")) el("wf-default").checked = !!wh?.is_default;
+    const whType = wh?.warehouse_type || "new";
+    if (el("wf-type")) el("wf-type").value = whType === "accessories" ? "new" : whType;
+    const cur = (wh?.currency_code || wh?.currency?.code || "").toUpperCase();
+    if (el("wf-currency")) {
+      el("wf-currency").value = cur || (whType === "used" ? "TJS" : "USD");
+    }
     showModal("warehouse-modal");
   } catch (err) {
     console.error("openWarehouseModal", err);
@@ -2218,6 +2280,8 @@ async function saveWarehouse(e) {
     address: document.getElementById("wf-address").value,
     notes: document.getElementById("wf-notes").value,
     is_default: document.getElementById("wf-default").checked,
+    warehouse_type: document.getElementById("wf-type")?.value || "new",
+    currency_code: document.getElementById("wf-currency")?.value || "",
   };
   try {
     if (id) await api(`/api/warehouses/${id}`, { method: "PUT", body: JSON.stringify(body) });
@@ -4446,26 +4510,61 @@ async function openReportDetail() {
 }
 
 let payDebtorTarget = null;
+let mutualPayTarget = null;
+
+function mutualFmt(n, code) {
+  return fmtCurrency(n, currency_meta(code || "TJS"));
+}
 
 function bindDebtors() {
   document.getElementById("debtors-filter")?.addEventListener("change", loadDebtorsPage);
   document.getElementById("debtors-refresh")?.addEventListener("click", loadDebtorsPage);
+  document.getElementById("mutual-add-btn")?.addEventListener("click", () => {
+    document.getElementById("mutual-entry-form")?.reset();
+    document.getElementById("mutual-entry-modal")?.showModal();
+  });
+  document.getElementById("mutual-entry-cancel")?.addEventListener("click", () => {
+    document.getElementById("mutual-entry-modal")?.close();
+  });
+  document.getElementById("mutual-entry-form")?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    try {
+      await api("/api/mutual-entries", {
+        method: "POST",
+        body: JSON.stringify({
+          person_name: document.getElementById("mutual-name").value.trim(),
+          person_phone: document.getElementById("mutual-phone").value.trim(),
+          direction: document.getElementById("mutual-direction").value,
+          product_note: document.getElementById("mutual-product").value.trim(),
+          amount: +document.getElementById("mutual-amount").value,
+          currency_code: document.getElementById("mutual-currency").value,
+          notes: document.getElementById("mutual-notes").value.trim(),
+        }),
+      });
+      document.getElementById("mutual-entry-modal")?.close();
+      toast("Запись добавлена");
+      loadDebtorsPage();
+    } catch (err) { toast(err.message, "error"); }
+  });
   document.getElementById("debtor-pay-cancel")?.addEventListener("click", () => {
     document.getElementById("debtor-pay-modal").close();
     payDebtorTarget = null;
+    mutualPayTarget = null;
   });
   document.getElementById("debtor-pay-form")?.addEventListener("submit", async (e) => {
     e.preventDefault();
-    if (!payDebtorTarget) return;
+    const amount = +document.getElementById("debtor-pay-amount").value;
+    const body = {
+      amount,
+      payment_method_code: document.getElementById("debtor-pay-method").value,
+      notes: document.getElementById("debtor-pay-notes").value,
+    };
     try {
-      await api(`/api/receivables/${payDebtorTarget.id}/pay`, {
-        method: "POST",
-        body: JSON.stringify({
-          amount: +document.getElementById("debtor-pay-amount").value,
-          payment_method_code: document.getElementById("debtor-pay-method").value,
-          notes: document.getElementById("debtor-pay-notes").value,
-        }),
-      });
+      if (mutualPayTarget) {
+        await api(`/api/mutual-entries/${mutualPayTarget.id}/pay`, { method: "POST", body: JSON.stringify(body) });
+      } else if (payDebtorTarget) {
+        await api(`/api/receivables/${payDebtorTarget.id}/pay`, { method: "POST", body: JSON.stringify(body) });
+      } else return;
       document.getElementById("debtor-pay-modal").close();
       toast("Оплата принята");
       loadDebtorsPage();
@@ -4474,36 +4573,113 @@ function bindDebtors() {
   });
 }
 
-async function loadDebtorsPage() {
-  const status = document.getElementById("debtors-filter")?.value || "";
-  let url = "/api/receivables";
-  if (status) url += `?status=${status}`;
-  const items = await api(url);
-  document.getElementById("debtors-tbody").innerHTML = items.map((d) => `
+async function loadDebtorHistory(kind, id, title) {
+  const panel = document.getElementById("debtor-history-panel");
+  const tb = document.getElementById("debtor-history-tbody");
+  if (!panel || !tb) return;
+  document.getElementById("debtor-history-title").textContent = title;
+  panel.classList.remove("hidden");
+  tb.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--muted)">Загрузка…</td></tr>';
+  const path = kind === "mutual"
+    ? `/api/mutual-entries/${id}/payments`
+    : `/api/receivables/${id}/payments`;
+  const items = await api(path).catch(() => []);
+  tb.innerHTML = items.map((p) => `
     <tr>
-      <td><strong>${esc(d.customer_name)}</strong></td>
-      <td>${esc(d.customer_phone || "—")}</td>
-      <td>${esc(d.products || "—")}</td>
-      <td>${esc(d.warehouse_name || "—")}</td>
-      <td>${fmt(d.total_amount)}</td>
-      <td>${fmt(d.paid_amount)}</td>
-      <td class="${d.amount_due > 0 ? "stock-low" : ""}"><strong>${fmt(d.amount_due)}</strong></td>
-      <td>${esc(d.created_at?.slice(0, 10) || "")}</td>
-      <td>${d.status === "open"
-        ? `<button class="btn btn-primary btn-sm" onclick="openDebtorPayModal(${d.id})">Принять оплату</button>`
-        : `<span class="tag">Закрыт</span>`}
-      </td>
-    </tr>`).join("") || '<tr><td colspan="9" style="text-align:center;color:var(--muted)">Нет долгов</td></tr>';
+      <td>${esc(p.created_at?.slice(0, 16) || "")}</td>
+      <td>${fmt(p.amount)}</td>
+      <td>${esc(payLabel(p.payment_method_code))}</td>
+      <td>${esc(p.notes || "—")}</td>
+    </tr>`).join("") || '<tr><td colspan="4" style="text-align:center;color:var(--muted)">Оплат пока нет</td></tr>';
 }
 
-window.openDebtorPayModal = async (id) => {
-  const items = await api("/api/receivables?status=open");
-  payDebtorTarget = items.find((d) => d.id === id) || { id };
-  const full = await api("/api/receivables").then((all) => all.find((d) => d.id === id));
-  payDebtorTarget = full;
+async function loadDebtorsPage() {
+  const status = document.getElementById("debtors-filter")?.value || "";
+  let rUrl = "/api/receivables";
+  let mUrl = "/api/mutual-entries";
+  if (status) {
+    rUrl += `?status=${status}`;
+    mUrl += `?status=${status}`;
+  }
+  const [receivables, mutual] = await Promise.all([api(rUrl), api(mUrl)]);
+  const rows = [
+    ...receivables.map((d) => ({
+      kind: "sale",
+      id: d.id,
+      name: d.customer_name,
+      phone: d.customer_phone,
+      product: d.products || "—",
+      warehouse: d.warehouse_name,
+      total: d.total_amount,
+      paid: d.paid_amount,
+      due: d.amount_due,
+      status: d.status,
+      date: d.created_at,
+      currency: "TJS",
+      direction: "owe_us",
+    })),
+    ...mutual.map((m) => ({
+      kind: "mutual",
+      id: m.id,
+      name: m.person_name,
+      phone: m.person_phone,
+      product: m.product_note || m.notes || "—",
+      warehouse: m.direction === "we_owe" ? "Мы должны" : "Нам должны",
+      total: m.amount,
+      paid: m.paid_amount,
+      due: m.amount_due,
+      status: m.status,
+      date: m.created_at,
+      currency: m.currency_code,
+      direction: m.direction,
+    })),
+  ].sort((a, b) => String(b.date).localeCompare(String(a.date)));
+  document.getElementById("debtors-tbody").innerHTML = rows.map((d) => {
+    const typeLabel = d.kind === "sale"
+      ? `<span class="tag">Продажа</span>`
+      : `<span class="tag">${d.direction === "we_owe" ? "Мы должны" : "Займ"}</span>`;
+    const money = (n) => d.kind === "mutual" ? mutualFmt(n, d.currency) : fmt(n);
+    return `
+    <tr>
+      <td>${typeLabel}</td>
+      <td><strong>${esc(d.name)}</strong></td>
+      <td>${esc(d.phone || "—")}</td>
+      <td>${esc(d.product)}${d.warehouse && d.kind === "sale" ? `<br><span class="hint">${esc(d.warehouse)}</span>` : ""}</td>
+      <td>${money(d.total)}</td>
+      <td>${money(d.paid)}</td>
+      <td class="${d.due > 0 ? "stock-low" : ""}"><strong>${money(d.due)}</strong></td>
+      <td>${esc(d.date?.slice(0, 10) || "")}</td>
+      <td class="table-actions">
+        <button type="button" class="btn btn-ghost btn-sm" onclick="showDebtHistory('${d.kind}', ${d.id})">История</button>
+        ${d.status === "open"
+          ? `<button class="btn btn-primary btn-sm" onclick="openDebtorPayModal('${d.kind}', ${d.id})">Оплата</button>`
+          : `<span class="tag">Закрыт</span>`}
+      </td>
+    </tr>`;
+  }).join("") || '<tr><td colspan="9" style="text-align:center;color:var(--muted)">Нет записей</td></tr>';
+}
+
+window.showDebtHistory = (kind, id) => {
+  loadDebtorHistory(kind, id, kind === "mutual" ? "История оплат (займ)" : "История оплат (продажа)");
+};
+
+window.openDebtorPayModal = async (kind, id) => {
+  payDebtorTarget = null;
+  mutualPayTarget = null;
+  let full;
+  if (kind === "mutual") {
+    const items = await api("/api/mutual-entries?status=open");
+    full = items.find((d) => d.id === id) || (await api("/api/mutual-entries")).find((d) => d.id === id);
+    mutualPayTarget = full;
+  } else {
+    full = (await api("/api/receivables")).find((d) => d.id === id);
+    payDebtorTarget = full;
+  }
   if (!full) return;
+  const dueLabel = kind === "mutual" ? mutualFmt(full.amount_due, full.currency_code) : fmt(full.amount_due);
+  const who = full.customer_name || full.person_name;
   document.getElementById("debtor-pay-meta").innerHTML = `
-    <div class="metric-row"><span>${esc(full.customer_name)}</span><strong>Долг ${fmt(full.amount_due)}</strong></div>`;
+    <div class="metric-row"><span>${esc(who)}</span><strong>Долг ${dueLabel}</strong></div>`;
   document.getElementById("debtor-pay-amount").value = full.amount_due;
   document.getElementById("debtor-pay-notes").value = "";
   fillPaySelect(document.getElementById("debtor-pay-method"));
