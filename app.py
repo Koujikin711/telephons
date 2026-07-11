@@ -545,6 +545,20 @@ def migrate_db(conn: sqlite3.Connection) -> None:
             expense_date TEXT NOT NULL,
             created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS cash_inflows (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            amount REAL NOT NULL,
+            currency_code TEXT NOT NULL DEFAULT 'TJS',
+            amount_base REAL NOT NULL,
+            payment_method_code TEXT NOT NULL DEFAULT 'cash',
+            source_type TEXT NOT NULL DEFAULT 'counterparty',
+            counterparty_name TEXT DEFAULT '',
+            receivable_id INTEGER,
+            notes TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            created_by TEXT DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_cash_inflows_created ON cash_inflows(created_at);
         CREATE INDEX IF NOT EXISTS idx_exchange_rates_cur ON exchange_rates(currency_code, effective_at);
         CREATE INDEX IF NOT EXISTS idx_sale_payments_sale ON sale_payments(sale_id);
         """
@@ -2838,6 +2852,61 @@ def get_currency_config(conn: sqlite3.Connection) -> dict[str, str]:
     }
 
 
+def latest_exchange_rates(conn: sqlite3.Connection) -> dict[str, float]:
+    """Latest rate per currency: 1 unit of currency = rate units of base currency."""
+    base = get_setting(conn, "base_currency", "TJS").upper()
+    rates: dict[str, float] = {base: 1.0}
+    rows = conn.execute(
+        """
+        SELECT e.currency_code, e.rate
+        FROM exchange_rates e
+        INNER JOIN (
+            SELECT UPPER(currency_code) AS code, MAX(effective_at) AS mx
+            FROM exchange_rates
+            GROUP BY UPPER(currency_code)
+        ) t ON UPPER(e.currency_code) = t.code AND e.effective_at = t.mx
+        """
+    ).fetchall()
+    for r in rows:
+        code = str(r["currency_code"] or "").upper()
+        if code:
+            rates[code] = float(r["rate"] or 1.0)
+    rates[base] = 1.0
+    return rates
+
+
+def convert_amount(
+    conn: sqlite3.Connection,
+    amount: float,
+    from_code: str,
+    to_code: str,
+    *,
+    at: str | None = None,
+) -> float:
+    src = (from_code or "").upper()
+    dst = (to_code or "").upper()
+    if not src or not dst or src == dst:
+        return float(amount)
+    base = get_setting(conn, "base_currency", "TJS").upper()
+    for code in (src, dst):
+        if code == base:
+            continue
+        exists = conn.execute(
+            "SELECT 1 FROM exchange_rates WHERE UPPER(currency_code) = ? LIMIT 1",
+            (code,),
+        ).fetchone()
+        if not exists:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Нет курса {code} в настройках — добавьте курс к базовой валюте",
+            )
+    from_rate = get_exchange_rate_at(conn, src, at)
+    to_rate = get_exchange_rate_at(conn, dst, at)
+    if from_rate <= 0 or to_rate <= 0:
+        raise HTTPException(status_code=400, detail=f"Некорректный курс {src}/{dst}")
+    return float(amount) * from_rate / to_rate
+
+
 def list_payment_methods(conn: sqlite3.Connection, active_only: bool = True) -> list[dict[str, Any]]:
     sql = "SELECT * FROM payment_methods"
     if active_only:
@@ -3060,6 +3129,12 @@ def _cash_net_before(conn: sqlite3.Connection, cutoff: str) -> float:
         "SELECT COALESCE(SUM(amount), 0) FROM receivable_payments WHERE created_at < ?",
         (cutoff,),
     ).fetchone()[0]
+    manual_in = 0.0
+    if _table_exists(conn, "cash_inflows"):
+        manual_in = float(conn.execute(
+            "SELECT COALESCE(SUM(amount_base), 0) FROM cash_inflows WHERE created_at < ?",
+            (cutoff,),
+        ).fetchone()[0])
     sup_out = conn.execute(
         "SELECT COALESCE(SUM(amount), 0) FROM supplier_payments WHERE created_at < ?",
         (cutoff,),
@@ -3068,7 +3143,7 @@ def _cash_net_before(conn: sqlite3.Connection, cutoff: str) -> float:
         "SELECT COALESCE(SUM(amount), 0) FROM expenses WHERE expense_date < ?",
         (cutoff[:10],),
     ).fetchone()[0]
-    return float(sale_in) + float(recv_in) - float(sup_out) - float(exp_out)
+    return float(sale_in) + float(recv_in) + float(manual_in) - float(sup_out) - float(exp_out)
 
 
 def _period_cutoff_start(period: str, date_from: str, date_to: str) -> str:
@@ -3815,6 +3890,7 @@ class SaleIn(BaseModel):
     shift_id: int | None = None
     debtor_name: str = ""
     debtor_phone: str = ""
+    pay_currency: str = ""  # payments in this currency; converted to warehouse currency if different
 
 
 class CurrencySettingsIn(BaseModel):
@@ -3851,6 +3927,16 @@ class ExpenseIn(BaseModel):
     payment_method_code: str = "cash"
     expense_date: str = ""
     department: str = "main"
+
+
+class CashInflowIn(BaseModel):
+    amount: float = Field(gt=0)
+    currency_code: str = "TJS"
+    payment_method_code: str = "cash"
+    source_type: Literal["counterparty", "debtor"] = "counterparty"
+    counterparty_name: str = ""
+    receivable_id: int | None = None
+    notes: str = ""
 
 
 class AccessoryInboundIn(BaseModel):
@@ -4119,6 +4205,7 @@ async def config():
         user_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         currency = get_currency_config(conn)
         payment_methods = list_payment_methods(conn, active_only=True)
+        rates = latest_exchange_rates(conn)
     return {
         "auth_required": user_count > 0 or bool(settings.store_pin),
         "store_name": settings.store_name,
@@ -4127,6 +4214,7 @@ async def config():
         "simple_role_pages": SIMPLE_ROLE_PAGES,
         "currency": currency,
         "payment_methods": payment_methods,
+        "exchange_rates": rates,
     }
 
 
@@ -4279,6 +4367,131 @@ async def delete_expense(expense_id: int, x_pin: str | None = Header(default=Non
         if cur.rowcount == 0:
             raise HTTPException(status_code=404, detail="Не найдено")
     return {"ok": True}
+
+
+@app.get("/api/pos/cash-inflows")
+async def list_cash_inflows(
+    period: str = Query(default="day", pattern="^(day|week|month|all)$"),
+    x_pin: str | None = Header(default=None, alias="X-Pin"),
+):
+    check_pin(x_pin)
+    with db() as conn:
+        if not _table_exists(conn, "cash_inflows"):
+            return []
+        clause, params, _ = _report_period_clause(period, "", "", "created_at")
+        rows = conn.execute(
+            f"""
+            SELECT * FROM cash_inflows
+            WHERE 1=1 {clause}
+            ORDER BY created_at DESC LIMIT 40
+            """,
+            params,
+        ).fetchall()
+    return [row_to_dict(r) for r in rows]
+
+
+@app.post("/api/pos/cash-inflow")
+async def create_cash_inflow(body: CashInflowIn, x_pin: str | None = Header(default=None, alias="X-Pin")):
+    user = check_pin(x_pin)
+    source = (body.source_type or "counterparty").strip().lower()
+    if source not in ("counterparty", "debtor"):
+        raise HTTPException(status_code=400, detail="Тип прихода: counterparty или debtor")
+    with db() as conn:
+        pm = get_payment_method(conn, body.payment_method_code)
+        if not pm:
+            raise HTTPException(status_code=400, detail="Способ оплаты не найден")
+        now = utc_now()
+        currency = (body.currency_code or "TJS").upper().strip()
+        base = get_setting(conn, "base_currency", "TJS").upper()
+        amount = float(body.amount)
+        if source == "debtor":
+            if not body.receivable_id:
+                raise HTTPException(status_code=400, detail="Выберите должника")
+            # Pay receivable in the amount entered (converted to receivable currency ≈ base/sale)
+            amount_for_debt = amount
+            if currency != base:
+                amount_for_debt = convert_amount(conn, amount, currency, base, at=now)
+            pay_body = ReceivablePaymentIn(
+                amount=round(amount_for_debt, 2),
+                payment_method_code=body.payment_method_code,
+                notes=body.notes or f"Приход с кассы ({currency} {amount:g})",
+            )
+            # inline pay logic via existing endpoint path
+            row = conn.execute("SELECT * FROM receivables WHERE id = ?", (body.receivable_id,)).fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Долг не найден")
+            if row["status"] == "closed":
+                raise HTTPException(status_code=400, detail="Долг уже закрыт")
+            due = float(row["amount_due"])
+            if pay_body.amount > due + 0.01:
+                raise HTTPException(status_code=400, detail=f"Сумма больше долга ({due:.2f})")
+            conn.execute(
+                """
+                INSERT INTO receivable_payments (receivable_id, amount, payment_method_code, notes, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (body.receivable_id, pay_body.amount, pay_body.payment_method_code, pay_body.notes, now),
+            )
+            new_paid = float(row["paid_amount"]) + pay_body.amount
+            new_due = max(0.0, float(row["total_amount"]) - new_paid)
+            new_status = "closed" if new_due <= 0.01 else "open"
+            conn.execute(
+                """
+                UPDATE receivables
+                SET paid_amount = ?, amount_due = ?, status = ?,
+                    closed_at = CASE WHEN ? = 'closed' THEN ? ELSE closed_at END
+                WHERE id = ?
+                """,
+                (new_paid, new_due, new_status, new_status, now, body.receivable_id),
+            )
+            if row["sale_id"]:
+                conn.execute(
+                    "UPDATE sales SET amount_paid = COALESCE(amount_paid, 0) + ?, amount_due = ? WHERE id = ?",
+                    (pay_body.amount, new_due, row["sale_id"]),
+                )
+            # Audit row in cash_inflows (amount_base already counted via receivable_payments — mark source)
+            amount_base = pay_body.amount
+            cur = conn.execute(
+                """
+                INSERT INTO cash_inflows
+                (amount, currency_code, amount_base, payment_method_code, source_type,
+                 counterparty_name, receivable_id, notes, created_at, created_by)
+                VALUES (?, ?, ?, ?, 'debtor', ?, ?, ?, ?, ?)
+                """,
+                (
+                    amount, currency, amount_base, body.payment_method_code,
+                    row["customer_name"] or "", body.receivable_id,
+                    pay_body.notes, now, (user or {}).get("name", ""),
+                ),
+            )
+            # IMPORTANT: debtor payments already in receivable_payments — don't double-count in DDS.
+            # Store amount_base=0 for debtor audit rows? Or exclude debtor from manual_inflows sum.
+            # We already filter source_type='counterparty' in DDS. Good — keep amount_base for display.
+            saved = conn.execute("SELECT * FROM cash_inflows WHERE id = ?", (cur.lastrowid,)).fetchone()
+            return {"ok": True, "type": "debtor", "inflow": row_to_dict(saved), "amount_due": new_due}
+
+        name = body.counterparty_name.strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="Укажите контрагента / источник")
+        amount_base = amount if currency == base else convert_amount(conn, amount, currency, base, at=now)
+        amount_base = round(float(amount_base), 2)
+        note = body.notes.strip()
+        if currency != base:
+            note = (f"{currency} {amount:g} → {base} {amount_base:g}" + (f" · {note}" if note else "")).strip()
+        cur = conn.execute(
+            """
+            INSERT INTO cash_inflows
+            (amount, currency_code, amount_base, payment_method_code, source_type,
+             counterparty_name, receivable_id, notes, created_at, created_by)
+            VALUES (?, ?, ?, ?, 'counterparty', ?, NULL, ?, ?, ?)
+            """,
+            (
+                amount, currency, amount_base, body.payment_method_code,
+                name, note, now, (user or {}).get("name", ""),
+            ),
+        )
+        saved = conn.execute("SELECT * FROM cash_inflows WHERE id = ?", (cur.lastrowid,)).fetchone()
+    return {"ok": True, "type": "counterparty", "inflow": row_to_dict(saved)}
 
 
 @app.get("/api/settings/expense-allocation")
@@ -5655,20 +5868,49 @@ async def pos_cash_register(
                 + (" AND s.created_at >= ?" if period != "all" else ""),
                 ([pm["code"], period_start(period)] if period != "all" else [pm["code"]]),
             ).fetchone()[0]
+            recv_amt = conn.execute(
+                """
+                SELECT COALESCE(SUM(amount), 0) FROM receivable_payments
+                WHERE payment_method_code = ?
+                """
+                + (" AND created_at >= ?" if period != "all" else ""),
+                ([pm["code"], period_start(period)] if period != "all" else [pm["code"]]),
+            ).fetchone()[0]
+            manual_amt = 0.0
+            if _table_exists(conn, "cash_inflows"):
+                manual_amt = float(conn.execute(
+                    """
+                    SELECT COALESCE(SUM(amount_base), 0) FROM cash_inflows
+                    WHERE source_type = 'counterparty' AND payment_method_code = ?
+                    """
+                    + (" AND created_at >= ?" if period != "all" else ""),
+                    ([pm["code"], period_start(period)] if period != "all" else [pm["code"]]),
+                ).fetchone()[0])
+            inflow = float(amt) + float(recv_amt) + float(manual_amt)
             out = 0.0
-            if pm["method_type"] == "cash":
+            if True:
                 out = float(conn.execute(
-                    f"SELECT COALESCE(SUM(amount), 0) FROM expenses WHERE payment_method_code = ? {clause.replace('expense_date', 'expense_date') if clause else ''}",
+                    f"SELECT COALESCE(SUM(amount), 0) FROM expenses WHERE payment_method_code = ? {clause}",
                     [pm["code"], *params] if clause else [pm["code"]],
                 ).fetchone()[0])
             balances.append({
                 "code": pm["code"],
                 "name": pm["name"],
                 "method_type": pm["method_type"],
-                "inflow": float(amt),
+                "inflow": inflow,
                 "outflow": out,
-                "net": float(amt) - out,
+                "net": inflow - out,
             })
+        recent_inflows = []
+        if _table_exists(conn, "cash_inflows"):
+            iclause, iparams, _ = _report_period_clause(period, "", "", "created_at")
+            recent_inflows = [
+                row_to_dict(r)
+                for r in conn.execute(
+                    f"SELECT * FROM cash_inflows WHERE 1=1 {iclause} ORDER BY created_at DESC LIMIT 20",
+                    iparams,
+                ).fetchall()
+            ]
     return {
         "period": period,
         "period_label": dds["period_label"],
@@ -5681,6 +5923,7 @@ async def pos_cash_register(
         "expenses_total": opiu["operating_expenses"],
         "expenses": [row_to_dict(r) for r in exp_rows],
         "balances": balances,
+        "cash_inflows": recent_inflows,
     }
 
 
@@ -6612,11 +6855,36 @@ async def create_sale(body: SaleIn, x_pin: str | None = Header(default=None, ali
 
         total = max(0.0, subtotal - body.discount)
         now = utc_now()
+        sale_currency = get_warehouse_currency(conn, warehouse_id)["code"]
+        pay_currency = (body.pay_currency or sale_currency).upper().strip() or sale_currency
+        fx_note = ""
+        if pay_currency != sale_currency:
+            # Payments come in pay_currency — convert to warehouse/sale currency
+            converted_payments = []
+            for p in body.payments:
+                amt = convert_amount(conn, float(p.amount), pay_currency, sale_currency, at=now)
+                converted_payments.append({"method_code": p.method_code, "amount": round(amt, 2)})
+            # Absorb tiny FX rounding so full payment still matches total
+            paid_conv = sum(p["amount"] for p in converted_payments)
+            if converted_payments and abs(paid_conv - total) <= 0.05 and abs(paid_conv - total) > 0.001:
+                converted_payments[-1]["amount"] = round(
+                    converted_payments[-1]["amount"] + (total - paid_conv), 2
+                )
+            rate_pay = get_exchange_rate_at(conn, pay_currency, now)
+            rate_sale = get_exchange_rate_at(conn, sale_currency, now)
+            cross = rate_pay / rate_sale if rate_sale else rate_pay
+            fx_note = f"Конвертация: оплата {pay_currency} → {sale_currency}, курс 1 {pay_currency} = {cross:.4f} {sale_currency}"
+            pay_payload_src = converted_payments
+        else:
+            pay_payload_src = [{"method_code": p.method_code, "amount": p.amount} for p in body.payments] if body.payments else []
 
-        if body.payments:
-            pay_payload = [{"method_code": p.method_code, "amount": p.amount} for p in body.payments]
+        sale_notes = body.notes.strip()
+        if fx_note:
+            sale_notes = f"{sale_notes} | {fx_note}".strip(" |") if sale_notes else fx_note
+
+        if pay_payload_src:
             cash_amount, card_amount, payment_method, pay_payload, amount_paid, amount_due = process_sale_payments(
-                conn, pay_payload, total, debtor_name=body.debtor_name
+                conn, pay_payload_src, total, debtor_name=body.debtor_name
             )
         else:
             if total <= 0:
@@ -6639,7 +6907,6 @@ async def create_sale(body: SaleIn, x_pin: str | None = Header(default=None, ali
                 amount_paid = total
                 amount_due = 0.0
 
-        sale_currency = get_warehouse_currency(conn, warehouse_id)["code"]
         cur = conn.execute(
             """
             INSERT INTO sales
@@ -6648,7 +6915,7 @@ async def create_sale(body: SaleIn, x_pin: str | None = Header(default=None, ali
              amount_paid, amount_due, currency_code)
             VALUES (?, ?, ?, 'completed', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
             """,
-            (total, body.discount, payment_method, body.notes, now,
+            (total, body.discount, payment_method, sale_notes, now,
              warehouse_id, cash_amount, card_amount, shift_id,
              user.get("id") if user else None, user.get("name", "") if user else "",
              amount_paid, amount_due, sale_currency),
@@ -7139,6 +7406,43 @@ def _report_dds(conn: sqlite3.Connection, period: str, date_from: str, date_to: 
         recv_params if recv_clause else [],
     ).fetchone()[0]
     total_in += float(recv_in)
+    manual_inflows: list[dict[str, Any]] = []
+    manual_total = 0.0
+    if _table_exists(conn, "cash_inflows"):
+        man_clause = clause.replace("s.created_at", "ci.created_at")
+        man_rows = conn.execute(
+            f"""
+            SELECT ci.payment_method_code AS method_code, pm.name, pm.method_type,
+                   COALESCE(SUM(ci.amount_base), 0) AS amount
+            FROM cash_inflows ci
+            LEFT JOIN payment_methods pm ON pm.code = ci.payment_method_code
+            WHERE ci.source_type = 'counterparty' {man_clause}
+            GROUP BY ci.payment_method_code
+            """,
+            params if man_clause else [],
+        ).fetchall()
+        manual_inflows = [
+            {"method_code": r["method_code"], "name": r["name"] or r["method_code"], "amount": float(r["amount"])}
+            for r in man_rows
+        ]
+        manual_total = sum(float(r["amount"]) for r in man_rows)
+        total_in += manual_total
+    # Merge manual into operating_inflows by method
+    inflow_map: dict[str, dict[str, Any]] = {}
+    for r in inflows:
+        code = r["method_code"]
+        inflow_map[code] = {
+            "method_code": code,
+            "name": r["name"] or code,
+            "amount": float(r["amount"]),
+        }
+    for r in manual_inflows:
+        code = r["method_code"]
+        if code in inflow_map:
+            inflow_map[code]["amount"] += r["amount"]
+        else:
+            inflow_map[code] = dict(r)
+    operating_inflows = list(inflow_map.values())
     sup_clause = clause.replace("s.created_at", "created_at")
     supplier_out = conn.execute(
         f"SELECT COALESCE(SUM(amount), 0) FROM supplier_payments WHERE 1=1 {sup_clause.replace('s.', '') if 's.' in sup_clause else sup_clause}",
@@ -7161,8 +7465,9 @@ def _report_dds(conn: sqlite3.Connection, period: str, date_from: str, date_to: 
     closing_balance = opening_balance + net_operating_cash
     return {
         "period_label": label,
-        "operating_inflows": [{"method_code": r["method_code"], "name": r["name"] or r["method_code"], "amount": float(r["amount"])} for r in inflows],
+        "operating_inflows": operating_inflows,
         "receivable_collections": float(recv_in),
+        "manual_inflows": manual_total,
         "total_inflows": total_in,
         "supplier_payments": float(supplier_out),
         "operating_expenses": float(expenses_out),

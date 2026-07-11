@@ -8,7 +8,7 @@ let products = [];
 let warehouses = [];
 let cart = [];
 let paymentMethod = "cash";
-let storeConfig = { currency: { code: "TJS", symbol: "смн", name: "Сомони" }, payment_methods: [] };
+let storeConfig = { currency: { code: "TJS", symbol: "смн", name: "Сомони" }, payment_methods: [], exchange_rates: { TJS: 1 } };
 let reportType = "finance";
 let authRequired = false;
 let currentPage = "dashboard";
@@ -167,6 +167,87 @@ function posWhId() {
 }
 function posMoney(n) {
   return whMoney(n, posWhId());
+}
+function lineUnitPrice(c) {
+  const v = c.unit_price;
+  if (v != null && Number.isFinite(+v) && +v > 0) return +v;
+  return +c.product?.sale_price || 0;
+}
+function lineSubtotal(c) {
+  return lineUnitPrice(c) * (c.quantity || 0);
+}
+function currencyLabel(code) {
+  const c = (code || "").toUpperCase();
+  if (c === "USD") return "$ (USD)";
+  if (c === "TJS") return "смн (TJS)";
+  return c || "—";
+}
+function getRate(code) {
+  const c = (code || "").toUpperCase();
+  const base = (storeConfig.currency?.code || "TJS").toUpperCase();
+  if (!c || c === base) return 1;
+  const rates = storeConfig.exchange_rates || {};
+  if (rates[c] == null) return null;
+  return +rates[c];
+}
+/** Convert amount from → to using rates to base currency. */
+function convertMoney(amount, fromCode, toCode) {
+  const from = (fromCode || "").toUpperCase();
+  const to = (toCode || "").toUpperCase();
+  if (!from || !to || from === to) return +amount || 0;
+  const fr = getRate(from);
+  const tr = getRate(to);
+  if (fr == null || tr == null || fr <= 0 || tr <= 0) return null;
+  return (+amount || 0) * fr / tr;
+}
+function posSaleCurrency() {
+  return (warehouseCurrency(posWhId())?.code || "TJS").toUpperCase();
+}
+function posPayCurrency() {
+  if (!document.getElementById("pos-fx-enable")?.checked) return posSaleCurrency();
+  return (document.getElementById("pos-fx-currency")?.value || posSaleCurrency()).toUpperCase();
+}
+function posPayMoney(n) {
+  return fmtCurrency(n, currency_meta(posPayCurrency()));
+}
+function refreshPosFxUi() {
+  const enable = document.getElementById("pos-fx-enable");
+  const fields = document.getElementById("pos-fx-fields");
+  const sel = document.getElementById("pos-fx-currency");
+  const hint = document.getElementById("pos-fx-rate-hint");
+  const totalEl = document.getElementById("pos-fx-total");
+  const totalLabel = document.getElementById("pos-fx-total-label");
+  if (!enable || !fields || !sel) return;
+  const saleCur = posSaleCurrency();
+  const opts = ["TJS", "USD"].filter((c, i, a) => a.indexOf(c) === i);
+  const prev = sel.value;
+  sel.innerHTML = opts.map((c) =>
+    `<option value="${c}" ${c === saleCur ? "disabled" : ""}>${currencyLabel(c)}</option>`
+  ).join("");
+  const prefer = opts.find((c) => c !== saleCur) || opts[0];
+  sel.value = opts.includes(prev) && prev !== saleCur ? prev : prefer;
+  fields.classList.toggle("hidden", !enable.checked);
+  if (!enable.checked) {
+    if (hint) hint.textContent = "";
+    updateSplitSummary();
+    return;
+  }
+  const payCur = sel.value;
+  const rate = convertMoney(1, saleCur, payCur);
+  if (hint) {
+    if (rate == null) {
+      hint.textContent = `Нет курса ${saleCur === "USD" || payCur === "USD" ? "USD" : payCur} в Настройках`;
+      hint.style.color = "var(--danger)";
+    } else {
+      hint.textContent = `1 ${saleCur} = ${rate.toFixed(4)} ${payCur} (курс из настроек)`;
+      hint.style.color = "";
+    }
+  }
+  const dueWh = cartTotalDue();
+  const duePay = convertMoney(dueWh, saleCur, payCur);
+  if (totalLabel) totalLabel.textContent = `К оплате (${payCur})`;
+  if (totalEl) totalEl.textContent = duePay == null ? "—" : posPayMoney(duePay);
+  updateSplitSummary();
 }
 function finFmt(block, field = "gross_revenue") {
   const rows = block?.by_currency;
@@ -531,9 +612,9 @@ function applySimpleNav() {
     label.classList.toggle("hidden", !anyVisible);
   });
   const whSel = document.getElementById("pos-warehouse");
-  const whWrap = whSel?.closest(".toolbar-optional");
-  if (whWrap && phoneWarehouses().length <= 1) whWrap.classList.add("hidden");
-}
+  if (whSel && phoneWarehouses().length <= 1) {
+    whSel.classList.add("hidden");
+  }
 
 function updateAdvancedUiToggle() {
   const cb = document.getElementById("toggle-advanced-ui");
@@ -732,6 +813,7 @@ async function init() {
     document.getElementById("store-name").textContent = cfg.store_name || "TeleStore";
     if (cfg.currency) storeConfig.currency = cfg.currency;
     if (cfg.payment_methods?.length) storeConfig.payment_methods = cfg.payment_methods;
+    if (cfg.exchange_rates) storeConfig.exchange_rates = cfg.exchange_rates;
 
     if (authRequired && !pin) {
       showLogin();
@@ -939,57 +1021,52 @@ function bindDashboard() {
 }
 
 /* ── POS ── */
+let posInType = "counterparty";
+
 function bindPos() {
-  ["pos-search", "pos-category", "pos-ownership", "pos-warehouse"].forEach((id) => {
-    const el = document.getElementById(id);
-    el?.addEventListener(id === "pos-search" ? "input" : "change", debounce(() => {
-      if (id === "pos-warehouse") {
-        cart = [];
-        const curHint = document.getElementById("pos-currency-hint");
-        if (curHint) {
-          const cur = warehouseCurrency(posWhId());
-          curHint.textContent = cur.code === "USD" ? "Цены в $" : "Цены в смн";
-        }
-      }
-      loadProducts();
-    }, 250));
+  document.getElementById("pos-warehouse")?.addEventListener("change", () => {
+    cart = [];
+    const fx = document.getElementById("pos-fx-enable");
+    if (fx) fx.checked = false;
+    const curHint = document.getElementById("pos-currency-hint");
+    if (curHint) {
+      const cur = warehouseCurrency(posWhId());
+      curHint.textContent = cur.code === "USD" ? "Цены в $" : "Цены в смн";
+    }
+    renderCart();
+    const q = document.getElementById("pos-search")?.value?.trim();
+    if (q) runPosSmartSearch(q);
+    else hidePosSearchResults();
   });
-  document.getElementById("pos-search").addEventListener("keydown", async (e) => {
+  document.getElementById("pos-search")?.addEventListener("input", debounce((e) => {
+    const q = e.target.value.trim();
+    if (q.length < 1) { hidePosSearchResults(); return; }
+    runPosSmartSearch(q);
+  }, 220));
+  document.getElementById("pos-search")?.addEventListener("keydown", async (e) => {
+    if (e.key === "Escape") { hidePosSearchResults(); return; }
     if (e.key !== "Enter") return;
+    e.preventDefault();
     const q = e.target.value.trim();
     if (!q) return;
-    e.preventDefault();
-    const whId = +document.getElementById("pos-warehouse").value;
-    const byBarcode = products.find((x) => x.barcode === q && whStock(x, whId) > 0);
-    if (byBarcode) { await addToCart(byBarcode.id); e.target.value = ""; scanBeep(true); loadProducts(); return; }
-    try {
-      const hit = await api(`/api/units/lookup?q=${encodeURIComponent(q)}&warehouse_id=${whId}`);
-      if (hit.match_type === "unit" && hit.matches.length === 1) {
-        const u = hit.matches[0];
-        if (u.is_reserved) toast("Устройство в резерве — можно продать клиенту", "info");
-        await addToCart(u.product_id, u.id);
-        e.target.value = "";
-        scanBeep(true);
-        loadProducts();
-        return;
-      }
-      if (hit.match_type === "unit" && hit.matches.length > 1) {
-        scanBeep(false);
-        toast(`Найдено ${hit.matches.length} устройств — уточните IMEI`, "error");
-        return;
-      }
-      if (hit.match_type === "product" && hit.matches.length === 1) {
-        await addToCart(hit.matches[0].id);
-        e.target.value = "";
-        scanBeep(true);
-        loadProducts();
-        return;
-      }
-    } catch (err) { /* fall through to search */ }
-    loadProducts();
+    const first = document.querySelector("#pos-search-results .pos-search-item");
+    if (first) first.click();
+    else await runPosSmartSearch(q, true);
+  });
+  document.addEventListener("click", (e) => {
+    const wrap = document.querySelector(".pos-search-wrap");
+    if (wrap && !wrap.contains(e.target)) hidePosSearchResults();
   });
   document.getElementById("split-fill-cash")?.addEventListener("click", () => {
-    const total = cartTotalDue();
+    const saleCur = posSaleCurrency();
+    const payCur = posPayCurrency();
+    const fxOn = !!document.getElementById("pos-fx-enable")?.checked && payCur !== saleCur;
+    let total = cartTotalDue();
+    if (fxOn) {
+      const conv = convertMoney(total, saleCur, payCur);
+      if (conv == null) { toast("Нет курса валюты в настройках", "error"); return; }
+      total = Math.round(conv * 100) / 100;
+    }
     document.querySelectorAll(".split-pay-input").forEach((inp) => { inp.value = inp.dataset.method === "cash" ? total : ""; });
     updateSplitSummary();
   });
@@ -998,6 +1075,14 @@ function bindPos() {
   });
   document.getElementById("cart-discount").addEventListener("input", renderCart);
   document.getElementById("checkout-btn").addEventListener("click", checkout);
+  document.getElementById("pos-fx-enable")?.addEventListener("change", () => {
+    refreshPosFxUi();
+    renderSplitPayments();
+  });
+  document.getElementById("pos-fx-currency")?.addEventListener("change", () => {
+    refreshPosFxUi();
+    renderSplitPayments();
+  });
   document.getElementById("clear-cart-btn").addEventListener("click", () => { cart = []; renderCart(); });
   document.getElementById("pos-cash-refresh")?.addEventListener("click", loadPosCashRegister);
   fillPaySelect(document.getElementById("pos-exp-pay"));
@@ -1016,6 +1101,21 @@ function bindPos() {
       loadPosCashRegister();
     } catch (err) { toast(err.message, "error"); }
   });
+  fillPaySelect(document.getElementById("pos-in-pay"));
+  document.querySelectorAll("#pos-in-type-tabs .seg").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll("#pos-in-type-tabs .seg").forEach((b) => b.classList.remove("active"));
+      btn.classList.add("active");
+      posInType = btn.dataset.inType || "counterparty";
+      document.getElementById("pos-in-counterparty-block")?.classList.toggle("hidden", posInType !== "counterparty");
+      document.getElementById("pos-in-debtor-block")?.classList.toggle("hidden", posInType !== "debtor");
+      const cp = document.getElementById("pos-in-counterparty");
+      if (cp) cp.required = posInType === "counterparty";
+      if (posInType === "debtor") loadPosDebtorsSelect();
+    });
+  });
+  document.getElementById("pos-in-debtor")?.addEventListener("change", onPosDebtorSelected);
+  document.getElementById("pos-inflow-form")?.addEventListener("submit", submitPosInflow);
   bindDebtorCheckout();
 }
 
@@ -1036,7 +1136,7 @@ async function loadPosCashRegister() {
         <div class="pos-balance-row">
           <span>${esc(b.name)}</span>
           <strong>${fmt(b.net)}</strong>
-          <small class="muted">+${fmt(b.inflow)} / −${fmt(b.outflow)}</small>
+          <small>+${fmt(b.inflow || 0)} / −${fmt(b.outflow || 0)}</small>
         </div>`).join("") || '<p class="muted">Нет данных</p>';
     }
     if (tb) {
@@ -1044,17 +1144,30 @@ async function loadPosCashRegister() {
         `<tr><td>${esc(e.expense_date)}</td><td>${esc(e.category)}</td><td><strong>${fmt(e.amount)}</strong></td></tr>`
       ).join("") || '<tr><td colspan="3" style="text-align:center;color:var(--muted)">Нет расходов</td></tr>';
     }
+    const inTb = document.getElementById("pos-inflows-tbody");
+    if (inTb) {
+      inTb.innerHTML = (r.cash_inflows || []).map((row) => {
+        const src = row.source_type === "debtor"
+          ? `Долг: ${row.counterparty_name || "—"}`
+          : (row.counterparty_name || "Контрагент");
+        const sum = row.currency_code && row.currency_code !== (storeConfig.currency?.code || "TJS")
+          ? `${fmtCurrency(row.amount, currency_meta(row.currency_code))} · ${fmt(row.amount_base)}`
+          : fmt(row.amount_base ?? row.amount);
+        return `<tr><td>${esc((row.created_at || "").slice(0, 16))}</td><td>${esc(src)}</td><td><strong>${sum}</strong></td></tr>`;
+      }).join("") || '<tr><td colspan="3" style="text-align:center;color:var(--muted)">Нет приходов</td></tr>';
+    }
   } catch (err) {
     kpi.innerHTML = `<p class="muted">${esc(err.message)}</p>`;
   }
 }
 
+
 async function loadPos() {
   if (!warehouses.length) await loadWarehouses();
   await refreshSession();
   fillWarehouseSelect(document.getElementById("pos-warehouse"), document.getElementById("pos-warehouse").value || defaultWarehouseId(), { phonesOnly: true });
-  const catEl = document.getElementById("pos-category");
-  if (catEl) catEl.closest(".toolbar")?.classList.toggle("hidden", currentUser?.role === "accessories");
+  fillPaySelect(document.getElementById("pos-exp-pay"));
+  fillPaySelect(document.getElementById("pos-in-pay"));
   await loadProducts();
   await loadPosCashRegister();
   const curHint = document.getElementById("pos-currency-hint");
@@ -1062,17 +1175,17 @@ async function loadPos() {
     const cur = warehouseCurrency(posWhId());
     curHint.textContent = cur.code === "USD" ? "Цены в $" : "Цены в смн";
   }
+  hidePosSearchResults();
   focusScanInput("pos-search");
   updatePosShiftHint();
 }
 
 async function loadProducts() {
-  const q = document.getElementById("pos-search")?.value || "";
   let cat = document.getElementById("pos-category")?.value || "";
   if (currentUser?.role === "accessories") cat = "accessory";
   const own = document.getElementById("pos-ownership")?.value || "";
   const wh = document.getElementById("pos-warehouse")?.value || "";
-  let url = `/api/products?q=${encodeURIComponent(q)}`;
+  let url = `/api/products?q=`;
   if (cat) url += `&category=${cat}`;
   if (own) url += `&ownership_type=${own}`;
   if (wh) url += `&warehouse_id=${wh}`;
@@ -1093,42 +1206,180 @@ async function loadProducts() {
 }
 
 function renderPosProducts() {
-  const grid = document.getElementById("pos-products");
-  const whId = +document.getElementById("pos-warehouse")?.value;
-  const compact = effectiveSimpleUi();
-  if (!products.length) {
-    grid.innerHTML = `<p class="pos-empty">${compact ? "Ничего не найдено — измените поиск" : "Товары не найдены"}</p>`;
-    return;
-  }
-  grid.innerHTML = products.map((p) => {
-    const stock = whStock(p, whId);
-    const out = stock <= 0;
-    const margin = p.sale_price - p.purchase_price;
-    const meta = [p.model, p.color, p.memory].filter(Boolean).join(" · ");
-    const ownTag = compact ? "" : `<span class="tag tag-${p.ownership_type === "consignment" ? "cons" : "own"}">${ownLabel(p.ownership_type)}</span>`;
-    const metaLine = compact
-      ? (out ? "Нет в наличии" : `В наличии: ${stock}`)
-      : `${esc(p.brand)} · ${catLabel(p.category)}${meta ? ` · ${esc(meta)}` : ""}${p.track_units ? ' · <span class="tag" style="font-size:.6rem">IMEI</span>' : ""}`;
-    const marginLine = compact ? "" : `<div class="meta">${out ? "Нет в наличии" : `Ост: ${stock} · +${posMoney(margin)}`}</div>`;
-    return `<div class="product-card ${out ? "out" : ""}" data-id="${p.id}">
-      ${p.image_url && !compact ? `<div class="product-card-thumb"><img src="${esc(p.image_url)}" alt="" loading="lazy"></div>` : ""}
-      ${ownTag}
-      <div class="name">${esc(p.name)}</div>
-      ${compact && meta ? `<div class="meta">${esc(meta)}</div>` : `<div class="meta">${metaLine}</div>`}
-      <div class="price">${posMoney(p.sale_price)}</div>
-      ${marginLine}
-    </div>`;
-  }).join("");
-  grid.querySelectorAll(".product-card:not(.out)").forEach((c) => {
-    c.addEventListener("click", () => addToCart(+c.dataset.id));
-  });
+  /* каталог убран — продажа только через умный поиск */
 }
 
-async function addToCart(id, preselectedUnitId = null) {
+function hidePosSearchResults() {
+  const box = document.getElementById("pos-search-results");
+  if (box) {
+    box.classList.add("hidden");
+    box.innerHTML = "";
+  }
+}
+
+async function runPosSmartSearch(q, autoPick = false) {
+  const box = document.getElementById("pos-search-results");
+  if (!box) return;
+  const whId = posWhId();
+  try {
+    const hit = await api(`/api/units/lookup?q=${encodeURIComponent(q)}&warehouse_id=${whId}`);
+    const items = [];
+    if (hit.match_type === "unit") {
+      for (const u of hit.matches || []) {
+        items.push({
+          kind: "unit",
+          product_id: u.product_id,
+          unit_id: u.id,
+          name: u.product_name || u.model || "Устройство",
+          meta: [u.imei || u.serial, u.product_color || u.color, u.memory, u.warehouse_name].filter(Boolean).join(" · "),
+          price: u.sale_price,
+          product: null,
+          reserved: !!u.is_reserved,
+        });
+      }
+    } else if (hit.match_type === "product") {
+      for (const p of hit.matches || []) {
+        const stock = whStock(p, whId);
+        if (stock <= 0 && p.track_units) continue;
+        items.push({
+          kind: "product",
+          product_id: p.id,
+          unit_id: null,
+          name: p.name,
+          meta: [p.model, p.color, p.memory, stock ? `ост. ${stock}` : "нет на складе"].filter(Boolean).join(" · "),
+          price: p.sale_price,
+          product: p,
+          reserved: false,
+          out: stock <= 0,
+        });
+      }
+    }
+    if (!items.length) {
+      box.innerHTML = `<div class="pos-search-empty">Ничего не найдено</div>`;
+      box.classList.remove("hidden");
+      return;
+    }
+    if (autoPick && items.length === 1 && !items[0].out) {
+      await selectPosSearchItem(items[0]);
+      return;
+    }
+    box.innerHTML = items.map((it, idx) => `
+      <button type="button" class="pos-search-item${it.out ? " out" : ""}" data-idx="${idx}">
+        <span class="psi-name">${esc(it.name)}${it.reserved ? ' <span class="tag">резерв</span>' : ""}</span>
+        <span class="psi-price">${it.price != null ? posMoney(it.price) : ""}</span>
+        <span class="psi-meta">${esc(it.meta || "")}</span>
+      </button>`).join("");
+    box.classList.remove("hidden");
+    box.querySelectorAll(".pos-search-item").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const it = items[+btn.dataset.idx];
+        if (!it || it.out) { toast("Нет в наличии", "error"); return; }
+        await selectPosSearchItem(it);
+      });
+    });
+  } catch (err) {
+    box.innerHTML = `<div class="pos-search-empty">${esc(err.message)}</div>`;
+    box.classList.remove("hidden");
+  }
+}
+
+async function selectPosSearchItem(it) {
+  hidePosSearchResults();
+  const search = document.getElementById("pos-search");
+  if (search) search.value = "";
+  if (it.kind === "unit") {
+    await addToCart(it.product_id, it.unit_id);
+  } else {
+    await addToCart(it.product_id, null, it.product);
+  }
+  scanBeep(true);
+  focusScanInput("pos-search");
+}
+
+async function loadPosDebtorsSelect() {
+  const sel = document.getElementById("pos-in-debtor");
+  if (!sel) return;
+  try {
+    const rows = await api("/api/receivables?status=open");
+    sel.innerHTML = `<option value="">Выберите должника…</option>` + (rows || []).map((r) =>
+      `<option value="${r.id}" data-due="${r.amount_due}">${esc(r.customer_name || "Без имени")} — долг ${fmt(r.amount_due)}${r.products ? ` · ${esc(String(r.products).slice(0, 40))}` : ""}</option>`
+    ).join("");
+    if (!rows?.length) {
+      document.getElementById("pos-in-debtor-hint").textContent = "Открытых долгов нет";
+    } else {
+      document.getElementById("pos-in-debtor-hint").textContent = "Выберите должника — сумма спишется с долга";
+    }
+  } catch (err) {
+    sel.innerHTML = `<option value="">Ошибка загрузки</option>`;
+  }
+}
+
+function onPosDebtorSelected() {
+  const sel = document.getElementById("pos-in-debtor");
+  const opt = sel?.selectedOptions?.[0];
+  const due = +(opt?.dataset?.due || 0);
+  const amount = document.getElementById("pos-in-amount");
+  if (due > 0 && amount && !+amount.value) amount.value = due;
+  const hint = document.getElementById("pos-in-debtor-hint");
+  if (hint && due > 0) hint.textContent = `К погашению: ${fmt(due)}`;
+}
+
+async function submitPosInflow(e) {
+  e.preventDefault();
+  const amount = +document.getElementById("pos-in-amount").value;
+  const currency_code = document.getElementById("pos-in-currency").value;
+  const payment_method_code = document.getElementById("pos-in-pay").value;
+  const notes = document.getElementById("pos-in-notes")?.value || "";
+  if (!(amount > 0)) { toast("Укажите сумму", "error"); return; }
+  try {
+    if (posInType === "debtor") {
+      const receivable_id = +document.getElementById("pos-in-debtor").value;
+      if (!receivable_id) { toast("Выберите должника", "error"); return; }
+      await api("/api/pos/cash-inflow", {
+        method: "POST",
+        body: JSON.stringify({
+          amount, currency_code, payment_method_code,
+          source_type: "debtor", receivable_id, notes,
+        }),
+      });
+      toast("Оплата долга принята");
+    } else {
+      const counterparty_name = document.getElementById("pos-in-counterparty").value.trim();
+      if (!counterparty_name) { toast("Укажите контрагента", "error"); return; }
+      await api("/api/pos/cash-inflow", {
+        method: "POST",
+        body: JSON.stringify({
+          amount, currency_code, payment_method_code,
+          source_type: "counterparty", counterparty_name, notes,
+        }),
+      });
+      toast("Приход записан");
+    }
+    document.getElementById("pos-inflow-form").reset();
+    posInType = "counterparty";
+    document.querySelectorAll("#pos-in-type-tabs .seg").forEach((b) => {
+      b.classList.toggle("active", b.dataset.inType === "counterparty");
+    });
+    document.getElementById("pos-in-counterparty-block")?.classList.remove("hidden");
+    document.getElementById("pos-in-debtor-block")?.classList.add("hidden");
+    const cp = document.getElementById("pos-in-counterparty");
+    if (cp) cp.required = true;
+    loadPosCashRegister();
+  } catch (err) {
+    toast(err.message, "error");
+  }
+}
+
+
+async function addToCart(id, preselectedUnitId = null, productOverride = null) {
   const whId = +document.getElementById("pos-warehouse").value;
-  const p = products.find((x) => x.id === id);
+  let p = productOverride || products.find((x) => x.id === id);
+  if (!p) {
+    try { p = await api(`/api/products/${id}`); } catch { toast("Товар не найден", "error"); return; }
+  }
+  if (!products.find((x) => x.id === p.id)) products.push(p);
   const stock = whStock(p, whId);
-  if (!p || stock <= 0) return;
+  if (stock <= 0 && !preselectedUnitId) { toast("Нет в наличии на складе", "error"); return; }
   if (p.track_units) {
     if (preselectedUnitId) {
       let picked;
@@ -1157,6 +1408,7 @@ async function addToCart(id, preselectedUnitId = null) {
         product_id: id, quantity: 1, product: p, unit_ids: [picked.id],
         unit_labels: [picked.imei || picked.serial || `#${picked.id}`],
         unit_metas: unitMeta ? [{ unit_id: picked.id, ...unitMeta }] : [],
+        unit_price: +p.sale_price || 0,
       });
       renderCart();
       return;
@@ -1165,7 +1417,11 @@ async function addToCart(id, preselectedUnitId = null) {
       if (!picked) return;
       const used = cart.flatMap((c) => c.unit_ids || []);
       if (used.includes(picked.id)) { toast("Этот IMEI уже в чеке", "error"); return; }
-      cart.push({ product_id: id, quantity: 1, product: p, unit_ids: [picked.id], unit_labels: [picked.label], unit_metas: picked.unitMeta ? [{ unit_id: picked.id, ...picked.unitMeta }] : [] });
+      cart.push({
+        product_id: id, quantity: 1, product: p, unit_ids: [picked.id], unit_labels: [picked.label],
+        unit_metas: picked.unitMeta ? [{ unit_id: picked.id, ...picked.unitMeta }] : [],
+        unit_price: +p.sale_price || 0,
+      });
       renderCart();
     });
     return;
@@ -1173,7 +1429,7 @@ async function addToCart(id, preselectedUnitId = null) {
   const ex = cart.find((c) => c.product_id === id && !c.unit_ids?.length);
   const qty = ex ? ex.quantity : 0;
   if (qty >= stock) { toast(`Макс. ${stock} шт.`, "error"); return; }
-  if (ex) ex.quantity++; else cart.push({ product_id: id, quantity: 1, product: p, unit_ids: [] });
+  if (ex) ex.quantity++; else cart.push({ product_id: id, quantity: 1, product: p, unit_ids: [], unit_price: +p.sale_price || 0 });
   renderCart();
 }
 
@@ -1292,12 +1548,16 @@ function renderCart() {
     document.getElementById("checkout-btn").disabled = true;
     document.getElementById("cart-subtotal").textContent = posMoney(0);
     document.getElementById("cart-total").textContent = posMoney(0);
+    refreshPosFxUi();
     return;
   }
   empty.classList.add("hidden");
   let sub = 0;
   box.innerHTML = cart.map((c, idx) => {
-    const line = c.product.sale_price * c.quantity;
+    const price = lineUnitPrice(c);
+    const catalog = +c.product.sale_price || 0;
+    const custom = Math.abs(price - catalog) > 0.0001;
+    const line = price * c.quantity;
     sub += line;
     const imeiLabel = c.unit_labels?.length
       ? `<div class="ci-imei">${c.unit_labels.map((l, i) => {
@@ -1314,17 +1574,59 @@ function renderCart() {
       <div><div class="ci-name">${esc(c.product.name)}</div>
       <span class="tag tag-${c.product.ownership_type === "consignment" ? "cons" : "own"}" style="font-size:.6rem">${ownLabel(c.product.ownership_type)}</span>${imeiLabel}</div>
       ${qtyCtrl}
-      <strong>${posMoney(line)}</strong>
-      ${c.unit_ids?.length ? `<button class="btn btn-ghost btn-sm" onclick="removeCartLine(${idx})">×</button>` : ""}
+      <div class="ci-price-wrap">
+        <input type="number" class="input sm ci-price${custom ? " is-custom" : ""}" min="0.01" step="0.01"
+          value="${price}" title="Цена продажи (прайс ${posMoney(catalog)})"
+          onchange="setCartPrice(${idx}, this.value)" oninput="setCartPrice(${idx}, this.value, true)">
+        <button type="button" class="btn btn-ghost btn-sm ci-price-reset" title="По прайсу" onclick="resetCartPrice(${idx})">↺</button>
+      </div>
+      <strong class="ci-line-sum">${posMoney(line)}</strong>
+      ${c.unit_ids?.length ? `<button class="btn btn-ghost btn-sm" onclick="removeCartLine(${idx})">×</button>` : `<span></span>`}
     </div>`;
   }).join("");
   const disc = +document.getElementById("cart-discount").value || 0;
   document.getElementById("cart-subtotal").textContent = posMoney(sub);
   document.getElementById("cart-total").textContent = posMoney(Math.max(0, sub - disc));
   renderSplitPayments();
-  updateSplitSummary();
+  refreshPosFxUi();
   document.getElementById("checkout-btn").disabled = !openShift;
 }
+
+window.setCartPrice = (idx, value, soft = false) => {
+  const c = cart[idx];
+  if (!c) return;
+  const n = +value;
+  if (!Number.isFinite(n) || n <= 0) {
+    if (!soft) toast("Укажите цену больше 0", "error");
+    return;
+  }
+  c.unit_price = n;
+  if (soft) {
+    // update line sum without full re-render (keep focus)
+    const row = document.querySelectorAll("#cart-items .cart-item")[idx];
+    if (row) {
+      const sum = row.querySelector(".ci-line-sum");
+      if (sum) sum.textContent = posMoney(lineSubtotal(c));
+      const inp = row.querySelector(".ci-price");
+      const catalog = +c.product.sale_price || 0;
+      if (inp) inp.classList.toggle("is-custom", Math.abs(n - catalog) > 0.0001);
+    }
+    const sub = cart.reduce((s, x) => s + lineSubtotal(x), 0);
+    const disc = +document.getElementById("cart-discount").value || 0;
+    document.getElementById("cart-subtotal").textContent = posMoney(sub);
+    document.getElementById("cart-total").textContent = posMoney(Math.max(0, sub - disc));
+    refreshPosFxUi();
+    return;
+  }
+  renderCart();
+};
+
+window.resetCartPrice = (idx) => {
+  const c = cart[idx];
+  if (!c) return;
+  c.unit_price = +c.product.sale_price || 0;
+  renderCart();
+};
 
 window.removeCartLine = (idx) => {
   cart.splice(idx, 1);
@@ -1345,12 +1647,13 @@ window.changeQty = (id, d) => {
 
 let debtorModalResolve = null;
 
-function promptDebtorModal(total, paid) {
+function promptDebtorModal(total, paid, currencyCode = null) {
   return new Promise((resolve) => {
     debtorModalResolve = resolve;
     const due = Math.max(0, total - paid);
+    const money = (n) => currencyCode ? fmtCurrency(n, currency_meta(currencyCode)) : posMoney(n);
     document.getElementById("debtor-modal-hint").textContent =
-      `К оплате ${posMoney(total)}, оплачено ${posMoney(paid)}. В долг: ${posMoney(due)}. Укажите клиента.`;
+      `К оплате ${money(total)}, оплачено ${money(paid)}. В долг: ${money(due)}. Укажите клиента.`;
     document.getElementById("debtor-name").value = "";
     document.getElementById("debtor-phone").value = "";
     document.getElementById("debtor-modal").showModal();
@@ -1383,18 +1686,33 @@ async function checkout() {
   const discount = +document.getElementById("cart-discount").value || 0;
   const warehouse_id = +document.getElementById("pos-warehouse").value;
   const total = cartTotalDue();
+  const saleCur = posSaleCurrency();
+  const payCur = posPayCurrency();
+  const fxOn = !!document.getElementById("pos-fx-enable")?.checked && payCur !== saleCur;
   try {
-    const payments = collectSplitPayments();
-    const paid = payments.reduce((s, p) => s + p.amount, 0);
-    if (paid <= 0 && total > 0) { toast("Укажите суммы оплаты", "error"); return; }
+    const paymentsRaw = collectSplitPayments();
+    if (fxOn) {
+      const probe = convertMoney(1, payCur, saleCur);
+      if (probe == null) {
+        toast(`Нет курса для ${payCur} → ${saleCur}. Добавьте курс в Настройках.`, "error");
+        return;
+      }
+    }
+    const paidUi = paymentsRaw.reduce((s, p) => s + p.amount, 0);
+    const totalUi = fxOn ? convertMoney(total, saleCur, payCur) : total;
+    if (totalUi == null) {
+      toast("Нет курса валюты в настройках", "error");
+      return;
+    }
+    if (paidUi <= 0 && total > 0) { toast("Укажите суммы оплаты", "error"); return; }
     let debtor_name = "";
     let debtor_phone = "";
-    if (total - paid > 0.01) {
-      const debtor = await promptDebtorModal(total, paid);
+    if (totalUi - paidUi > 0.01) {
+      const debtor = await promptDebtorModal(totalUi, paidUi, fxOn ? payCur : saleCur);
       if (!debtor) return;
       debtor_name = debtor.name;
       debtor_phone = debtor.phone;
-    } else if (Math.abs(total - paid) > 0.01) {
+    } else if (Math.abs(totalUi - paidUi) > 0.01) {
       toast("Сумма оплат не совпадает с итогом", "error");
       return;
     }
@@ -1402,6 +1720,7 @@ async function checkout() {
       items: cart.map((c) => ({
         product_id: c.product_id,
         quantity: c.quantity,
+        unit_price: lineUnitPrice(c),
         unit_ids: c.unit_ids || [],
         units: (c.unit_metas || []).map((m) => ({
           unit_id: m.unit_id,
@@ -1411,7 +1730,12 @@ async function checkout() {
           customs_price: m.customs_price || 0,
         })),
       })),
-      discount, payments, warehouse_id, debtor_name, debtor_phone,
+      discount,
+      payments: paymentsRaw,
+      warehouse_id,
+      debtor_name,
+      debtor_phone,
+      pay_currency: fxOn ? payCur : "",
     };
     let sale;
     try {
@@ -1421,6 +1745,8 @@ async function checkout() {
         enqueueOfflineSale(payload);
         cart = [];
         document.getElementById("cart-discount").value = "0";
+        const fx = document.getElementById("pos-fx-enable");
+        if (fx) fx.checked = false;
         renderCart();
         updateTopbar();
         toast("Продажа сохранена офлайн — отправится при связи");
@@ -1430,12 +1756,14 @@ async function checkout() {
     }
     cart = [];
     document.getElementById("cart-discount").value = "0";
+    const fx = document.getElementById("pos-fx-enable");
+    if (fx) fx.checked = false;
     renderCart();
     await loadProducts();
     await refreshSession();
     showReceipt(sale);
     loadPosCashRegister();
-    if (total - paid > 0.01) loadDebtorsPage();
+    if (totalUi - paidUi > 0.01) loadDebtorsPage();
     toast("Продажа проведена");
   } catch (e) { toast(e.message, "error"); }
 }
@@ -3664,9 +3992,17 @@ function bindAccessories() {
   document.getElementById("acc-checkout-btn")?.addEventListener("click", accCheckout);
   document.getElementById("acc-clear-cart")?.addEventListener("click", () => { accCart = []; renderAccCart(); });
   document.getElementById("acc-fill-cash")?.addEventListener("click", () => {
-    const t = accCartTotal();
+    const saleCur = accSaleCurrency();
+    const payCur = accPayCurrency();
+    const fxOn = !!document.getElementById("acc-fx-enable")?.checked && payCur !== saleCur;
+    let total = accCartTotal();
+    if (fxOn) {
+      const conv = convertMoney(total, saleCur, payCur);
+      if (conv == null) { toast("Нет курса валюты в настройках", "error"); return; }
+      total = Math.round(conv * 100) / 100;
+    }
     document.querySelectorAll(".acc-split-pay-input").forEach((inp) => {
-      inp.value = inp.dataset.method === "cash" ? t : "";
+      inp.value = inp.dataset.method === "cash" ? total : "";
     });
     updateAccSplitSummary();
   });
@@ -3840,13 +4176,68 @@ function accAddToCart(id) {
     if (item.quantity >= stock) { toast(`Макс. ${stock}`, "error"); return; }
     item.quantity += 1;
   } else {
-    accCart.push({ product_id: id, quantity: 1, product: p });
+    accCart.push({ product_id: id, quantity: 1, product: p, unit_price: +p.sale_price || 0 });
   }
   renderAccCart();
 }
 
+function accLinePrice(c) {
+  const v = c.unit_price;
+  if (v != null && Number.isFinite(+v) && +v > 0) return +v;
+  return +c.product?.sale_price || 0;
+}
+
 function accCartTotal() {
-  return accCart.reduce((s, c) => s + c.product.sale_price * c.quantity, 0);
+  return accCart.reduce((s, c) => s + accLinePrice(c) * c.quantity, 0);
+}
+
+function accSaleCurrency() {
+  return (warehouseCurrency(accWarehouseId)?.code || "USD").toUpperCase();
+}
+
+function accPayCurrency() {
+  if (!document.getElementById("acc-fx-enable")?.checked) return accSaleCurrency();
+  return (document.getElementById("acc-fx-currency")?.value || accSaleCurrency()).toUpperCase();
+}
+
+function refreshAccFxUi() {
+  const enable = document.getElementById("acc-fx-enable");
+  const fields = document.getElementById("acc-fx-fields");
+  const sel = document.getElementById("acc-fx-currency");
+  const hint = document.getElementById("acc-fx-rate-hint");
+  const totalEl = document.getElementById("acc-fx-total");
+  const totalLabel = document.getElementById("acc-fx-total-label");
+  if (!enable || !fields || !sel) return;
+  const saleCur = accSaleCurrency();
+  const opts = ["TJS", "USD"];
+  const prev = sel.value;
+  sel.innerHTML = opts.map((c) =>
+    `<option value="${c}" ${c === saleCur ? "disabled" : ""}>${currencyLabel(c)}</option>`
+  ).join("");
+  const prefer = opts.find((c) => c !== saleCur) || opts[0];
+  sel.value = opts.includes(prev) && prev !== saleCur ? prev : prefer;
+  fields.classList.toggle("hidden", !enable.checked);
+  if (!enable.checked) {
+    if (hint) hint.textContent = "";
+    updateAccSplitSummary();
+    return;
+  }
+  const payCur = sel.value;
+  const rate = convertMoney(1, saleCur, payCur);
+  if (hint) {
+    if (rate == null) {
+      hint.textContent = `Нет курса в Настройках`;
+      hint.style.color = "var(--danger)";
+    } else {
+      hint.textContent = `1 ${saleCur} = ${rate.toFixed(4)} ${payCur}`;
+      hint.style.color = "";
+    }
+  }
+  const dueWh = accCartTotal();
+  const duePay = convertMoney(dueWh, saleCur, payCur);
+  if (totalLabel) totalLabel.textContent = `К оплате (${payCur})`;
+  if (totalEl) totalEl.textContent = duePay == null ? "—" : fmtCurrency(duePay, currency_meta(payCur));
+  updateAccSplitSummary();
 }
 
 function renderAccSplitPayments() {
@@ -3869,13 +4260,19 @@ function collectAccPayments() {
 }
 
 function updateAccSplitSummary() {
-  const total = accCartTotal();
+  const saleCur = accSaleCurrency();
+  const payCur = accPayCurrency();
+  const fxOn = !!document.getElementById("acc-fx-enable")?.checked && payCur !== saleCur;
+  const totalWh = accCartTotal();
+  const total = fxOn ? (convertMoney(totalWh, saleCur, payCur) ?? totalWh) : totalWh;
   const paid = collectAccPayments().reduce((s, p) => s + p.amount, 0);
-  document.getElementById("acc-split-paid").textContent = accMoney(paid);
+  const money = (n) => fxOn ? fmtCurrency(n, currency_meta(payCur)) : accMoney(n);
+  const paidEl = document.getElementById("acc-split-paid");
+  if (paidEl) paidEl.textContent = money(paid);
   const rem = document.getElementById("acc-split-remain-wrap");
   if (rem) {
     rem.classList.toggle("hidden", Math.abs(total - paid) < 0.01);
-    document.getElementById("acc-split-remain").textContent = accMoney(Math.max(0, total - paid));
+    document.getElementById("acc-split-remain").textContent = money(Math.max(0, total - paid));
   }
 }
 
@@ -3890,26 +4287,68 @@ function renderAccCart() {
     document.getElementById("acc-checkout-btn").disabled = true;
     document.getElementById("acc-cart-subtotal").textContent = accMoney(0);
     document.getElementById("acc-cart-total").textContent = accMoney(0);
+    refreshAccFxUi();
     return;
   }
   empty.classList.add("hidden");
   let sub = 0;
   box.innerHTML = accCart.map((c, idx) => {
-    const line = c.product.sale_price * c.quantity;
+    const price = accLinePrice(c);
+    const catalog = +c.product.sale_price || 0;
+    const custom = Math.abs(price - catalog) > 0.0001;
+    const line = price * c.quantity;
     sub += line;
     return `<div class="cart-item">
       <div><div class="ci-name">${esc(c.product.name)}</div></div>
       <div class="ci-qty"><button type="button" onclick="accChangeQty(${idx},-1)">−</button>${c.quantity}<button type="button" onclick="accChangeQty(${idx},1)">+</button></div>
-      <strong>${accMoney(line)}</strong>
+      <div class="ci-price-wrap">
+        <input type="number" class="input sm ci-price${custom ? " is-custom" : ""}" min="0.01" step="0.01"
+          value="${price}" title="Прайс ${accMoney(catalog)}"
+          onchange="setAccCartPrice(${idx}, this.value)" oninput="setAccCartPrice(${idx}, this.value, true)">
+        <button type="button" class="btn btn-ghost btn-sm ci-price-reset" title="По прайсу" onclick="resetAccCartPrice(${idx})">↺</button>
+      </div>
+      <strong class="ci-line-sum">${accMoney(line)}</strong>
       <button class="btn btn-ghost btn-sm" onclick="accRemoveLine(${idx})">×</button>
     </div>`;
   }).join("");
   document.getElementById("acc-cart-subtotal").textContent = accMoney(sub);
   document.getElementById("acc-cart-total").textContent = accMoney(sub);
   renderAccSplitPayments();
-  updateAccSplitSummary();
+  refreshAccFxUi();
   document.getElementById("acc-checkout-btn").disabled = false;
 }
+
+window.setAccCartPrice = (idx, value, soft = false) => {
+  const c = accCart[idx];
+  if (!c) return;
+  const n = +value;
+  if (!Number.isFinite(n) || n <= 0) {
+    if (!soft) toast("Укажите цену больше 0", "error");
+    return;
+  }
+  c.unit_price = n;
+  if (soft) {
+    const row = document.querySelectorAll("#acc-cart-items .cart-item")[idx];
+    if (row) {
+      const sum = row.querySelector(".ci-line-sum");
+      if (sum) sum.textContent = accMoney(accLinePrice(c) * c.quantity);
+      const inp = row.querySelector(".ci-price");
+      if (inp) inp.classList.toggle("is-custom", Math.abs(n - (+c.product.sale_price || 0)) > 0.0001);
+    }
+    const sub = accCartTotal();
+    document.getElementById("acc-cart-subtotal").textContent = accMoney(sub);
+    document.getElementById("acc-cart-total").textContent = accMoney(sub);
+    refreshAccFxUi();
+    return;
+  }
+  renderAccCart();
+};
+window.resetAccCartPrice = (idx) => {
+  const c = accCart[idx];
+  if (!c) return;
+  c.unit_price = +c.product.sale_price || 0;
+  renderAccCart();
+};
 
 window.accChangeQty = (idx, d) => {
   const c = accCart[idx];
@@ -3924,17 +4363,26 @@ window.accRemoveLine = (idx) => { accCart.splice(idx, 1); renderAccCart(); };
 
 async function accCheckout() {
   const total = accCartTotal();
-  const payments = collectAccPayments();
-  const paid = payments.reduce((s, p) => s + p.amount, 0);
-  if (paid <= 0 && total > 0) { toast("Укажите оплату", "error"); return; }
+  const saleCur = accSaleCurrency();
+  const payCur = accPayCurrency();
+  const fxOn = !!document.getElementById("acc-fx-enable")?.checked && payCur !== saleCur;
+  const paymentsRaw = collectAccPayments();
+  if (fxOn && convertMoney(1, payCur, saleCur) == null) {
+    toast("Нет курса валюты в настройках", "error");
+    return;
+  }
+  const paidUi = paymentsRaw.reduce((s, p) => s + p.amount, 0);
+  const totalUi = fxOn ? convertMoney(total, saleCur, payCur) : total;
+  if (totalUi == null) { toast("Нет курса валюты в настройках", "error"); return; }
+  if (paidUi <= 0 && total > 0) { toast("Укажите оплату", "error"); return; }
   let debtor_name = "";
   let debtor_phone = "";
-  if (total - paid > 0.01) {
-    const debtor = await promptDebtorModal(total, paid);
+  if (totalUi - paidUi > 0.01) {
+    const debtor = await promptDebtorModal(totalUi, paidUi, fxOn ? payCur : saleCur);
     if (!debtor) return;
     debtor_name = debtor.name;
     debtor_phone = debtor.phone;
-  } else if (Math.abs(total - paid) > 0.01) {
+  } else if (Math.abs(totalUi - paidUi) > 0.01) {
     toast("Сумма оплат не совпадает с итогом", "error");
     return;
   }
@@ -3942,11 +4390,21 @@ async function accCheckout() {
     await api("/api/sales", {
       method: "POST",
       body: JSON.stringify({
-        items: accCart.map((c) => ({ product_id: c.product_id, quantity: c.quantity })),
-        payments, warehouse_id: accWarehouseId, debtor_name, debtor_phone,
+        items: accCart.map((c) => ({
+          product_id: c.product_id,
+          quantity: c.quantity,
+          unit_price: accLinePrice(c),
+        })),
+        payments: paymentsRaw,
+        warehouse_id: accWarehouseId,
+        debtor_name,
+        debtor_phone,
+        pay_currency: fxOn ? payCur : "",
       }),
     });
     accCart = [];
+    const fx = document.getElementById("acc-fx-enable");
+    if (fx) fx.checked = false;
     renderAccCart();
     await loadAccProducts();
     loadAccCashRegister();
@@ -4054,7 +4512,7 @@ async function loadSuppliers() {
 
 
 function cartTotalDue() {
-  const sub = cart.reduce((s, c) => s + c.product.sale_price * c.quantity, 0);
+  const sub = cart.reduce((s, c) => s + lineSubtotal(c), 0);
   const disc = +document.getElementById("cart-discount")?.value || 0;
   return Math.max(0, sub - disc);
 }
@@ -4076,13 +4534,18 @@ function renderSplitPayments() {
 }
 
 function updateSplitSummary() {
-  const total = cartTotalDue();
+  const saleCur = posSaleCurrency();
+  const payCur = posPayCurrency();
+  const fxOn = !!document.getElementById("pos-fx-enable")?.checked && payCur !== saleCur;
+  const totalWh = cartTotalDue();
+  const total = fxOn ? (convertMoney(totalWh, saleCur, payCur) ?? totalWh) : totalWh;
   const paid = collectSplitPayments().reduce((s, p) => s + p.amount, 0);
+  const money = (n) => fxOn ? posPayMoney(n) : posMoney(n);
   const paidEl = document.getElementById("split-paid-total");
   const remEl = document.getElementById("split-remain-total");
   const remWrap = document.getElementById("split-remain-label");
-  if (paidEl) paidEl.textContent = posMoney(paid);
-  if (remEl) remEl.textContent = posMoney(Math.max(0, total - paid));
+  if (paidEl) paidEl.textContent = money(paid);
+  if (remEl) remEl.textContent = money(Math.max(0, total - paid));
   if (remWrap) remWrap.classList.toggle("hidden", Math.abs(total - paid) < 0.01);
   if (remWrap) remWrap.style.color = total - paid > 0.01 ? "var(--danger)" : "var(--success)";
 }
@@ -4188,6 +4651,13 @@ async function loadSettingsPage() {
   document.getElementById("expense-allocation-card")?.classList.toggle("hidden", currentUser?.role !== "owner");
   storeConfig.currency = data.currency;
   storeConfig.payment_methods = data.payment_methods.filter((m) => m.is_active);
+  const rateMap = { [(data.currency?.code || "TJS").toUpperCase()]: 1 };
+  for (const r of data.exchange_rates || []) {
+    const code = String(r.currency_code || "").toUpperCase();
+    if (!code || rateMap[code] != null) continue; // first = latest (DESC)
+    rateMap[code] = +r.rate;
+  }
+  storeConfig.exchange_rates = rateMap;
   document.getElementById("set-currency-code").value = data.currency.code || "";
   document.getElementById("set-currency-symbol").value = data.currency.symbol || "";
   document.getElementById("set-currency-name").value = data.currency.name || "";

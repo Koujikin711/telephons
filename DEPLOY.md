@@ -13,15 +13,27 @@
 ```powershell
 cd "C:\Users\nikit\OneDrive\Desktop\Магазин телефонов и акссесуаров"
 git init
-git remote add amvera https://git.msk0.amvera.ru/koujikin/telephons
+git remote add amvera https://git.amvera.ru/koujikin/telephons
 ```
 
 ### 2. Push на Amvera
 
+**Через git** (если репозиторий доступен):
+
 ```powershell
 git add .
 git commit -m "Касса и аналитика магазина телефонов"
-git push amvera master
+git push amvera main:master
+```
+
+**Через Amvera CLI** (если git push не работает):
+
+```bash
+amvera login -u YOUR_USER
+git archive HEAD | tar -x -C /tmp/telephons-deploy
+rm -rf /tmp/telephons-deploy/node_modules
+printf 'yes\n' | amvera upload code --slug telephons --source /tmp/telephons-deploy --target /
+amvera rebuild --slug telephons
 ```
 
 Amvera автоматически соберёт приложение по `amvera.yml` и запустит на порту 80.

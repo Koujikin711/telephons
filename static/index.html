@@ -134,67 +134,150 @@
 
         <!-- POS -->
         <section id="page-pos" class="page">
-          <div class="pos-layout pos-layout-3">
-            <div class="pos-left card">
-              <div class="toolbar">
-                <select id="pos-warehouse" class="select toolbar-optional" title="Склад отгрузки"></select>
-                <span id="pos-currency-hint" class="muted toolbar-optional" style="font-size:.8rem;white-space:nowrap"></span>
-                <input type="search" id="pos-search" class="input input-lg" placeholder="Найти телефон или введите IMEI…" autofocus>
-                <select id="pos-category" class="select toolbar-advanced">
-                  <option value="">Все категории</option>
-                  <option value="phone">Телефоны</option>
-                </select>
-                <select id="pos-ownership" class="select toolbar-advanced">
-                  <option value="">Все товары</option>
-                  <option value="own">Собственные</option>
-                  <option value="consignment">Реализация</option>
-                </select>
+          <div class="pos-desk">
+            <div class="pos-cols">
+              <!-- КАССА -->
+              <div class="card pos-col pos-col-sale">
+                <div class="card-header">
+                  <h3>Касса</h3>
+                  <select id="pos-warehouse" class="select" title="Склад"></select>
+                </div>
+                <div class="card-body pos-col-body">
+                  <div class="pos-search-wrap">
+                    <span id="pos-currency-hint" class="muted" style="font-size:.8rem"></span>
+                    <input type="search" id="pos-search" class="input input-lg" placeholder="Имя, модель или IMEI…" autofocus autocomplete="off">
+                    <div id="pos-search-results" class="pos-search-results hidden"></div>
+                  </div>
+                  <select id="pos-category" class="select toolbar-advanced hidden">
+                    <option value="">Все категории</option>
+                    <option value="phone">Телефоны</option>
+                  </select>
+                  <select id="pos-ownership" class="select toolbar-advanced hidden">
+                    <option value="">Все товары</option>
+                    <option value="own">Собственные</option>
+                    <option value="consignment">Реализация</option>
+                  </select>
+                  <div class="pos-cart-block">
+                    <div class="pos-cart-head">
+                      <strong>Текущий чек</strong>
+                      <span class="cart-badge" id="cart-count">0</span>
+                    </div>
+                    <div id="cart-items" class="cart-items"></div>
+                    <div class="cart-empty" id="cart-empty">Найдите товар поиском и добавьте в чек</div>
+                    <div class="cart-totals">
+                      <div class="total-line"><span>Подытог</span><span id="cart-subtotal">0</span></div>
+                      <div class="total-line">
+                        <label>Скидка</label>
+                        <input type="number" id="cart-discount" class="input sm" value="0" min="0" step="10">
+                      </div>
+                      <div class="total-line grand"><span>К оплате</span><span id="cart-total">0</span></div>
+                      <div class="pos-fx" id="pos-fx-block">
+                        <label class="toggle-row pos-fx-toggle">
+                          <input type="checkbox" id="pos-fx-enable">
+                          <span>Конвертация</span>
+                        </label>
+                        <div id="pos-fx-fields" class="pos-fx-fields hidden">
+                          <label class="pos-fx-currency-label">Оплата в
+                            <select id="pos-fx-currency" class="select"></select>
+                          </label>
+                          <p class="hint" id="pos-fx-rate-hint"></p>
+                          <div class="total-line"><span id="pos-fx-total-label">К оплате</span><span id="pos-fx-total">0</span></div>
+                        </div>
+                      </div>
+                    </div>
+                    <div id="split-payments" class="split-payments"></div>
+                    <div class="split-pay-summary">
+                      <span id="split-paid-label">Оплачено: <strong id="split-paid-total">0</strong></span>
+                      <span id="split-remain-label" class="hidden">Осталось: <strong id="split-remain-total">0</strong></span>
+                    </div>
+                    <button type="button" id="split-fill-cash" class="btn btn-ghost btn-sm btn-block">Вся сумма наличными</button>
+                    <button id="checkout-btn" class="btn btn-success btn-block" disabled>Провести оплату</button>
+                    <p id="pos-shift-hint" class="hint hidden"></p>
+                    <button id="clear-cart-btn" class="btn btn-ghost btn-block">Очистить</button>
+                  </div>
+                </div>
               </div>
-              <div id="pos-products" class="product-grid"></div>
+
+              <!-- ПРИХОД -->
+              <div class="card pos-col pos-col-in">
+                <div class="card-header"><h3>Приход</h3></div>
+                <div class="card-body pos-col-body">
+                  <form id="pos-inflow-form" class="form-stack">
+                    <div class="form-row">
+                      <label>Сумма<input type="number" id="pos-in-amount" class="input" min="0.01" step="0.01" required placeholder="0.00"></label>
+                      <label>Валюта
+                        <select id="pos-in-currency" class="select">
+                          <option value="TJS">смн (TJS)</option>
+                          <option value="USD">$ (USD)</option>
+                        </select>
+                      </label>
+                    </div>
+                    <label>Кошелёк / способ
+                      <select id="pos-in-pay" class="select" required></select>
+                    </label>
+                    <div class="segmented" id="pos-in-type-tabs">
+                      <button type="button" class="seg active" data-in-type="counterparty">Контрагент</button>
+                      <button type="button" class="seg" data-in-type="debtor">Дебиторка</button>
+                    </div>
+                    <div id="pos-in-counterparty-block">
+                      <label>Откуда деньги
+                        <input id="pos-in-counterparty" class="input" placeholder="Имя контрагента / источник" required>
+                      </label>
+                      <label>Комментарий
+                        <input id="pos-in-notes" class="input" placeholder="Необязательно">
+                      </label>
+                    </div>
+                    <div id="pos-in-debtor-block" class="hidden">
+                      <label>Должник
+                        <select id="pos-in-debtor" class="select"></select>
+                      </label>
+                      <p class="hint" id="pos-in-debtor-hint">Выберите должника — сумма спишется с долга</p>
+                    </div>
+                    <button type="submit" class="btn btn-primary btn-block">Принять приход</button>
+                  </form>
+                  <div class="table-wrap" style="margin-top:1rem;max-height:220px;overflow:auto">
+                    <table class="data-table">
+                      <thead><tr><th>Дата</th><th>Источник</th><th>Сумма</th></tr></thead>
+                      <tbody id="pos-inflows-tbody"></tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+
+              <!-- РАСХОД -->
+              <div class="card pos-col pos-col-out">
+                <div class="card-header"><h3>Расход</h3></div>
+                <div class="card-body pos-col-body">
+                  <form id="pos-expense-form" class="form-stack">
+                    <label>Категория<input id="pos-exp-category" class="input" required placeholder="Аренда"></label>
+                    <div class="form-row">
+                      <label>Сумма<input type="number" id="pos-exp-amount" class="input" min="0.01" step="0.01" required></label>
+                      <label>Оплата<select id="pos-exp-pay" class="select"></select></label>
+                    </div>
+                    <label>Описание<input id="pos-exp-desc" class="input"></label>
+                    <button type="submit" class="btn btn-primary btn-block">Добавить расход</button>
+                  </form>
+                  <div class="table-wrap" style="margin-top:1rem;max-height:280px;overflow:auto">
+                    <table class="data-table">
+                      <thead><tr><th>Дата</th><th>Категория</th><th>Сумма</th></tr></thead>
+                      <tbody id="pos-expenses-tbody"></tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
             </div>
-            <div class="pos-mid card" id="pos-cash-panel">
-              <div class="card-header"><h3>Касса — деньги</h3><button type="button" id="pos-cash-refresh" class="btn btn-ghost btn-sm">Обновить</button></div>
+
+            <!-- Отчёт на всю ширину -->
+            <div class="card pos-cash-report" id="pos-cash-panel">
+              <div class="card-header">
+                <h3>Касса — деньги</h3>
+                <button type="button" id="pos-cash-refresh" class="btn btn-ghost btn-sm">Обновить</button>
+              </div>
               <div class="card-body">
                 <div class="kpi-grid pos-kpi" id="pos-cash-kpi"></div>
                 <h4 class="sub-heading">По кошелькам</h4>
-                <div id="pos-balances" class="pos-balances"></div>
-                <h4 class="sub-heading">Расход</h4>
-                <form id="pos-expense-form" class="form-stack">
-                  <label>Категория<input id="pos-exp-category" class="input" required placeholder="Аренда"></label>
-                  <div class="form-row">
-                    <label>Сумма<input type="number" id="pos-exp-amount" class="input" min="0.01" step="0.01" required></label>
-                    <label>Оплата<select id="pos-exp-pay" class="select"></select></label>
-                  </div>
-                  <label>Описание<input id="pos-exp-desc" class="input"></label>
-                  <button type="submit" class="btn btn-primary btn-sm">Добавить расход</button>
-                </form>
-                <div class="table-wrap" style="margin-top:1rem;max-height:200px;overflow:auto">
-                  <table class="data-table"><thead><tr><th>Дата</th><th>Категория</th><th>Сумма</th></tr></thead>
-                  <tbody id="pos-expenses-tbody"></tbody></table>
-                </div>
+                <div id="pos-balances" class="pos-balances pos-balances-wide"></div>
               </div>
-            </div>
-            <div class="pos-right card">
-              <div class="card-header"><h3>Текущий чек</h3><span class="cart-badge" id="cart-count">0</span></div>
-              <div id="cart-items" class="cart-items"></div>
-              <div class="cart-empty" id="cart-empty">Сканируйте или выберите товар</div>
-              <div class="cart-totals">
-                <div class="total-line"><span>Подытог</span><span id="cart-subtotal">0 ₽</span></div>
-                <div class="total-line">
-                  <label>Скидка</label>
-                  <input type="number" id="cart-discount" class="input sm" value="0" min="0" step="10">
-                </div>
-                <div class="total-line grand"><span>К оплате</span><span id="cart-total">0 ₽</span></div>
-              </div>
-              <div id="split-payments" class="split-payments"></div>
-              <div class="split-pay-summary">
-                <span id="split-paid-label">Оплачено: <strong id="split-paid-total">0</strong></span>
-                <span id="split-remain-label" class="hidden">Осталось: <strong id="split-remain-total">0</strong></span>
-              </div>
-              <button type="button" id="split-fill-cash" class="btn btn-ghost btn-sm btn-block">Вся сумма наличными</button>
-              <button id="checkout-btn" class="btn btn-success btn-block" disabled>Провести оплату</button>
-              <p id="pos-shift-hint" class="hint hidden"></p>
-              <button id="clear-cart-btn" class="btn btn-ghost btn-block">Очистить</button>
             </div>
           </div>
         </section>
@@ -443,6 +526,19 @@
                 <div class="cart-totals">
                   <div class="total-line"><span>Подытог</span><span id="acc-cart-subtotal">0</span></div>
                   <div class="total-line grand"><span>К оплате</span><span id="acc-cart-total">0</span></div>
+                  <div class="pos-fx" id="acc-fx-block">
+                    <label class="toggle-row pos-fx-toggle">
+                      <input type="checkbox" id="acc-fx-enable">
+                      <span>Конвертация</span>
+                    </label>
+                    <div id="acc-fx-fields" class="pos-fx-fields hidden">
+                      <label class="pos-fx-currency-label">Оплата в
+                        <select id="acc-fx-currency" class="select"></select>
+                      </label>
+                      <p class="hint" id="acc-fx-rate-hint"></p>
+                      <div class="total-line"><span id="acc-fx-total-label">К оплате</span><span id="acc-fx-total">0</span></div>
+                    </div>
+                  </div>
                 </div>
                 <div id="acc-split-payments" class="split-payments"></div>
                 <div class="split-pay-summary">
@@ -627,6 +723,7 @@
               <form id="rate-form" class="form-stack card-body">
                 <label>Валюта<input id="rate-code" class="input" maxlength="3" placeholder="USD"></label>
                 <label>Курс к базовой<input type="number" id="rate-value" class="input" min="0" step="0.0001" required></label>
+                <p class="hint" style="margin:0">Например USD = 10.5 означает: 1 $ = 10.5 смн. Нужен для конвертации на кассе.</p>
                 <label>Действует с<input type="datetime-local" id="rate-effective" class="input"></label>
                 <label>Комментарий<input id="rate-notes" class="input"></label>
                 <button type="submit" class="btn btn-primary">Добавить курс</button>
