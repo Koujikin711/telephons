@@ -39,23 +39,23 @@ DEFAULT_WAREHOUSE_NAME = "Основной склад"
 
 ROLE_PAGES: dict[str, list[str]] = {
     "owner": [
-        "dashboard", "pos", "shifts", "sales", "warehouses", "products-own",
+        "dashboard", "pos", "sales", "warehouses", "products-own",
         "products-consignment", "accessories", "reports", "analytics", "debtors", "creditors",
-        "imei", "stocktake", "settings",
+        "stocktake", "settings",
     ],
     "warehouse": [
         "dashboard", "warehouses", "products-own", "products-consignment",
-        "accessories", "imei", "stocktake",
+        "accessories", "stocktake",
     ],
-    "cashier": ["dashboard", "pos", "shifts", "sales", "debtors"],
+    "cashier": ["dashboard", "pos", "sales", "debtors"],
     "accessories": ["accessories"],
 }
 
 # Упрощённый интерфейс: касса, склад, взаиморасчёты — без отдельного раздела «Продажи».
 SIMPLE_ROLE_PAGES: dict[str, list[str]] = {
-    "owner": ["pos", "shifts", "warehouses", "debtors", "stocktake", "accessories", "reports", "settings"],
-    "warehouse": ["warehouses", "stocktake", "imei"],
-    "cashier": ["pos", "shifts", "debtors"],
+    "owner": ["pos", "warehouses", "debtors", "stocktake", "accessories", "reports", "settings"],
+    "warehouse": ["warehouses", "stocktake"],
+    "cashier": ["pos", "debtors"],
     "accessories": ["accessories"],
 }
 
@@ -203,6 +203,14 @@ def sale_search_sql(q: str) -> tuple[str, list[Any]]:
     return f"({' OR '.join(parts)})", params
 
 
+def imei_digits_expr(col: str) -> str:
+    """SQL expression: strip common separators from IMEI/serial for digit matching."""
+    return (
+        f"REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(COALESCE({col}, ''), ' ', ''), '-', ''), "
+        f"'.', ''), '_', ''), '/', '')"
+    )
+
+
 def unit_search_sql(q: str, imei_col: str = "u.imei", serial_col: str = "u.serial") -> tuple[str, list[Any]]:
     q = normalize_search_q(q)
     if not q:
@@ -210,9 +218,18 @@ def unit_search_sql(q: str, imei_col: str = "u.imei", serial_col: str = "u.seria
     d = only_digits(q)
     if len(d) >= 5 and re.fullmatch(r"[\d\s-]+", q):
         suffix = d[-min(len(d), 15):]
+        dig_imei = imei_digits_expr(imei_col)
+        dig_serial = imei_digits_expr(serial_col)
         return (
-            f" AND ({imei_col} LIKE ? OR {serial_col} LIKE ? OR {imei_col} LIKE ? OR {serial_col} LIKE ?)",
-            [f"%{suffix}", f"%{suffix}", f"%{d}%", f"%{d}%"],
+            f" AND ("
+            f"{imei_col} LIKE ? OR {serial_col} LIKE ? OR {imei_col} LIKE ? OR {serial_col} LIKE ?"
+            f" OR {dig_imei} LIKE ? OR {dig_serial} LIKE ?"
+            f" OR {dig_imei} LIKE ? OR {dig_serial} LIKE ?"
+            f")",
+            [
+                f"%{suffix}", f"%{suffix}", f"%{d}%", f"%{d}%",
+                f"%{suffix}", f"%{suffix}", f"%{d}%", f"%{d}%",
+            ],
         )
     like = f"%{q}%"
     return f" AND ({imei_col} LIKE ? OR {serial_col} LIKE ?)", [like, like]
@@ -255,8 +272,9 @@ def units_for_product_at_warehouse(
         """
         SELECT u.id, u.imei, u.serial, u.status, u.notes, u.created_at,
                u.battery_capacity, u.client_name, u.region, u.arrival_date,
+               u.purchase_price AS unit_purchase_price,
                p.color AS product_color, p.name AS product_name, p.model, p.memory,
-               p.purchase_price, p.supplier_name, p.sale_price, p.ownership_type
+               p.purchase_price AS product_purchase_price, p.supplier_name, p.sale_price, p.ownership_type
         FROM product_units u
         JOIN products p ON p.id = u.product_id
         WHERE u.product_id = ? AND u.warehouse_id = ? AND u.status = 'in_stock'
@@ -264,7 +282,15 @@ def units_for_product_at_warehouse(
         """,
         (product_id, warehouse_id),
     ).fetchall()
-    return [row_to_dict(r) for r in rows]
+    out = []
+    for r in rows:
+        d = row_to_dict(r) or {}
+        d["purchase_price"] = unit_purchase_price(
+            {"purchase_price": d.get("unit_purchase_price")},
+            {"purchase_price": d.get("product_purchase_price")},
+        )
+        out.append(d)
+    return out
 
 
 @contextmanager
@@ -386,6 +412,15 @@ def migrate_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_mutual_status ON mutual_entries(status, created_at);
         """
     )
+    _add_column(conn, "mutual_payments", "pay_amount", "REAL")
+    _add_column(conn, "mutual_payments", "pay_currency_code", "TEXT DEFAULT ''")
+    _add_column(conn, "mutual_payments", "fx_rate", "REAL")
+    _add_column(conn, "receivable_payments", "pay_amount", "REAL")
+    _add_column(conn, "receivable_payments", "pay_currency_code", "TEXT DEFAULT ''")
+    _add_column(conn, "receivable_payments", "fx_rate", "REAL")
+    _add_column(conn, "cash_inflows", "mutual_entry_id", "INTEGER")
+    _add_column(conn, "payment_methods", "currency_code", "TEXT NOT NULL DEFAULT ''")
+    _backfill_payment_method_currencies(conn)
     if _table_exists(conn, "product_units"):
         conn.executescript(
             """
@@ -406,6 +441,7 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     _add_column(conn, "product_units", "client_name", "TEXT DEFAULT ''")
     _add_column(conn, "product_units", "region", "TEXT DEFAULT ''")
     _add_column(conn, "product_units", "arrival_date", "TEXT DEFAULT ''")
+    _add_column(conn, "product_units", "purchase_price", "REAL NOT NULL DEFAULT 0")
     _add_column(conn, "warehouses", "warehouse_type", "TEXT NOT NULL DEFAULT 'new'")
     _add_column(conn, "warehouses", "currency_code", "TEXT NOT NULL DEFAULT ''")
     if _table_exists(conn, "product_units"):
@@ -413,6 +449,20 @@ def migrate_db(conn: sqlite3.Connection) -> None:
             """
             UPDATE product_units SET customs_status = 'cleared'
             WHERE customs_cleared = 1 AND customs_status = 'none'
+            """
+        )
+        # Backfill unit cost from product card when unit has no own cost yet
+        conn.execute(
+            """
+            UPDATE product_units
+            SET purchase_price = (
+                SELECT p.purchase_price FROM products p WHERE p.id = product_units.product_id
+            )
+            WHERE COALESCE(purchase_price, 0) = 0
+              AND EXISTS (
+                  SELECT 1 FROM products p
+                  WHERE p.id = product_units.product_id AND COALESCE(p.purchase_price, 0) > 0
+              )
             """
         )
     if _table_exists(conn, "warehouses"):
@@ -505,6 +555,46 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     _add_column(conn, "sales", "amount_due", "REAL NOT NULL DEFAULT 0")
     _add_column(conn, "sales", "currency_code", "TEXT NOT NULL DEFAULT 'TJS'")
     _add_column(conn, "expenses", "department", "TEXT NOT NULL DEFAULT 'main'")
+    _add_column(conn, "expenses", "created_by", "TEXT NOT NULL DEFAULT ''")
+    _add_column(conn, "expenses", "created_by_user_id", "INTEGER")
+    _add_column(conn, "expenses", "warehouse_id", "INTEGER")
+    _add_column(conn, "expenses", "payee", "TEXT NOT NULL DEFAULT ''")
+    _add_column(conn, "expenses", "kind", "TEXT NOT NULL DEFAULT 'expense'")
+    _add_column(conn, "sales", "affects_cash", "INTEGER NOT NULL DEFAULT 1")
+    _add_column(conn, "expenses", "affects_cash", "INTEGER NOT NULL DEFAULT 1")
+    # Mark Excel-imported rows for display when created_by is empty
+    if _table_exists(conn, "expenses"):
+        conn.execute(
+            """
+            UPDATE expenses
+            SET created_by = 'Excel импорт'
+            WHERE COALESCE(TRIM(created_by), '') = ''
+              AND description = 'Excel импорт ОПиУ'
+            """
+        )
+    # Excel / Z-import must not inflate POS cash wallets by default
+    if _table_exists(conn, "sales"):
+        conn.execute(
+            """
+            UPDATE sales SET affects_cash = 0
+            WHERE COALESCE(affects_cash, 1) = 1
+              AND (
+                user_name LIKE 'Z-импорт%'
+                OR COALESCE(notes, '') LIKE 'Z-импорт%'
+              )
+            """
+        )
+    if _table_exists(conn, "expenses"):
+        conn.execute(
+            """
+            UPDATE expenses SET affects_cash = 0
+            WHERE COALESCE(affects_cash, 1) = 1
+              AND (
+                description = 'Excel импорт ОПиУ'
+                OR created_by = 'Excel импорт'
+              )
+            """
+        )
 
     conn.executescript(
         """
@@ -1311,12 +1401,14 @@ def _import_products_rows(
                 """
                 INSERT INTO product_units
                 (product_id, warehouse_id, imei, serial, status, notes, created_at,
-                 customs_status, customs_cleared, battery_capacity, client_name, region, arrival_date)
-                VALUES (?, ?, ?, ?, 'in_stock', ?, ?, 'none', 0, ?, ?, ?, ?)
+                 customs_status, customs_cleared, battery_capacity, client_name, region, arrival_date,
+                 purchase_price)
+                VALUES (?, ?, ?, ?, 'in_stock', ?, ?, 'none', 0, ?, ?, ?, ?, ?)
                 """,
                 (
                     product_id, default_wh_id, imei, serial, notes or "Импорт Excel", utc_now(), battery,
                     client_name, region, arrival_date or utc_now()[:10],
+                    purchase if purchase > 0 else float(product["purchase_price"] or 0),
                 ),
             )
             adjust_warehouse_stock(conn, default_wh_id, product_id, 1, "inbound", notes=f"Импорт: {imei or serial}")
@@ -1904,9 +1996,11 @@ def _import_z_register_rows(
     warehouse_id: int,
     *,
     sheet_kind: str = "used",
+    affect_cash: bool = False,
 ) -> dict[str, Any]:
     created_units = sold = skipped = 0
     errors: list[str] = []
+    cash_flag = 1 if affect_cash else 0
     expected_condition = (
         "used" if sheet_kind == "used"
         else "partnership" if sheet_kind == "partnership"
@@ -1936,10 +2030,10 @@ def _import_z_register_rows(
             INSERT INTO sales
             (total, discount, payment_method, status, notes, created_at,
              warehouse_id, cash_amount, card_amount, trade_in_value, shift_id, user_id, user_name,
-             amount_paid, amount_due, currency_code)
-            VALUES (?, 0, 'cash', 'completed', ?, ?, ?, ?, 0, 0, NULL, NULL, 'Z-импорт', ?, 0, ?)
+             amount_paid, amount_due, currency_code, affects_cash)
+            VALUES (?, 0, 'cash', 'completed', ?, ?, ?, ?, 0, 0, NULL, NULL, 'Z-импорт', ?, 0, ?, ?)
             """,
-            (total, row["comments"] or "Z-импорт Excel", sale_date, warehouse_id, total, total, currency_code),
+            (total, row["comments"] or "Z-импорт Excel", sale_date, warehouse_id, total, total, currency_code, cash_flag),
         )
         sale_id = int(cur_s.lastrowid)
         insert_sale_payments(conn, sale_id, [{"method_code": "cash", "amount": total}])
@@ -1996,15 +2090,238 @@ def _import_z_register_rows(
                 if has_sale:
                     reuse_unit = in_stock
                 else:
+                    # Keep existing unit; refresh per-IMEI cost from Excel
+                    conn.execute(
+                        """
+                        UPDATE product_units
+                        SET purchase_price = ?, customs_price = ?
+                        WHERE id = ?
+                        """,
+                        (purchase, extra, int(in_stock["id"])),
+                    )
+                    if purchase > 0:
+                        conn.execute(
+                            "UPDATE products SET purchase_price = ? WHERE id = ?",
+                            (purchase, int(in_stock["product_id"])),
+                        )
                     skipped += 1
-                    errors.append(f"Строка {row['row_num']}: IMEI {imei} уже на складе")
                     continue
-            elif conn.execute(
-                "SELECT 1 FROM product_units WHERE imei = ? AND imei != '' LIMIT 1", (imei,)
-            ).fetchone() and not has_sale:
-                skipped += 1
-                errors.append(f"Строка {row['row_num']}: IMEI {imei} уже импортирован")
-                continue
+            else:
+                existing_any = conn.execute(
+                    """
+                    SELECT id, product_id, warehouse_id, status, sale_id
+                    FROM product_units
+                    WHERE imei = ? AND imei != ''
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (imei,),
+                ).fetchone()
+                if existing_any and not has_sale:
+                    # Return / re-accept: same IMEI was sold, Excel shows it back in stock.
+                    unit_id = int(existing_any["id"])
+                    old_wh = int(existing_any["warehouse_id"] or warehouse_id)
+                    old_status = (existing_any["status"] or "").strip()
+                    # Ensure product card matches current Excel attrs (color/memory may change).
+                    existing_prod = conn.execute(
+                        """
+                        SELECT id FROM products
+                        WHERE category = 'phone' AND LOWER(TRIM(name)) = LOWER(TRIM(?))
+                          AND LOWER(TRIM(COALESCE(model, ''))) = LOWER(TRIM(?))
+                          AND LOWER(TRIM(COALESCE(memory, ''))) = LOWER(TRIM(?))
+                          AND LOWER(TRIM(COALESCE(color, ''))) = LOWER(TRIM(?))
+                          AND condition = ?
+                        LIMIT 1
+                        """,
+                        (name, name, memory, color, condition),
+                    ).fetchone()
+                    if existing_prod:
+                        product_id = int(existing_prod["id"])
+                        conn.execute(
+                            "UPDATE products SET purchase_price = ?, condition = ? WHERE id = ?",
+                            (purchase, condition, product_id),
+                        )
+                    else:
+                        cur = conn.execute(
+                            """
+                            INSERT INTO products
+                            (name, category, ownership_type, supplier_name, brand, sku, barcode,
+                             purchase_price, sale_price, stock, min_stock, created_at,
+                             model, color, size, memory, ram, customs_cleared, customs_price, specs_extra,
+                             condition, track_units, image_url)
+                            VALUES (?, 'phone', 'own', '', '', '', '', ?, ?, 0, 0, ?,
+                                    ?, ?, '', ?, '', 0, 0, '', ?, 1, '')
+                            """,
+                            (name, purchase, round(purchase * 1.15, 2), utc_now(), name, color, memory, condition),
+                        )
+                        product_id = int(cur.lastrowid)
+                    unit_notes = (row["comments"] or "").strip()
+                    unit_notes = (
+                        f"Z-импорт возврат: {unit_notes}" if unit_notes else "Z-импорт возврат Excel"
+                    )
+                    conn.execute(
+                        """
+                        UPDATE product_units
+                        SET status = 'in_stock', sale_id = NULL, product_id = ?, warehouse_id = ?,
+                            purchase_price = ?, customs_price = ?, battery_capacity = ?,
+                            client_name = ?, region = ?, arrival_date = ?, notes = ?,
+                            serial = COALESCE(NULLIF(serial, ''), ?)
+                        WHERE id = ?
+                        """,
+                        (
+                            product_id,
+                            warehouse_id,
+                            purchase,
+                            extra,
+                            row["battery"],
+                            row["comments"] or "",
+                            row["region"] or "",
+                            (row["arrival_date"] or "")[:10],
+                            unit_notes,
+                            imei,
+                            unit_id,
+                        ),
+                    )
+                    if old_status != "in_stock":
+                        adjust_warehouse_stock(
+                            conn,
+                            warehouse_id,
+                            product_id,
+                            1,
+                            "inbound",
+                            notes=f"Z-импорт возврат IMEI {imei}: {name}",
+                        )
+                        if old_wh != warehouse_id or int(existing_any["product_id"]) != product_id:
+                            sync_product_stock(conn, int(existing_any["product_id"]))
+                        sync_product_stock(conn, product_id)
+                    created_units += 1
+                    continue
+                if existing_any and has_sale:
+                    # Same IMEI sold again in Excel = return + resale (or duplicate of same sale).
+                    already = conn.execute(
+                        """
+                        SELECT s.id
+                        FROM sales s
+                        JOIN sale_items si ON si.sale_id = s.id
+                        JOIN sale_item_units siu ON siu.sale_item_id = si.id
+                        WHERE siu.imei = ?
+                          AND substr(s.created_at, 1, 10) = ?
+                          AND ABS(COALESCE(s.total, 0) - ?) < 0.02
+                        LIMIT 1
+                        """,
+                        (imei, str(sale_date)[:10], float(sale_price)),
+                    ).fetchone()
+                    if already:
+                        skipped += 1
+                        continue
+                    unit_id = int(existing_any["id"])
+                    old_status = (existing_any["status"] or "").strip()
+                    existing_prod = conn.execute(
+                        """
+                        SELECT id FROM products
+                        WHERE category = 'phone' AND LOWER(TRIM(name)) = LOWER(TRIM(?))
+                          AND LOWER(TRIM(COALESCE(model, ''))) = LOWER(TRIM(?))
+                          AND LOWER(TRIM(COALESCE(memory, ''))) = LOWER(TRIM(?))
+                          AND LOWER(TRIM(COALESCE(color, ''))) = LOWER(TRIM(?))
+                          AND condition = ?
+                        LIMIT 1
+                        """,
+                        (name, name, memory, color, condition),
+                    ).fetchone()
+                    if existing_prod:
+                        product_id = int(existing_prod["id"])
+                        conn.execute(
+                            "UPDATE products SET purchase_price = ?, sale_price = COALESCE(?, sale_price), condition = ? WHERE id = ?",
+                            (purchase, sale_price, condition, product_id),
+                        )
+                    else:
+                        cur = conn.execute(
+                            """
+                            INSERT INTO products
+                            (name, category, ownership_type, supplier_name, brand, sku, barcode,
+                             purchase_price, sale_price, stock, min_stock, created_at,
+                             model, color, size, memory, ram, customs_cleared, customs_price, specs_extra,
+                             condition, track_units, image_url)
+                            VALUES (?, 'phone', 'own', '', '', '', '', ?, ?, 0, 0, ?,
+                                    ?, ?, '', ?, '', 0, 0, '', ?, 1, '')
+                            """,
+                            (
+                                name,
+                                purchase,
+                                float(sale_price) if sale_price else round(purchase * 1.15, 2),
+                                utc_now(),
+                                name,
+                                color,
+                                memory,
+                                condition,
+                            ),
+                        )
+                        product_id = int(cur.lastrowid)
+                    unit_notes = (row["comments"] or "").strip()
+                    unit_notes = (
+                        f"Z-импорт возврат+продажа: {unit_notes}"
+                        if unit_notes
+                        else "Z-импорт возврат+продажа Excel"
+                    )
+                    conn.execute(
+                        """
+                        UPDATE product_units
+                        SET status = 'in_stock', sale_id = NULL, product_id = ?, warehouse_id = ?,
+                            purchase_price = ?, customs_price = ?, battery_capacity = ?,
+                            client_name = ?, region = ?, arrival_date = ?, notes = ?,
+                            serial = COALESCE(NULLIF(serial, ''), ?)
+                        WHERE id = ?
+                        """,
+                        (
+                            product_id,
+                            warehouse_id,
+                            purchase,
+                            extra,
+                            row["battery"],
+                            row["comments"] or "",
+                            row["region"] or "",
+                            (row["arrival_date"] or "")[:10],
+                            unit_notes,
+                            imei,
+                            unit_id,
+                        ),
+                    )
+                    if old_status != "in_stock":
+                        adjust_warehouse_stock(
+                            conn,
+                            warehouse_id,
+                            product_id,
+                            1,
+                            "inbound",
+                            notes=f"Z-импорт возврат перед повторной продажей IMEI {imei}",
+                        )
+                        sync_product_stock(conn, product_id)
+                    reuse_unit = conn.execute(
+                        "SELECT id, product_id FROM product_units WHERE id = ?",
+                        (unit_id,),
+                    ).fetchone()
+        else:
+            # No IMEI: stable serial Z{row}-{wh}. Skip re-creating the same Excel row.
+            by_serial = conn.execute(
+                """
+                SELECT id, product_id FROM product_units
+                WHERE serial = ? AND status = 'in_stock' LIMIT 1
+                """,
+                (serial,),
+            ).fetchone()
+            if by_serial:
+                if has_sale:
+                    reuse_unit = by_serial
+                else:
+                    conn.execute(
+                        """
+                        UPDATE product_units
+                        SET purchase_price = ?, customs_price = ?
+                        WHERE id = ?
+                        """,
+                        (purchase, extra, int(by_serial["id"])),
+                    )
+                    skipped += 1
+                    continue
 
         if reuse_unit:
             unit_id = int(reuse_unit["id"])
@@ -2012,6 +2329,10 @@ def _import_z_register_rows(
             conn.execute(
                 "UPDATE products SET purchase_price = ?, sale_price = COALESCE(?, sale_price) WHERE id = ?",
                 (purchase, sale_price, product_id),
+            )
+            conn.execute(
+                "UPDATE product_units SET purchase_price = ?, customs_price = ? WHERE id = ?",
+                (purchase, extra, unit_id),
             )
         else:
             existing = conn.execute(
@@ -2055,13 +2376,13 @@ def _import_z_register_rows(
                 INSERT INTO product_units
                 (product_id, warehouse_id, imei, serial, status, notes, created_at,
                  customs_status, customs_cleared, customs_price, battery_capacity,
-                 client_name, region, arrival_date)
-                VALUES (?, ?, ?, ?, 'in_stock', ?, ?, 'none', 0, ?, ?, ?, ?, ?)
+                 client_name, region, arrival_date, purchase_price)
+                VALUES (?, ?, ?, ?, 'in_stock', ?, ?, 'none', 0, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     product_id, warehouse_id, imei, serial, unit_notes,
                     utc_now(), extra, row["battery"], row["comments"] or "", row["region"] or "",
-                    (row["arrival_date"] or "")[:10],
+                    (row["arrival_date"] or "")[:10], purchase,
                 ),
             )
             unit_id = int(cur_u.lastrowid)
@@ -2147,8 +2468,8 @@ def _import_accessory_z_rows(
                 INSERT INTO sales
                 (total, discount, payment_method, status, notes, created_at,
                  warehouse_id, cash_amount, card_amount, trade_in_value, shift_id, user_id, user_name,
-                 amount_paid, amount_due, currency_code)
-                VALUES (?, 0, 'cash', 'completed', ?, ?, ?, ?, 0, 0, NULL, NULL, 'Z-импорт акс', ?, 0, ?)
+                 amount_paid, amount_due, currency_code, affects_cash)
+                VALUES (?, 0, 'cash', 'completed', ?, ?, ?, ?, 0, 0, NULL, NULL, 'Z-импорт акс', ?, 0, ?, 0)
                 """,
                 (total, row["comments"] or "Z-импорт аксессуаров", sale_date, warehouse_id, total, total, currency_code),
             )
@@ -2285,29 +2606,40 @@ def import_opu_expenses(
     expense_date: str,
     *,
     replace: bool = False,
+    affect_cash: bool = False,
 ) -> dict[str, Any]:
     if replace:
         conn.execute("DELETE FROM expenses WHERE description = 'Excel импорт ОПиУ'")
     created = 0
     total = 0.0
+    cash_flag = 1 if affect_cash else 0
     for row in rows:
         cat = row["category"]
         amount = float(row["amount"])
         dept = "accessories" if "аксесс" in cat.lower() else "main"
         conn.execute(
             """
-            INSERT INTO expenses (category, amount, description, payment_method_code, expense_date, created_at, department)
-            VALUES (?, ?, 'Excel импорт ОПиУ', 'cash', ?, ?, ?)
+            INSERT INTO expenses (
+                category, amount, description, payment_method_code, expense_date, created_at,
+                department, created_by, created_by_user_id, affects_cash
+            )
+            VALUES (?, ?, 'Excel импорт ОПиУ', 'cash', ?, ?, ?, 'Excel импорт', NULL, ?)
             """,
-            (cat, amount, expense_date[:10], utc_now(), dept),
+            (cat, amount, expense_date[:10], utc_now(), dept, cash_flag),
         )
         created += 1
         total += amount
-    return {"created": created, "total": round(total, 2), "expense_date": expense_date[:10]}
+    return {"created": created, "total": round(total, 2), "expense_date": expense_date[:10], "affects_cash": cash_flag}
 
 
 def import_z_register_excel(
-    conn: sqlite3.Connection, raw: bytes, filename: str, sheet: str = "", *, replace: bool = False
+    conn: sqlite3.Connection,
+    raw: bytes,
+    filename: str,
+    sheet: str = "",
+    *,
+    replace: bool = False,
+    affect_cash: bool = False,
 ) -> dict[str, Any]:
     from openpyxl import load_workbook
 
@@ -2341,7 +2673,7 @@ def import_z_register_excel(
         ws = wb[sn]
         rows = _parse_z_register_sheet(ws, kind)
         results["sheets"][sn] = _import_z_register_rows(
-            conn, rows, wh_id, sheet_kind=kind
+            conn, rows, wh_id, sheet_kind=kind, affect_cash=affect_cash
         ) | {"warehouse_id": wh_id, "kind": kind}
     for sn in wb.sheetnames:
         low = sn.lower().replace(" ", "")
@@ -2350,9 +2682,10 @@ def import_z_register_excel(
             if expense_rows:
                 exp_date = _expense_date_from_filename(filename)
                 results["expenses"] = import_opu_expenses(
-                    conn, expense_rows, exp_date, replace=replace
+                    conn, expense_rows, exp_date, replace=replace, affect_cash=affect_cash
                 )
             break
+    results["affects_cash"] = bool(affect_cash)
     return results
 
 
@@ -2471,10 +2804,10 @@ def _reclassify_phones_from_accessories(conn: sqlite3.Connection) -> None:
                     INSERT INTO product_units
                     (product_id, warehouse_id, imei, serial, status, notes, created_at,
                      customs_status, customs_cleared, customs_price, battery_capacity,
-                     client_name, region, arrival_date)
-                    VALUES (?, ?, '', ?, 'in_stock', 'Перенос с аксессуаров', ?, 'none', 0, 0, NULL, '', '', '')
+                     client_name, region, arrival_date, purchase_price)
+                    VALUES (?, ?, '', ?, 'in_stock', 'Перенос с аксессуаров', ?, 'none', 0, 0, NULL, '', '', '', ?)
                     """,
-                    (pid, main_id, f"ACC{pid}-{i + 1}", utc_now()),
+                    (pid, main_id, f"ACC{pid}-{i + 1}", utc_now(), float(r["purchase_price"] or 0)),
                 )
                 adjust_warehouse_stock(
                     conn, main_id, pid, 1, "transfer", notes=f"Перенос с аксессуаров: {name}",
@@ -2751,7 +3084,9 @@ def _z_register_lines(
         f"""
         SELECT u.id AS unit_id, u.arrival_date, u.imei, u.serial, u.battery_capacity,
                u.client_name, u.region, u.customs_price AS extra_cost, u.status, u.notes,
-               p.name AS product_name, p.model, p.memory, p.color, p.purchase_price, p.condition,
+               u.purchase_price AS unit_purchase_price,
+               p.name AS product_name, p.model, p.memory, p.color,
+               p.purchase_price AS product_purchase_price, p.condition,
                si.subtotal AS sale_price, si.shop_profit, si.purchase_price AS item_purchase_price,
                s.created_at AS sale_date, s.id AS sale_id
         FROM product_units u
@@ -2785,7 +3120,10 @@ def _z_register_lines(
         elif not year and not month:
             in_period = bool(sd)
 
-        product_purchase = float(d.get("purchase_price") or 0)
+        product_purchase = unit_purchase_price(
+            {"purchase_price": d.get("unit_purchase_price")},
+            {"purchase_price": d.get("product_purchase_price")},
+        )
         item_purchase_raw = d.get("item_purchase_price")
         item_purchase = float(item_purchase_raw) if item_purchase_raw is not None else None
         extra_cost = float(d.get("extra_cost") or 0)
@@ -2907,12 +3245,89 @@ def convert_amount(
     return float(amount) * from_rate / to_rate
 
 
+def _infer_payment_method_currency(name: str = "", code: str = "", explicit: str = "") -> str:
+    """USD / TJS / '' (any). Prefer explicit; else detect from name/code."""
+    ex = (explicit or "").strip().upper()
+    if ex in ("USD", "TJS"):
+        return ex
+    blob = f"{name or ''} {code or ''}".lower()
+    if any(x in blob for x in ("доллар", "dollar", "usd", "$")):
+        return "USD"
+    if any(x in blob for x in ("сомон", "смн", "наличн", "tjs")) or (code or "").lower() == "cash":
+        return "TJS"
+    return ""
+
+
+def _backfill_payment_method_currencies(conn: sqlite3.Connection) -> None:
+    if not _table_exists(conn, "payment_methods"):
+        return
+    if "currency_code" not in {r[1] for r in conn.execute("PRAGMA table_info(payment_methods)").fetchall()}:
+        return
+    for row in conn.execute("SELECT id, code, name, currency_code FROM payment_methods").fetchall():
+        current = (row["currency_code"] or "").strip().upper()
+        inferred = _infer_payment_method_currency(row["name"], row["code"], current)
+        if inferred and inferred != current:
+            conn.execute(
+                "UPDATE payment_methods SET currency_code = ? WHERE id = ?",
+                (inferred, row["id"]),
+            )
+
+
+def payment_method_currency(pm: dict[str, Any] | sqlite3.Row | None) -> str:
+    if not pm:
+        return ""
+    return _infer_payment_method_currency(
+        pm["name"] if "name" in pm.keys() else "",
+        pm["code"] if "code" in pm.keys() else "",
+        pm["currency_code"] if "currency_code" in pm.keys() else "",
+    )
+
+
+def cash_wallet_code_for_currency(conn: sqlite3.Connection, currency: str) -> str | None:
+    """Find cash-type payment method bound to USD or TJS."""
+    want = (currency or "").strip().upper()
+    if want not in ("USD", "TJS"):
+        return None
+    methods = list_payment_methods(conn, active_only=True)
+    exact = [
+        m for m in methods
+        if (m.get("method_type") or "") == "cash" and payment_method_currency(m) == want
+    ]
+    if exact:
+        # Prefer code containing usd/dollar for USD
+        if want == "USD":
+            prefer = [m for m in exact if "usd" in m["code"].lower() or "dollar" in m["code"].lower()
+                      or "доллар" in (m.get("name") or "").lower()]
+            return (prefer or exact)[0]["code"]
+        prefer = [m for m in exact if m["code"] == "cash"]
+        return (prefer or exact)[0]["code"]
+    return None
+
+
+def resolve_wallet_method_code(
+    conn: sqlite3.Connection,
+    method_code: str,
+    money_currency: str,
+) -> str:
+    """Route cash payments into the matching currency cash wallet (USD vs сомони)."""
+    code = (method_code or "cash").strip() or "cash"
+    pm = get_payment_method(conn, code)
+    if not pm or (pm["method_type"] or "") != "cash":
+        return code
+    money_cur = (money_currency or "TJS").strip().upper() or "TJS"
+    target = cash_wallet_code_for_currency(conn, money_cur)
+    return target or code
+
+
 def list_payment_methods(conn: sqlite3.Connection, active_only: bool = True) -> list[dict[str, Any]]:
     sql = "SELECT * FROM payment_methods"
     if active_only:
         sql += " WHERE is_active = 1"
     sql += " ORDER BY sort_order, name"
-    return [row_to_dict(r) for r in conn.execute(sql).fetchall()]
+    rows = [row_to_dict(r) for r in conn.execute(sql).fetchall()]
+    for r in rows:
+        r["currency_code"] = payment_method_currency(r)
+    return rows
 
 
 def get_payment_method(conn: sqlite3.Connection, code: str) -> sqlite3.Row | None:
@@ -3012,6 +3427,34 @@ def process_sale_payments(
         raise HTTPException(status_code=400, detail="Укажите способ оплаты")
     payment_method = codes[0] if len(codes) == 1 else ("split" if codes else "credit")
     return cash_amount, card_amount, payment_method, normalized, paid, due
+
+
+def debt_reduction_from_payment(
+    *,
+    debt_currency: str,
+    pay_amount: float,
+    pay_currency: str,
+    fx_rate: float | None,
+) -> float:
+    """Reduce debt by pay_amount in pay_currency. fx_rate = 1 USD in TJS."""
+    debt = (debt_currency or "TJS").strip().upper() or "TJS"
+    pay = (pay_currency or debt).strip().upper() or debt
+    amt = float(pay_amount or 0)
+    if amt <= 0:
+        raise HTTPException(status_code=400, detail="Сумма оплаты должна быть больше 0")
+    if pay == debt:
+        return round(amt, 2)
+    rate = float(fx_rate or 0)
+    if rate <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Укажите курс: сколько сомони за 1 доллар",
+        )
+    if debt == "USD" and pay == "TJS":
+        return round(amt / rate, 2)
+    if debt == "TJS" and pay == "USD":
+        return round(amt * rate, 2)
+    raise HTTPException(status_code=400, detail=f"Неподдерживаемая пара валют {pay} → {debt}")
 
 
 def create_receivable(
@@ -3115,13 +3558,106 @@ def allocate_expense_amount(amount: float, split: list[dict[str, Any]]) -> list[
     return out
 
 
+def expenses_allocated_by_warehouse(
+    conn: sqlite3.Connection,
+    exp_clause: str,
+    exp_params: list[Any],
+) -> tuple[float, float, list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split expenses: warehouse_id set → 100% that WH; NULL → % from settings.
+
+    Returns (total, main_total, expenses_by_warehouse, split_rules).
+    """
+    rows = conn.execute(
+        f"""
+        SELECT warehouse_id,
+               COALESCE(department, 'main') AS department,
+               COALESCE(SUM(amount), 0) AS total
+        FROM expenses
+        WHERE 1=1 {exp_clause}
+        GROUP BY warehouse_id, COALESCE(department, 'main')
+        """,
+        exp_params,
+    ).fetchall()
+    shared = 0.0
+    shared_main = 0.0
+    direct: dict[int, float] = {}
+    direct_main: dict[int, float] = {}
+    total = 0.0
+    main_total = 0.0
+    for r in rows:
+        amt = float(r["total"] or 0)
+        total += amt
+        is_main = (r["department"] or "main") != "accessories"
+        if is_main:
+            main_total += amt
+        wid = r["warehouse_id"]
+        if wid is None:
+            shared += amt
+            if is_main:
+                shared_main += amt
+        else:
+            wid_i = int(wid)
+            direct[wid_i] = direct.get(wid_i, 0.0) + amt
+            if is_main:
+                direct_main[wid_i] = direct_main.get(wid_i, 0.0) + amt
+
+    split = get_expense_warehouse_split(conn)
+    shared_alloc = allocate_expense_amount(shared, split)
+    wh_names = {
+        int(w["id"]): w["name"]
+        for w in conn.execute("SELECT id, name FROM warehouses").fetchall()
+    }
+    by_wh: dict[int, dict[str, Any]] = {}
+    for s in shared_alloc:
+        wid = int(s["warehouse_id"])
+        shared_amt = float(s.get("amount") or 0)
+        by_wh[wid] = {
+            "warehouse_id": wid,
+            "warehouse_name": s.get("warehouse_name") or wh_names.get(wid, f"#{wid}"),
+            "pct_rule": float(s.get("pct") or 0),
+            "shared_amount": shared_amt,
+            "direct_amount": 0.0,
+            "amount": shared_amt,
+        }
+    for wid, amt in direct.items():
+        if wid not in by_wh:
+            by_wh[wid] = {
+                "warehouse_id": wid,
+                "warehouse_name": wh_names.get(wid, f"#{wid}"),
+                "pct_rule": 0.0,
+                "shared_amount": 0.0,
+                "direct_amount": 0.0,
+                "amount": 0.0,
+            }
+        by_wh[wid]["direct_amount"] = round(amt, 2)
+        by_wh[wid]["amount"] = round(float(by_wh[wid]["amount"]) + amt, 2)
+
+    out = sorted(by_wh.values(), key=lambda x: x["warehouse_name"])
+    for row in out:
+        row["pct"] = round(100.0 * float(row["amount"]) / total, 2) if total else 0.0
+        row["amount"] = round(float(row["amount"]), 2)
+        row["shared_amount"] = round(float(row["shared_amount"]), 2)
+    return round(total, 2), round(main_total, 2), out, split
+
+
+def expense_amount_for_warehouse(
+    expenses_by_warehouse: list[dict[str, Any]],
+    warehouse_id: int,
+) -> float:
+    row = next(
+        (x for x in expenses_by_warehouse if int(x.get("warehouse_id") or 0) == int(warehouse_id)),
+        None,
+    )
+    return float(row["amount"]) if row else 0.0
+
+
 def _cash_net_before(conn: sqlite3.Connection, cutoff: str) -> float:
     sale_in = conn.execute(
         """
         SELECT COALESCE(SUM(sp.amount), 0)
         FROM sale_payments sp
         JOIN sales s ON s.id = sp.sale_id
-        WHERE s.status = 'completed' AND s.created_at < ?
+        WHERE s.status = 'completed' AND COALESCE(s.affects_cash, 1) = 1 AND s.created_at < ?
         """,
         (cutoff,),
     ).fetchone()[0]
@@ -3140,7 +3676,7 @@ def _cash_net_before(conn: sqlite3.Connection, cutoff: str) -> float:
         (cutoff,),
     ).fetchone()[0]
     exp_out = conn.execute(
-        "SELECT COALESCE(SUM(amount), 0) FROM expenses WHERE expense_date < ?",
+        "SELECT COALESCE(SUM(amount), 0) FROM expenses WHERE COALESCE(affects_cash, 1) = 1 AND expense_date < ?",
         (cutoff[:10],),
     ).fetchone()[0]
     return float(sale_in) + float(recv_in) + float(manual_in) - float(sup_out) - float(exp_out)
@@ -3785,17 +4321,65 @@ def ownership_filter_sql(scope: str, column: str = "si.ownership_type") -> tuple
     return "", []
 
 
-def calc_line(product: sqlite3.Row, qty: int, unit_price: float | None = None) -> dict[str, float | str]:
+def unit_purchase_price(
+    unit: sqlite3.Row | dict[str, Any] | None,
+    product: sqlite3.Row | dict[str, Any] | None = None,
+) -> float:
+    """Cost of one device: unit.purchase_price if set, else product card."""
+    if unit is not None:
+        try:
+            up = float(unit["purchase_price"] or 0)
+        except (KeyError, IndexError, TypeError):
+            up = 0.0
+        if up > 0:
+            return up
+    if product is not None:
+        try:
+            return float(product["purchase_price"] or 0)
+        except (KeyError, IndexError, TypeError):
+            return 0.0
+    return 0.0
+
+
+def unit_extra_cost(unit: sqlite3.Row | dict[str, Any] | None) -> float:
+    """Per-IMEI extra (repair / customs column «Расходы»)."""
+    if unit is None:
+        return 0.0
+    try:
+        return max(0.0, float(unit["customs_price"] or 0))
+    except (KeyError, IndexError, TypeError):
+        return 0.0
+
+
+def unit_total_cost(
+    unit: sqlite3.Row | dict[str, Any] | None,
+    product: sqlite3.Row | dict[str, Any] | None = None,
+) -> float:
+    """Landed cost for profit: себестоимость + расходы на IMEI."""
+    return unit_purchase_price(unit, product) + unit_extra_cost(unit)
+
+
+def calc_line(
+    product: sqlite3.Row,
+    qty: int,
+    unit_price: float | None = None,
+    unit_costs: list[float] | None = None,
+) -> dict[str, float | str]:
     price = unit_price if unit_price is not None else float(product["sale_price"])
     subtotal = price * qty
     ownership = product["ownership_type"] or "own"
-    cost = float(product["purchase_price"])
+    if unit_costs is not None and len(unit_costs) == qty and qty > 0:
+        total_cost = float(sum(unit_costs))
+        cost = total_cost / qty
+    else:
+        cost = float(product["purchase_price"] or 0)
+        total_cost = cost * qty
     if ownership == "consignment":
-        supplier_due = cost * qty
+        supplier_due = total_cost
         shop_profit = subtotal - supplier_due
     else:
         supplier_due = 0.0
-        shop_profit = subtotal - cost * qty
+        shop_profit = subtotal - total_cost
     return {
         "ownership_type": ownership,
         "supplier_name": product["supplier_name"] or "",
@@ -3805,6 +4389,460 @@ def calc_line(product: sqlite3.Row, qty: int, unit_price: float | None = None) -
         "supplier_due": supplier_due,
         "shop_profit": shop_profit,
     }
+
+
+def inventory_stock_value_by_currency(
+    conn: sqlite3.Connection, scope: str = "all", warehouse_id: int | None = None
+) -> list[dict[str, Any]]:
+    """Stock value: per-IMEI cost for tracked phones + product cost × qty for accessories."""
+    scope_sql = ""
+    params: list[Any] = []
+    if scope != "all":
+        scope_sql = " AND p.ownership_type = ?"
+        params.append(scope)
+    wh_sql = ""
+    if warehouse_id:
+        wh_sql = " AND w.id = ?"
+        params.append(warehouse_id)
+    totals: dict[str, float] = {}
+    for row in conn.execute(
+        f"""
+        SELECT COALESCE(w.currency_code, 'TJS') AS currency_code,
+               COALESCE(SUM(
+                   (CASE WHEN COALESCE(u.purchase_price, 0) > 0 THEN u.purchase_price
+                         ELSE p.purchase_price END)
+                   + COALESCE(u.customs_price, 0)
+               ), 0) AS val
+        FROM product_units u
+        JOIN products p ON p.id = u.product_id
+        JOIN warehouses w ON w.id = u.warehouse_id
+        WHERE u.status = 'in_stock'{scope_sql}{wh_sql}
+        GROUP BY COALESCE(w.currency_code, 'TJS')
+        """,
+        params,
+    ).fetchall():
+        code = (row["currency_code"] or "TJS").strip().upper() or "TJS"
+        totals[code] = totals.get(code, 0.0) + float(row["val"])
+    qty_params = list(params)
+    for row in conn.execute(
+        f"""
+        SELECT COALESCE(w.currency_code, 'TJS') AS currency_code,
+               COALESCE(SUM(p.purchase_price * ws.quantity), 0) AS val
+        FROM warehouse_stock ws
+        JOIN products p ON p.id = ws.product_id
+        JOIN warehouses w ON w.id = ws.warehouse_id
+        WHERE ws.quantity > 0 AND IFNULL(p.track_units, 0) = 0{scope_sql}{wh_sql}
+        GROUP BY COALESCE(w.currency_code, 'TJS')
+        """,
+        qty_params,
+    ).fetchall():
+        code = (row["currency_code"] or "TJS").strip().upper() or "TJS"
+        totals[code] = totals.get(code, 0.0) + float(row["val"])
+    return [{**currency_meta(code), "value": val} for code, val in sorted(totals.items())]
+
+
+def _safe_convert(
+    conn: sqlite3.Connection, amount: float, from_code: str, to_code: str
+) -> float:
+    try:
+        return round(convert_amount(conn, amount, from_code, to_code), 2)
+    except HTTPException:
+        return 0.0
+
+
+def warehouse_stock_money(conn: sqlite3.Connection, warehouse_id: int) -> dict[str, Any]:
+    """Stock cost on one warehouse: native currency + USD + TJS equivalents."""
+    wh = conn.execute(
+        "SELECT id, name, currency_code FROM warehouses WHERE id = ?", (warehouse_id,)
+    ).fetchone()
+    if not wh:
+        raise HTTPException(status_code=404, detail="Склад не найден")
+    native_code = (wh["currency_code"] or "TJS").strip().upper() or "TJS"
+    by_cur = inventory_stock_value_by_currency(conn, "all", warehouse_id)
+    native_val = round(sum(float(x["value"]) for x in by_cur), 2)
+    units_count = int(conn.execute(
+        "SELECT COUNT(*) FROM product_units WHERE warehouse_id = ? AND status = 'in_stock'",
+        (warehouse_id,),
+    ).fetchone()[0])
+    qty_items = int(conn.execute(
+        """
+        SELECT COALESCE(SUM(ws.quantity), 0)
+        FROM warehouse_stock ws
+        JOIN products p ON p.id = ws.product_id
+        WHERE ws.warehouse_id = ? AND ws.quantity > 0 AND IFNULL(p.track_units, 0) = 0
+        """,
+        (warehouse_id,),
+    ).fetchone()[0])
+    return {
+        "warehouse_id": warehouse_id,
+        "warehouse_name": wh["name"],
+        "currency_code": native_code,
+        "currency": currency_meta(native_code),
+        "value": native_val,
+        "value_usd": _safe_convert(conn, native_val, native_code, "USD"),
+        "value_tjs": _safe_convert(conn, native_val, native_code, "TJS"),
+        "units_count": units_count,
+        "qty_items": qty_items,
+        "by_currency": by_cur,
+    }
+
+
+def _pay_bucket(method_type: str | None) -> str:
+    return "cash" if (method_type or "") == "cash" else "wallet"
+
+
+def _money_sides_by_currency(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Bag signed cash lines into per-currency plus/minus/net. Never mix USD+TJS."""
+    bags: dict[str, dict[str, float]] = {}
+    for line in lines:
+        code = str(line.get("currency_code") or "TJS").strip().upper() or "TJS"
+        bag = bags.setdefault(code, {"plus": 0.0, "minus": 0.0})
+        amt = float(line.get("amount") or 0)
+        if line.get("side") == "+":
+            bag["plus"] += amt
+        else:
+            bag["minus"] += amt
+    out: list[dict[str, Any]] = []
+    for code in sorted(bags.keys(), key=lambda c: (0 if c == "USD" else 1, c)):
+        plus = round(bags[code]["plus"], 2)
+        minus = round(bags[code]["minus"], 2)
+        out.append({
+            **currency_meta(code),
+            "plus": plus,
+            "minus": minus,
+            "net": round(plus - minus, 2),
+            "inflow": plus,
+            "outflow": minus,
+        })
+    return out
+
+
+def _period_cash_by_currency(
+    conn: sqlite3.Connection,
+    period: str,
+    *,
+    method_code: str = "",
+    date_from: str = "",
+    date_to: str = "",
+) -> dict[str, Any]:
+    """Period cash in/out bags by currency (+ optional per payment method bags)."""
+    sale_clause, sale_params, label = _report_period_clause(period, date_from, date_to, "s.created_at")
+    method = (method_code or "").strip()
+    bags: dict[str, dict[str, float]] = {}
+    method_bags: dict[str, dict[str, dict[str, float]]] = {}
+
+    def add(cur: str, side: str, amt: float, mcode: str = "") -> None:
+        code = (cur or "TJS").strip().upper() or "TJS"
+        bag = bags.setdefault(code, {"inflow": 0.0, "outflow": 0.0})
+        val = float(amt or 0)
+        if side == "+":
+            bag["inflow"] += val
+        else:
+            bag["outflow"] += val
+        if mcode:
+            mb = method_bags.setdefault(mcode, {})
+            mb2 = mb.setdefault(code, {"inflow": 0.0, "outflow": 0.0})
+            if side == "+":
+                mb2["inflow"] += val
+            else:
+                mb2["outflow"] += val
+
+    def wallet_code(raw_method: str, money_cur: str) -> str:
+        resolved = resolve_wallet_method_code(conn, raw_method or "cash", money_cur)
+        if method and resolved != method:
+            return ""
+        return resolved
+
+    pay_sql = f"""
+        SELECT UPPER(COALESCE(NULLIF(TRIM(s.currency_code), ''), 'TJS')) AS cur,
+               sp.method_code, SUM(sp.amount) AS amt
+        FROM sale_payments sp
+        JOIN sales s ON s.id = sp.sale_id
+        WHERE s.status = 'completed' AND COALESCE(s.affects_cash, 1) = 1 {sale_clause}
+        GROUP BY 1, 2
+    """
+    for r in conn.execute(pay_sql, list(sale_params)).fetchall():
+        cur = r["cur"] or "TJS"
+        wcode = wallet_code(r["method_code"] or "cash", cur)
+        if not wcode:
+            continue
+        add(cur, "+", r["amt"], wcode)
+
+    recv_clause, recv_params, _ = _report_period_clause(period, date_from, date_to, "rp.created_at")
+    recv_sql = f"""
+        SELECT UPPER(COALESCE(
+                   NULLIF(TRIM(rp.pay_currency_code), ''),
+                   NULLIF(TRIM(s.currency_code), ''),
+                   'TJS'
+               )) AS cur,
+               rp.payment_method_code AS method_code,
+               SUM(COALESCE(NULLIF(rp.pay_amount, 0), rp.amount)) AS amt
+        FROM receivable_payments rp
+        JOIN receivables r ON r.id = rp.receivable_id
+        LEFT JOIN sales s ON s.id = r.sale_id
+        WHERE COALESCE(s.affects_cash, 1) = 1 {recv_clause}
+        GROUP BY 1, 2
+    """
+    if _table_exists(conn, "receivable_payments"):
+        for r in conn.execute(recv_sql, list(recv_params)).fetchall():
+            cur = r["cur"] or "TJS"
+            wcode = wallet_code(r["method_code"] or "cash", cur)
+            if not wcode:
+                continue
+            add(cur, "+", r["amt"], wcode)
+
+    if _table_exists(conn, "mutual_payments"):
+        m_clause, m_params, _ = _report_period_clause(period, date_from, date_to, "mp.created_at")
+        m_sql = f"""
+            SELECT UPPER(COALESCE(
+                       NULLIF(TRIM(mp.pay_currency_code), ''),
+                       NULLIF(TRIM(me.currency_code), ''),
+                       'TJS'
+                   )) AS cur,
+                   mp.payment_method_code AS method_code,
+                   SUM(COALESCE(NULLIF(mp.pay_amount, 0), mp.amount)) AS amt
+            FROM mutual_payments mp
+            JOIN mutual_entries me ON me.id = mp.entry_id
+            WHERE me.direction = 'owe_us' {m_clause}
+            GROUP BY 1, 2
+        """
+        for r in conn.execute(m_sql, list(m_params)).fetchall():
+            cur = r["cur"] or "TJS"
+            wcode = wallet_code(r["method_code"] or "cash", cur)
+            if not wcode:
+                continue
+            add(cur, "+", r["amt"], wcode)
+
+    if _table_exists(conn, "cash_inflows"):
+        c_clause, c_params, _ = _report_period_clause(period, date_from, date_to, "created_at")
+        c_sql = f"""
+            SELECT UPPER(COALESCE(NULLIF(TRIM(currency_code), ''), 'TJS')) AS cur,
+                   payment_method_code AS method_code,
+                   SUM(amount) AS amt
+            FROM cash_inflows
+            WHERE source_type = 'counterparty' {c_clause}
+            GROUP BY 1, 2
+        """
+        for r in conn.execute(c_sql, list(c_params)).fetchall():
+            cur = r["cur"] or "TJS"
+            wcode = wallet_code(r["method_code"] or "cash", cur)
+            if not wcode:
+                continue
+            add(cur, "+", r["amt"], wcode)
+
+    exp_clause, exp_params, _ = _report_period_clause(period, date_from, date_to, "expense_date")
+    if period != "all" and not date_from and not date_to and not exp_params:
+        exp_clause = " AND expense_date >= ?"
+        exp_params = [period_start(period)[:10]]
+    exp_sql = f"""
+        SELECT payment_method_code AS method_code, SUM(amount) AS amt
+        FROM expenses WHERE COALESCE(affects_cash, 1) = 1 {exp_clause}
+        GROUP BY 1
+    """
+    for r in conn.execute(exp_sql, list(exp_params)).fetchall():
+        wcode = wallet_code(r["method_code"] or "cash", "TJS")
+        if not wcode:
+            continue
+        add("TJS", "−", r["amt"], wcode)
+
+    if _table_exists(conn, "supplier_payments"):
+        s_clause, s_params, _ = _report_period_clause(period, date_from, date_to, "created_at")
+        s_sql = f"""
+            SELECT COALESCE(payment_method_code, 'cash') AS method_code, SUM(amount) AS amt
+            FROM supplier_payments WHERE 1=1 {s_clause}
+            GROUP BY 1
+        """
+        for r in conn.execute(s_sql, list(s_params)).fetchall():
+            wcode = wallet_code(r["method_code"] or "cash", "TJS")
+            if not wcode:
+                continue
+            add("TJS", "−", r["amt"], wcode)
+
+    by_currency = []
+    for code in sorted(bags.keys(), key=lambda c: (0 if c == "USD" else 1, c)):
+        inn = round(bags[code]["inflow"], 2)
+        out = round(bags[code]["outflow"], 2)
+        by_currency.append({
+            **currency_meta(code),
+            "inflow": inn,
+            "outflow": out,
+            "net": round(inn - out, 2),
+            "plus": inn,
+            "minus": out,
+        })
+
+    balances_by_method: list[dict[str, Any]] = []
+    methods = list_payment_methods(conn, active_only=True)
+    for pm in methods:
+        code = pm["code"]
+        cur_map = method_bags.get(code) or {}
+        if method and code != method:
+            continue
+        pm_cur = payment_method_currency(pm)
+        mbags = []
+        for ccode in sorted(cur_map.keys(), key=lambda c: (0 if c == "USD" else 1, c)):
+            # Bound wallet: ignore foreign-currency leakage
+            if pm_cur and ccode != pm_cur:
+                continue
+            inn = round(cur_map[ccode]["inflow"], 2)
+            out = round(cur_map[ccode]["outflow"], 2)
+            mbags.append({
+                **currency_meta(ccode),
+                "inflow": inn,
+                "outflow": out,
+                "net": round(inn - out, 2),
+            })
+        if not mbags:
+            show = pm_cur or "TJS"
+            mbags = [{**currency_meta(show), "inflow": 0.0, "outflow": 0.0, "net": 0.0}]
+            if not pm_cur:
+                mbags.insert(0, {**currency_meta("USD"), "inflow": 0.0, "outflow": 0.0, "net": 0.0})
+        balances_by_method.append({
+            "code": code,
+            "name": pm["name"],
+            "method_type": pm["method_type"],
+            "currency_code": pm_cur,
+            "by_currency": mbags,
+            "inflow": None,
+            "outflow": None,
+            "net": None,
+        })
+
+    return {
+        "period_label": label,
+        "by_currency": by_currency,
+        "balances": balances_by_method,
+    }
+
+
+def funds_snapshot(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Current money: stock per warehouse + cash/wallet by USD/TJS."""
+    rates = latest_exchange_rates(conn)
+    warehouses = []
+    stock_usd = 0.0
+    stock_tjs = 0.0
+    for w in conn.execute(
+        "SELECT id FROM warehouses ORDER BY is_default DESC, name"
+    ).fetchall():
+        row = warehouse_stock_money(conn, w["id"])
+        warehouses.append(row)
+        stock_usd += float(row["value_usd"] or 0)
+        stock_tjs += float(row["value_tjs"] or 0)
+
+    bals: dict[str, dict[str, float]] = {}
+
+    def add(cur: str, kind: str, amt: float) -> None:
+        code = (cur or "TJS").strip().upper() or "TJS"
+        bals.setdefault(code, {"cash": 0.0, "wallet": 0.0})
+        bals[code][kind] = bals[code].get(kind, 0.0) + float(amt or 0)
+
+    for r in conn.execute(
+        """
+        SELECT UPPER(COALESCE(NULLIF(TRIM(s.currency_code), ''), 'TJS')) AS cur,
+               COALESCE(pm.method_type, 'card') AS method_type,
+               SUM(sp.amount) AS amt
+        FROM sale_payments sp
+        JOIN sales s ON s.id = sp.sale_id
+        LEFT JOIN payment_methods pm ON pm.code = sp.method_code
+        WHERE s.status = 'completed' AND COALESCE(s.affects_cash, 1) = 1
+        GROUP BY 1, 2
+        """
+    ).fetchall():
+        add(r["cur"], _pay_bucket(r["method_type"]), r["amt"])
+
+    if _table_exists(conn, "receivable_payments"):
+        for r in conn.execute(
+            """
+            SELECT UPPER(COALESCE(NULLIF(TRIM(s.currency_code), ''), 'TJS')) AS cur,
+                   COALESCE(pm.method_type, 'cash') AS method_type,
+                   SUM(rp.amount) AS amt
+            FROM receivable_payments rp
+            JOIN receivables r ON r.id = rp.receivable_id
+            JOIN sales s ON s.id = r.sale_id
+            LEFT JOIN payment_methods pm ON pm.code = rp.payment_method_code
+            WHERE s.status = 'completed' AND COALESCE(s.affects_cash, 1) = 1
+            GROUP BY 1, 2
+            """
+        ).fetchall():
+            add(r["cur"], _pay_bucket(r["method_type"]), r["amt"])
+
+    if _table_exists(conn, "cash_inflows"):
+        for r in conn.execute(
+            """
+            SELECT UPPER(COALESCE(NULLIF(TRIM(currency_code), ''), 'TJS')) AS cur,
+                   payment_method_code,
+                   SUM(amount) AS amt
+            FROM cash_inflows
+            WHERE source_type = 'counterparty'
+            GROUP BY 1, 2
+            """
+        ).fetchall():
+            pm = get_payment_method(conn, r["payment_method_code"] or "cash")
+            mtype = pm["method_type"] if pm else "cash"
+            add(r["cur"], _pay_bucket(mtype), r["amt"])
+
+    for r in conn.execute(
+        """
+        SELECT payment_method_code, SUM(amount) AS amt
+        FROM expenses
+        WHERE COALESCE(affects_cash, 1) = 1
+        GROUP BY payment_method_code
+        """
+    ).fetchall():
+        pm = get_payment_method(conn, r["payment_method_code"] or "cash")
+        mtype = pm["method_type"] if pm else "cash"
+        add("TJS", _pay_bucket(mtype), -float(r["amt"] or 0))
+
+    if _table_exists(conn, "supplier_payments"):
+        for r in conn.execute(
+            """
+            SELECT COALESCE(payment_method_code, 'cash') AS payment_method_code,
+                   SUM(amount) AS amt
+            FROM supplier_payments
+            GROUP BY 1
+            """
+        ).fetchall():
+            pm = get_payment_method(conn, r["payment_method_code"] or "cash")
+            mtype = pm["method_type"] if pm else "cash"
+            add("TJS", _pay_bucket(mtype), -float(r["amt"] or 0))
+
+    cash_by_currency = []
+    for code in sorted(bals.keys()):
+        cash = round(bals[code].get("cash", 0.0), 2)
+        wallet = round(bals[code].get("wallet", 0.0), 2)
+        cash_by_currency.append({
+            **currency_meta(code),
+            "cash": cash,
+            "wallet": wallet,
+            "total": round(cash + wallet, 2),
+        })
+
+    def cur_amount(code: str, field: str) -> float:
+        row = next((x for x in cash_by_currency if x["code"] == code), None)
+        return float(row[field]) if row else 0.0
+
+    return {
+        "as_of": utc_now(),
+        "exchange_rates": rates,
+        "warehouses": warehouses,
+        "cash_by_currency": cash_by_currency,
+        "totals": {
+            "stock_usd": round(stock_usd, 2),
+            "stock_tjs": round(stock_tjs, 2),
+            "cash_usd": cur_amount("USD", "cash"),
+            "cash_tjs": cur_amount("TJS", "cash"),
+            "wallet_usd": cur_amount("USD", "wallet"),
+            "wallet_tjs": cur_amount("TJS", "wallet"),
+            "money_usd": cur_amount("USD", "total"),
+            "money_tjs": cur_amount("TJS", "total"),
+        },
+    }
+
+
+def warehouse_sales_filter(warehouse_id: int | None, alias: str = "s") -> tuple[str, list[Any]]:
+    if warehouse_id:
+        return f" AND {alias}.warehouse_id = ?", [int(warehouse_id)]
+    return "", []
 
 
 class ProductIn(BaseModel):
@@ -3878,6 +4916,7 @@ class CartItem(BaseModel):
 class PaymentPart(BaseModel):
     method_code: str = Field(min_length=1)
     amount: float = Field(ge=0)
+    currency_code: str = ""
 
 
 class SaleIn(BaseModel):
@@ -3890,7 +4929,8 @@ class SaleIn(BaseModel):
     shift_id: int | None = None
     debtor_name: str = ""
     debtor_phone: str = ""
-    pay_currency: str = ""  # payments in this currency; converted to warehouse currency if different
+    pay_currency: str = ""  # alternate currency for FX payments
+    fx_rate: float | None = Field(default=None, gt=0)  # 1 sale_currency = fx_rate pay_currency
 
 
 class CurrencySettingsIn(BaseModel):
@@ -3910,23 +4950,28 @@ class PaymentMethodIn(BaseModel):
     code: str = Field(min_length=1, max_length=32)
     name: str = Field(min_length=1, max_length=100)
     method_type: str = "card"
+    currency_code: str = Field(default="", pattern="^(|TJS|USD)$")
     sort_order: int = 0
 
 
 class PaymentMethodUpdate(BaseModel):
     name: str | None = None
     method_type: str | None = None
+    currency_code: str | None = Field(default=None, pattern="^(|TJS|USD)$")
     is_active: int | None = Field(default=None, ge=0, le=1)
     sort_order: int | None = None
 
 
 class ExpenseIn(BaseModel):
-    category: str = Field(min_length=1, max_length=100)
+    category: str = Field(default="", max_length=100)
     amount: float = Field(gt=0)
     description: str = ""
     payment_method_code: str = "cash"
     expense_date: str = ""
     department: str = "main"
+    warehouse_id: int | None = None
+    payee: str = ""
+    kind: Literal["expense", "payout"] = "expense"
 
 
 class CashInflowIn(BaseModel):
@@ -3936,6 +4981,8 @@ class CashInflowIn(BaseModel):
     source_type: Literal["counterparty", "debtor"] = "counterparty"
     counterparty_name: str = ""
     receivable_id: int | None = None
+    mutual_entry_id: int | None = None
+    fx_rate: float | None = Field(default=None, gt=0)  # 1 USD = fx_rate TJS
     notes: str = ""
 
 
@@ -3958,9 +5005,11 @@ class ExpenseAllocationIn(BaseModel):
 
 
 class ReceivablePaymentIn(BaseModel):
-    amount: float = Field(gt=0)
+    amount: float = Field(gt=0)  # сумма в валюте оплаты
     payment_method_code: str = "cash"
     notes: str = ""
+    currency_code: str = ""  # валюта оплаты; пусто = валюта долга
+    fx_rate: float | None = Field(default=None, gt=0)  # 1 USD = fx_rate TJS
 
 
 class MutualEntryIn(BaseModel):
@@ -3974,10 +5023,22 @@ class MutualEntryIn(BaseModel):
     notes: str = ""
 
 
+class MutualEntryUpdate(BaseModel):
+    person_name: str | None = Field(default=None, min_length=1, max_length=200)
+    person_phone: str | None = None
+    direction: Literal["owe_us", "we_owe"] | None = None
+    amount: float | None = Field(default=None, gt=0)
+    currency_code: str | None = None
+    product_note: str | None = None
+    notes: str | None = None
+
+
 class MutualPaymentIn(BaseModel):
-    amount: float = Field(gt=0)
+    amount: float = Field(gt=0)  # сумма в валюте оплаты
     payment_method_code: str = "cash"
     notes: str = ""
+    currency_code: str = ""
+    fx_rate: float | None = Field(default=None, gt=0)  # 1 USD = fx_rate TJS
 
 
 class UnitIn(BaseModel):
@@ -3987,6 +5048,7 @@ class UnitIn(BaseModel):
     serial: str = ""
     notes: str = ""
     customs_status: Literal["none", "pending", "cleared"] = "none"
+    purchase_price: float | None = Field(default=None, ge=0)
 
 
 class BulkUnitsIn(BaseModel):
@@ -3996,6 +5058,7 @@ class BulkUnitsIn(BaseModel):
     serial_prefix: str = Field(default="", max_length=40)
     notes: str = ""
     mark_pending_customs: int = Field(default=0, ge=0, le=1)
+    purchase_price: float | None = Field(default=None, ge=0)
 
 
 class CompleteImeiIn(BaseModel):
@@ -4109,6 +5172,8 @@ class InboundReceiptIn(BaseModel):
     client_name: str = ""
     region: str = ""
     arrival_date: str = ""
+    unit_purchase_price: float | None = Field(default=None, ge=0)
+    unit_extra_cost: float = Field(default=0, ge=0)
     product: InboundProductNew | None = None
 
 
@@ -4181,7 +5246,14 @@ async def index():
 
 @app.get("/sw.js")
 async def service_worker():
-    return FileResponse(STATIC_DIR / "sw.js", media_type="application/javascript")
+    return FileResponse(
+        STATIC_DIR / "sw.js",
+        media_type="application/javascript",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Service-Worker-Allowed": "/",
+        },
+    )
 
 
 @app.get("/manifest.webmanifest")
@@ -4193,7 +5265,7 @@ async def web_manifest():
 async def health():
     return {
         "status": "ok",
-        "build": "client-tz-v2",
+        "build": "z-import-resale-v1",
         "db": str(DB_PATH),
         "db_exists": DB_PATH.exists(),
     }
@@ -4293,12 +5365,13 @@ async def add_payment_method(body: PaymentMethodIn, x_pin: str | None = Header(d
     with db() as conn:
         if conn.execute("SELECT 1 FROM payment_methods WHERE code = ?", (code,)).fetchone():
             raise HTTPException(status_code=400, detail="Код уже существует")
+        cur_code = _infer_payment_method_currency(body.name, code, body.currency_code)
         cur = conn.execute(
             """
-            INSERT INTO payment_methods (code, name, method_type, is_active, sort_order, created_at)
-            VALUES (?, ?, ?, 1, ?, ?)
+            INSERT INTO payment_methods (code, name, method_type, is_active, sort_order, created_at, currency_code)
+            VALUES (?, ?, ?, 1, ?, ?, ?)
             """,
-            (code, body.name.strip(), body.method_type, body.sort_order, utc_now()),
+            (code, body.name.strip(), body.method_type, body.sort_order, utc_now(), cur_code),
         )
         row = conn.execute("SELECT * FROM payment_methods WHERE id = ?", (cur.lastrowid,)).fetchone()
     return row_to_dict(row)
@@ -4326,47 +5399,210 @@ async def list_expenses(
     period: str = Query(default="month", pattern="^(day|week|month|quarter|year|all)$"),
     date_from: str = "",
     date_to: str = "",
+    category: str = "",
+    department: str = "",
     x_pin: str | None = Header(default=None, alias="X-Pin"),
 ):
     check_pin(x_pin, min_role="owner")
-    clause, params, _ = _report_period_clause(period, date_from, date_to, "expense_date")
+    clause, params, _ = _report_period_clause(period, date_from, date_to, "e.expense_date")
     with db() as conn:
-        rows = conn.execute(
-            f"SELECT * FROM expenses WHERE 1=1 {clause.replace('s.created_at', 'expense_date')} ORDER BY expense_date DESC",
-            params,
-        ).fetchall()
-    return [row_to_dict(r) for r in rows]
+        sql = f"""
+            SELECT e.*, COALESCE(w.name, '') AS warehouse_name
+            FROM expenses e
+            LEFT JOIN warehouses w ON w.id = e.warehouse_id
+            WHERE 1=1 {clause}
+        """
+        if category.strip():
+            sql += " AND e.category = ?"
+            params.append(category.strip())
+        if department.strip():
+            sql += " AND COALESCE(e.department, 'main') = ?"
+            params.append(department.strip())
+        sql += " ORDER BY e.expense_date DESC, e.id DESC"
+        rows = conn.execute(sql, params).fetchall()
+        pay_map = {
+            r["code"]: r["name"]
+            for r in conn.execute("SELECT code, name FROM payment_methods").fetchall()
+        }
+    out = []
+    for r in rows:
+        d = row_to_dict(r)
+        d["payment_method_name"] = pay_map.get(d.get("payment_method_code") or "", d.get("payment_method_code") or "—")
+        if not (d.get("created_by") or "").strip():
+            if (d.get("description") or "") == "Excel импорт ОПиУ":
+                d["created_by"] = "Excel импорт"
+            else:
+                d["created_by"] = "—"
+        out.append(d)
+    return out
 
 
 @app.post("/api/expenses")
 async def create_expense(body: ExpenseIn, x_pin: str | None = Header(default=None, alias="X-Pin")):
     user = check_pin(x_pin)
     dept = (body.department or "main").strip() or "main"
-    if dept != "accessories" and user.get("role") != "owner":
+    kind = (body.kind or "expense").strip().lower()
+    if kind not in ("expense", "payout"):
+        kind = "expense"
+    payee = (body.payee or "").strip()
+    category = (body.category or "").strip()
+    if kind == "payout":
+        if not body.warehouse_id:
+            raise HTTPException(status_code=400, detail="Для выплаты выберите склад")
+        if not payee:
+            raise HTTPException(status_code=400, detail="Укажите, кому выплатили")
+        if not category:
+            category = "Выплата"
+    elif not category:
+        raise HTTPException(status_code=400, detail="Укажите категорию")
+    if dept != "accessories" and ROLE_LEVEL.get(user.get("role") or "", 0) < ROLE_LEVEL["cashier"]:
         raise HTTPException(status_code=403, detail="Недостаточно прав")
     when = body.expense_date or utc_now()[:10]
     with db() as conn:
         if user.get("role") == "accessories" and dept != "accessories":
             raise HTTPException(status_code=403, detail="Доступны только расходы аксессуаров")
+        warehouse_id = body.warehouse_id
+        if warehouse_id is not None:
+            wh = conn.execute(
+                """
+                SELECT id, name, COALESCE(warehouse_type, '') AS warehouse_type
+                FROM warehouses WHERE id = ?
+                """,
+                (warehouse_id,),
+            ).fetchone()
+            if not wh:
+                raise HTTPException(status_code=400, detail="Склад не найден")
+            if (wh["warehouse_type"] or "") == "accessories" or "аксесс" in (wh["name"] or "").lower():
+                if dept != "accessories":
+                    raise HTTPException(status_code=400, detail="Выберите склад телефонов")
+        elif kind == "payout":
+            raise HTTPException(status_code=400, detail="Для выплаты выберите склад")
+        else:
+            warehouse_id = None
+        desc = body.description or ""
+        if kind == "payout" and payee and payee.lower() not in desc.lower():
+            desc = f"{payee}" + (f" — {desc}" if desc.strip() else "")
         cur = conn.execute(
             """
-            INSERT INTO expenses (category, amount, description, payment_method_code, expense_date, created_at, department)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO expenses (
+                category, amount, description, payment_method_code, expense_date,
+                created_at, department, created_by, created_by_user_id,
+                warehouse_id, payee, kind
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (body.category.strip(), body.amount, body.description, body.payment_method_code, when, utc_now(), dept),
+            (
+                category,
+                body.amount,
+                desc,
+                body.payment_method_code,
+                when,
+                utc_now(),
+                dept,
+                (user.get("name") or "").strip() or "—",
+                user.get("id") or None,
+                warehouse_id,
+                payee,
+                kind,
+            ),
         )
-        row = conn.execute("SELECT * FROM expenses WHERE id = ?", (cur.lastrowid,)).fetchone()
+        row = conn.execute(
+            """
+            SELECT e.*, COALESCE(w.name, '') AS warehouse_name
+            FROM expenses e
+            LEFT JOIN warehouses w ON w.id = e.warehouse_id
+            WHERE e.id = ?
+            """,
+            (cur.lastrowid,),
+        ).fetchone()
     return row_to_dict(row)
 
 
 @app.delete("/api/expenses/{expense_id}")
 async def delete_expense(expense_id: int, x_pin: str | None = Header(default=None, alias="X-Pin")):
-    check_pin(x_pin, min_role="owner")
+    check_pin(x_pin, min_role="cashier")
     with db() as conn:
-        cur = conn.execute("DELETE FROM expenses WHERE id = ?", (expense_id,))
-        if cur.rowcount == 0:
+        row = conn.execute("SELECT * FROM expenses WHERE id = ?", (expense_id,)).fetchone()
+        if not row:
             raise HTTPException(status_code=404, detail="Не найдено")
-    return {"ok": True}
+        conn.execute("DELETE FROM expenses WHERE id = ?", (expense_id,))
+    return {"ok": True, "deleted": row_to_dict(row)}
+
+
+@app.delete("/api/pos/cash-inflows/{inflow_id}")
+async def delete_cash_inflow(inflow_id: int, x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin, min_role="cashier")
+    with db() as conn:
+        if not _table_exists(conn, "cash_inflows"):
+            raise HTTPException(status_code=404, detail="Не найдено")
+        row = conn.execute("SELECT * FROM cash_inflows WHERE id = ?", (inflow_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Не найдено")
+        conn.execute("DELETE FROM cash_inflows WHERE id = ?", (inflow_id,))
+    return {"ok": True, "deleted": row_to_dict(row)}
+
+
+def _pos_lines_window(period: str) -> tuple[str, str, str, str]:
+    """Return (period_key, date_from, date_to, label) for POS line lists."""
+    today = utc_now()[:10]
+    if period == "yesterday":
+        y = (datetime.strptime(today, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+        return "all", y, y, f"Вчера · {y}"
+    if period == "day":
+        return "all", today, today, f"Сегодня · {today}"
+    if period == "week":
+        start = period_start("week")[:10]
+        return "all", start, today, f"Неделя · {start} — {today}"
+    if period == "month":
+        start = period_start("month")[:10]
+        return "all", start, today, f"Месяц · {start} — {today}"
+    return "all", "", "", "Все записи"
+
+
+@app.get("/api/pos/cash-lines")
+async def pos_cash_lines(
+    period: str = Query(default="day", pattern="^(day|yesterday|week|month|all)$"),
+    x_pin: str | None = Header(default=None, alias="X-Pin"),
+):
+    """Expenses + inflows for a selectable period (for delete / review of past days)."""
+    check_pin(x_pin)
+    period_key, date_from, date_to, label = _pos_lines_window(period)
+    with db() as conn:
+        exp_clause, exp_params, _ = _report_period_clause(period_key, date_from, date_to, "e.expense_date")
+        exp_rows = conn.execute(
+            f"""
+            SELECT e.*, COALESCE(w.name, '') AS warehouse_name
+            FROM expenses e
+            LEFT JOIN warehouses w ON w.id = e.warehouse_id
+            WHERE COALESCE(e.affects_cash, 1) = 1 {exp_clause}
+            ORDER BY e.expense_date DESC, e.id DESC
+            LIMIT 300
+            """,
+            list(exp_params),
+        ).fetchall()
+        inflows: list[dict[str, Any]] = []
+        if _table_exists(conn, "cash_inflows"):
+            iclause, iparams, _ = _report_period_clause(period_key, date_from, date_to, "created_at")
+            inflows = [
+                row_to_dict(r)
+                for r in conn.execute(
+                    f"""
+                    SELECT * FROM cash_inflows
+                    WHERE 1=1 {iclause}
+                    ORDER BY created_at DESC
+                    LIMIT 300
+                    """,
+                    list(iparams),
+                ).fetchall()
+            ]
+    return {
+        "period": period,
+        "period_label": label,
+        "date_from": date_from,
+        "date_to": date_to,
+        "expenses": [row_to_dict(r) for r in exp_rows],
+        "cash_inflows": inflows,
+    }
 
 
 @app.get("/api/pos/cash-inflows")
@@ -4390,6 +5626,20 @@ async def list_cash_inflows(
     return [row_to_dict(r) for r in rows]
 
 
+def _usd_to_tjs_rate(conn: sqlite3.Connection, at: str | None = None, override: float | None = None) -> float | None:
+    if override is not None and float(override) > 0:
+        return float(override)
+    base = get_setting(conn, "base_currency", "TJS").upper()
+    if base == "TJS":
+        rate = get_exchange_rate_at(conn, "USD", at)
+        return float(rate) if rate and rate > 0 else None
+    # If base is USD, invert TJS rate when present
+    tjs = get_exchange_rate_at(conn, "TJS", at)
+    if tjs and tjs > 0 and base == "USD":
+        return round(1.0 / float(tjs), 6)
+    return None
+
+
 @app.post("/api/pos/cash-inflow")
 async def create_cash_inflow(body: CashInflowIn, x_pin: str | None = Header(default=None, alias="X-Pin")):
     user = check_pin(x_pin)
@@ -4405,34 +5655,142 @@ async def create_cash_inflow(body: CashInflowIn, x_pin: str | None = Header(defa
         base = get_setting(conn, "base_currency", "TJS").upper()
         amount = float(body.amount)
         if source == "debtor":
-            if not body.receivable_id:
+            if body.mutual_entry_id and body.receivable_id:
+                raise HTTPException(status_code=400, detail="Укажите одного должника")
+            if not body.mutual_entry_id and not body.receivable_id:
                 raise HTTPException(status_code=400, detail="Выберите должника")
-            # Pay receivable in the amount entered (converted to receivable currency ≈ base/sale)
-            amount_for_debt = amount
-            if currency != base:
-                amount_for_debt = convert_amount(conn, amount, currency, base, at=now)
-            pay_body = ReceivablePaymentIn(
-                amount=round(amount_for_debt, 2),
-                payment_method_code=body.payment_method_code,
-                notes=body.notes or f"Приход с кассы ({currency} {amount:g})",
-            )
-            # inline pay logic via existing endpoint path
+
+            if body.mutual_entry_id:
+                row = conn.execute(
+                    "SELECT * FROM mutual_entries WHERE id = ?", (body.mutual_entry_id,)
+                ).fetchone()
+                if not row:
+                    raise HTTPException(status_code=404, detail="Долг не найден")
+                if row["status"] == "closed":
+                    raise HTTPException(status_code=400, detail="Долг уже закрыт")
+                if row["direction"] != "owe_us":
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Это «мы должны» — погашение через Взаиморасчёты → Оплата",
+                    )
+                debt_cur = (row["currency_code"] or "TJS").strip().upper() or "TJS"
+                pay_cur = currency or debt_cur
+                fx = None
+                if pay_cur != debt_cur:
+                    fx = _usd_to_tjs_rate(conn, now, body.fx_rate)
+                    if not fx:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="Укажите курс: сколько сомони за 1 доллар",
+                        )
+                reduction = debt_reduction_from_payment(
+                    debt_currency=debt_cur,
+                    pay_amount=amount,
+                    pay_currency=pay_cur,
+                    fx_rate=fx,
+                )
+                due = float(row["amount_due"])
+                if reduction > due + 0.01:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"К долгу спишется {reduction:.2f} {debt_cur}, а остаток {due:.2f}",
+                    )
+                note = body.notes or f"Приход с кассы ({pay_cur} {amount:g})"
+                conn.execute(
+                    """
+                    INSERT INTO mutual_payments
+                    (entry_id, amount, payment_method_code, notes, created_at,
+                     pay_amount, pay_currency_code, fx_rate)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        body.mutual_entry_id, reduction, body.payment_method_code, note, now,
+                        amount, pay_cur, fx if pay_cur != debt_cur else None,
+                    ),
+                )
+                new_paid = float(row["paid_amount"]) + reduction
+                new_due = max(0.0, float(row["amount"]) - new_paid)
+                new_status = "closed" if new_due <= 0.01 else "open"
+                conn.execute(
+                    """
+                    UPDATE mutual_entries
+                    SET paid_amount = ?, amount_due = ?, status = ?,
+                        closed_at = CASE WHEN ? = 'closed' THEN ? ELSE closed_at END
+                    WHERE id = ?
+                    """,
+                    (new_paid, new_due, new_status, new_status, now, body.mutual_entry_id),
+                )
+                amount_base = (
+                    reduction if debt_cur == base
+                    else (convert_amount(conn, reduction, debt_cur, base, at=now) or reduction)
+                )
+                cur = conn.execute(
+                    """
+                    INSERT INTO cash_inflows
+                    (amount, currency_code, amount_base, payment_method_code, source_type,
+                     counterparty_name, receivable_id, mutual_entry_id, notes, created_at, created_by)
+                    VALUES (?, ?, ?, ?, 'debtor', ?, NULL, ?, ?, ?, ?)
+                    """,
+                    (
+                        amount, pay_cur, round(float(amount_base), 2), body.payment_method_code,
+                        row["person_name"] or "", body.mutual_entry_id,
+                        note, now, (user or {}).get("name", ""),
+                    ),
+                )
+                saved = conn.execute("SELECT * FROM cash_inflows WHERE id = ?", (cur.lastrowid,)).fetchone()
+                return {"ok": True, "type": "debtor", "inflow": row_to_dict(saved), "amount_due": new_due}
+
+            # Sale receivable
             row = conn.execute("SELECT * FROM receivables WHERE id = ?", (body.receivable_id,)).fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="Долг не найден")
             if row["status"] == "closed":
                 raise HTTPException(status_code=400, detail="Долг уже закрыт")
+            if row["sale_id"]:
+                sale_row = conn.execute(
+                    "SELECT status, currency_code FROM sales WHERE id = ?", (row["sale_id"],)
+                ).fetchone()
+                if sale_row and sale_row["status"] == "voided":
+                    raise HTTPException(status_code=400, detail="Продажа отменена — долг снят")
+                debt_cur = (sale_row["currency_code"] if sale_row else None) or "TJS"
+            else:
+                debt_cur = "TJS"
+            debt_cur = str(debt_cur).strip().upper() or "TJS"
+            pay_cur = currency or debt_cur
+            fx = None
+            if pay_cur != debt_cur:
+                fx = _usd_to_tjs_rate(conn, now, body.fx_rate)
+                if not fx:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Укажите курс: сколько сомони за 1 доллар",
+                    )
+            reduction = debt_reduction_from_payment(
+                debt_currency=debt_cur,
+                pay_amount=amount,
+                pay_currency=pay_cur,
+                fx_rate=fx,
+            )
             due = float(row["amount_due"])
-            if pay_body.amount > due + 0.01:
-                raise HTTPException(status_code=400, detail=f"Сумма больше долга ({due:.2f})")
+            if reduction > due + 0.01:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"К долгу спишется {reduction:.2f} {debt_cur}, а остаток {due:.2f}",
+                )
+            note = body.notes or f"Приход с кассы ({pay_cur} {amount:g})"
             conn.execute(
                 """
-                INSERT INTO receivable_payments (receivable_id, amount, payment_method_code, notes, created_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO receivable_payments
+                (receivable_id, amount, payment_method_code, notes, created_at,
+                 pay_amount, pay_currency_code, fx_rate)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (body.receivable_id, pay_body.amount, pay_body.payment_method_code, pay_body.notes, now),
+                (
+                    body.receivable_id, reduction, body.payment_method_code, note, now,
+                    amount, pay_cur, fx if pay_cur != debt_cur else None,
+                ),
             )
-            new_paid = float(row["paid_amount"]) + pay_body.amount
+            new_paid = float(row["paid_amount"]) + reduction
             new_due = max(0.0, float(row["total_amount"]) - new_paid)
             new_status = "closed" if new_due <= 0.01 else "open"
             conn.execute(
@@ -4447,26 +5805,25 @@ async def create_cash_inflow(body: CashInflowIn, x_pin: str | None = Header(defa
             if row["sale_id"]:
                 conn.execute(
                     "UPDATE sales SET amount_paid = COALESCE(amount_paid, 0) + ?, amount_due = ? WHERE id = ?",
-                    (pay_body.amount, new_due, row["sale_id"]),
+                    (reduction, new_due, row["sale_id"]),
                 )
-            # Audit row in cash_inflows (amount_base already counted via receivable_payments — mark source)
-            amount_base = pay_body.amount
+            amount_base = (
+                reduction if debt_cur == base
+                else (convert_amount(conn, reduction, debt_cur, base, at=now) or reduction)
+            )
             cur = conn.execute(
                 """
                 INSERT INTO cash_inflows
                 (amount, currency_code, amount_base, payment_method_code, source_type,
-                 counterparty_name, receivable_id, notes, created_at, created_by)
-                VALUES (?, ?, ?, ?, 'debtor', ?, ?, ?, ?, ?)
+                 counterparty_name, receivable_id, mutual_entry_id, notes, created_at, created_by)
+                VALUES (?, ?, ?, ?, 'debtor', ?, ?, NULL, ?, ?, ?)
                 """,
                 (
-                    amount, currency, amount_base, body.payment_method_code,
+                    amount, pay_cur, round(float(amount_base), 2), body.payment_method_code,
                     row["customer_name"] or "", body.receivable_id,
-                    pay_body.notes, now, (user or {}).get("name", ""),
+                    note, now, (user or {}).get("name", ""),
                 ),
             )
-            # IMPORTANT: debtor payments already in receivable_payments — don't double-count in DDS.
-            # Store amount_base=0 for debtor audit rows? Or exclude debtor from manual_inflows sum.
-            # We already filter source_type='counterparty' in DDS. Good — keep amount_base for display.
             saved = conn.execute("SELECT * FROM cash_inflows WHERE id = ?", (cur.lastrowid,)).fetchone()
             return {"ok": True, "type": "debtor", "inflow": row_to_dict(saved), "amount_due": new_due}
 
@@ -4482,8 +5839,8 @@ async def create_cash_inflow(body: CashInflowIn, x_pin: str | None = Header(defa
             """
             INSERT INTO cash_inflows
             (amount, currency_code, amount_base, payment_method_code, source_type,
-             counterparty_name, receivable_id, notes, created_at, created_by)
-            VALUES (?, ?, ?, ?, 'counterparty', ?, NULL, ?, ?, ?)
+             counterparty_name, receivable_id, mutual_entry_id, notes, created_at, created_by)
+            VALUES (?, ?, ?, ?, 'counterparty', ?, NULL, NULL, ?, ?, ?)
             """,
             (
                 amount, currency, amount_base, body.payment_method_code,
@@ -4541,11 +5898,12 @@ async def list_receivables(
     with db() as conn:
         sql = """
             SELECT r.*, COALESCE(w.name, '—') AS warehouse_name,
+                   UPPER(COALESCE(NULLIF(TRIM(s.currency_code), ''), NULLIF(TRIM(w.currency_code), ''), 'TJS')) AS currency_code,
                    (SELECT GROUP_CONCAT(si.product_name, ', ')
                     FROM sale_items si WHERE si.sale_id = r.sale_id) AS products
             FROM receivables r
             LEFT JOIN sales s ON s.id = r.sale_id
-            LEFT JOIN warehouses w ON w.id = r.warehouse_id
+            LEFT JOIN warehouses w ON w.id = COALESCE(r.warehouse_id, s.warehouse_id)
             WHERE (r.sale_id IS NULL OR s.status != 'voided')
         """
         params: list[Any] = []
@@ -4572,25 +5930,44 @@ async def pay_receivable(
             raise HTTPException(status_code=400, detail="Долг уже закрыт")
         if row["sale_id"]:
             sale_row = conn.execute(
-                "SELECT status FROM sales WHERE id = ?", (row["sale_id"],)
+                "SELECT status, currency_code FROM sales WHERE id = ?", (row["sale_id"],)
             ).fetchone()
             if sale_row and sale_row["status"] == "voided":
                 raise HTTPException(status_code=400, detail="Продажа отменена — долг снят")
+            debt_cur = (sale_row["currency_code"] if sale_row else None) or "TJS"
+        else:
+            debt_cur = "TJS"
+        debt_cur = str(debt_cur).strip().upper() or "TJS"
+        pay_cur = (body.currency_code or debt_cur).strip().upper() or debt_cur
+        reduction = debt_reduction_from_payment(
+            debt_currency=debt_cur,
+            pay_amount=body.amount,
+            pay_currency=pay_cur,
+            fx_rate=body.fx_rate,
+        )
         due = float(row["amount_due"])
-        if body.amount > due + 0.01:
-            raise HTTPException(status_code=400, detail=f"Сумма больше долга ({due:.2f})")
+        if reduction > due + 0.01:
+            raise HTTPException(
+                status_code=400,
+                detail=f"К долгу спишется {reduction:.2f} {debt_cur}, а остаток {due:.2f}",
+            )
         pm = get_payment_method(conn, body.payment_method_code)
         if not pm:
             raise HTTPException(status_code=400, detail="Способ оплаты не найден")
         now = utc_now()
         conn.execute(
             """
-            INSERT INTO receivable_payments (receivable_id, amount, payment_method_code, notes, created_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO receivable_payments
+            (receivable_id, amount, payment_method_code, notes, created_at,
+             pay_amount, pay_currency_code, fx_rate)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (receivable_id, body.amount, body.payment_method_code, body.notes, now),
+            (
+                receivable_id, reduction, body.payment_method_code, body.notes, now,
+                body.amount, pay_cur, body.fx_rate if pay_cur != debt_cur else None,
+            ),
         )
-        new_paid = float(row["paid_amount"]) + body.amount
+        new_paid = float(row["paid_amount"]) + reduction
         new_due = max(0.0, float(row["total_amount"]) - new_paid)
         new_status = "closed" if new_due <= 0.01 else "open"
         conn.execute(
@@ -4605,7 +5982,7 @@ async def pay_receivable(
         if row["sale_id"]:
             conn.execute(
                 "UPDATE sales SET amount_paid = COALESCE(amount_paid, 0) + ?, amount_due = ? WHERE id = ?",
-                (body.amount, new_due, row["sale_id"]),
+                (reduction, new_due, row["sale_id"]),
             )
         updated = conn.execute("SELECT * FROM receivables WHERE id = ?", (receivable_id,)).fetchone()
     return row_to_dict(updated)
@@ -4710,21 +6087,37 @@ async def pay_mutual_entry(
             raise HTTPException(status_code=404, detail="Запись не найдена")
         if row["status"] == "closed":
             raise HTTPException(status_code=400, detail="Запись уже закрыта")
+        debt_cur = (row["currency_code"] or "TJS").strip().upper() or "TJS"
+        pay_cur = (body.currency_code or debt_cur).strip().upper() or debt_cur
+        reduction = debt_reduction_from_payment(
+            debt_currency=debt_cur,
+            pay_amount=body.amount,
+            pay_currency=pay_cur,
+            fx_rate=body.fx_rate,
+        )
         due = float(row["amount_due"])
-        if body.amount > due + 0.01:
-            raise HTTPException(status_code=400, detail=f"Сумма больше долга ({due:.2f})")
+        if reduction > due + 0.01:
+            raise HTTPException(
+                status_code=400,
+                detail=f"К долгу спишется {reduction:.2f} {debt_cur}, а остаток {due:.2f}",
+            )
         pm = get_payment_method(conn, body.payment_method_code)
         if not pm:
             raise HTTPException(status_code=400, detail="Способ оплаты не найден")
         now = utc_now()
         conn.execute(
             """
-            INSERT INTO mutual_payments (entry_id, amount, payment_method_code, notes, created_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO mutual_payments
+            (entry_id, amount, payment_method_code, notes, created_at,
+             pay_amount, pay_currency_code, fx_rate)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (entry_id, body.amount, body.payment_method_code, body.notes, now),
+            (
+                entry_id, reduction, body.payment_method_code, body.notes, now,
+                body.amount, pay_cur, body.fx_rate if pay_cur != debt_cur else None,
+            ),
         )
-        new_paid = float(row["paid_amount"]) + body.amount
+        new_paid = float(row["paid_amount"]) + reduction
         new_due = max(0.0, float(row["amount"]) - new_paid)
         new_status = "closed" if new_due <= 0.01 else "open"
         conn.execute(
@@ -4738,6 +6131,61 @@ async def pay_mutual_entry(
         )
         updated = conn.execute("SELECT * FROM mutual_entries WHERE id = ?", (entry_id,)).fetchone()
     return row_to_dict(updated)
+
+
+@app.put("/api/mutual-entries/{entry_id}")
+async def update_mutual_entry(
+    entry_id: int,
+    body: MutualEntryUpdate,
+    x_pin: str | None = Header(default=None, alias="X-Pin"),
+):
+    check_pin(x_pin)
+    with db() as conn:
+        row = conn.execute("SELECT * FROM mutual_entries WHERE id = ?", (entry_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Запись не найдена")
+        paid = float(row["paid_amount"] or 0)
+        name = body.person_name.strip() if body.person_name is not None else row["person_name"]
+        phone = body.person_phone if body.person_phone is not None else row["person_phone"]
+        direction = body.direction if body.direction is not None else row["direction"]
+        amount = float(body.amount) if body.amount is not None else float(row["amount"])
+        currency = (body.currency_code or row["currency_code"] or "TJS").strip().upper()
+        product = body.product_note if body.product_note is not None else row["product_note"]
+        notes = body.notes if body.notes is not None else row["notes"]
+        if amount + 0.01 < paid:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Сумма не может быть меньше уже оплаченного ({paid:.2f})",
+            )
+        due = max(0.0, amount - paid)
+        status = "closed" if due <= 0.01 else "open"
+        conn.execute(
+            """
+            UPDATE mutual_entries
+            SET person_name = ?, person_phone = ?, direction = ?, amount = ?,
+                amount_due = ?, currency_code = ?, product_note = ?, notes = ?, status = ?,
+                closed_at = CASE WHEN ? = 'closed' THEN COALESCE(closed_at, ?) ELSE NULL END
+            WHERE id = ?
+            """,
+            (
+                name, phone or "", direction, amount, due, currency,
+                product or "", notes or "", status, status, utc_now(), entry_id,
+            ),
+        )
+        updated = conn.execute("SELECT * FROM mutual_entries WHERE id = ?", (entry_id,)).fetchone()
+    return row_to_dict(updated)
+
+
+@app.delete("/api/mutual-entries/{entry_id}")
+async def delete_mutual_entry(entry_id: int, x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin)
+    with db() as conn:
+        row = conn.execute("SELECT * FROM mutual_entries WHERE id = ?", (entry_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Запись не найдена")
+        conn.execute("DELETE FROM mutual_payments WHERE entry_id = ?", (entry_id,))
+        conn.execute("DELETE FROM mutual_entries WHERE id = ?", (entry_id,))
+    return {"ok": True, "id": entry_id}
 
 
 # --- Users (owner) ---
@@ -4957,10 +6405,15 @@ async def bulk_create_units(body: BulkUnitsIn, x_pin: str | None = Header(defaul
             cur = conn.execute(
                 """
                 INSERT INTO product_units
-                (product_id, warehouse_id, imei, serial, status, notes, created_at, customs_status)
-                VALUES (?, ?, '', ?, 'in_stock', ?, ?, ?)
+                (product_id, warehouse_id, imei, serial, status, notes, created_at, customs_status,
+                 purchase_price)
+                VALUES (?, ?, '', ?, 'in_stock', ?, ?, ?, ?)
                 """,
-                (body.product_id, wh, serial, body.notes or "Партия без IMEI", now, customs_status),
+                (
+                    body.product_id, wh, serial, body.notes or "Партия без IMEI", now, customs_status,
+                    float(body.purchase_price) if body.purchase_price is not None and body.purchase_price > 0
+                    else float(product["purchase_price"] or 0),
+                ),
             )
             adjust_warehouse_stock(
                 conn, wh, body.product_id, 1, "inbound",
@@ -5037,10 +6490,14 @@ async def lookup_unit(
         uclause, uparams = unit_search_sql(q)
         sql += uclause
         params.extend(uparams)
-        if warehouse_id:
+        # IMEI / digit fragment: search all warehouses (last 5 digits etc.)
+        # Text/name search: keep selected warehouse filter.
+        if warehouse_id and not is_code_query(q):
             sql += " AND u.warehouse_id = ?"
             params.append(warehouse_id)
-        units = conn.execute(sql + " ORDER BY u.created_at DESC LIMIT 20", params).fetchall()
+        order = " ORDER BY CASE WHEN u.warehouse_id = ? THEN 0 ELSE 1 END, u.created_at DESC LIMIT 20"
+        order_params = [warehouse_id or 0]
+        units = conn.execute(sql + order, params + order_params).fetchall()
         if units:
             matches = []
             for u in units:
@@ -5056,6 +6513,191 @@ async def lookup_unit(
         if prows:
             return {"match_type": "product", "matches": [enrich_product(conn, r) for r in prows]}
     return {"match_type": "none", "matches": []}
+
+
+def _unit_ops_count(conn: sqlite3.Connection, unit_id: int) -> int:
+    sales = conn.execute(
+        "SELECT COUNT(*) FROM sale_item_units WHERE unit_id = ?", (unit_id,)
+    ).fetchone()[0]
+    reserves = conn.execute(
+        "SELECT COUNT(*) FROM unit_reservations WHERE unit_id = ?", (unit_id,)
+    ).fetchone()[0]
+    # inbound/create always counts as 1 operation
+    return 1 + int(sales or 0) + int(reserves or 0)
+
+
+def _unit_history_events(conn: sqlite3.Connection, unit_id: int) -> list[dict[str, Any]]:
+    unit = conn.execute(
+        """
+        SELECT u.*, p.name AS product_name, p.model, p.color AS product_color,
+               p.memory, p.sale_price, w.name AS warehouse_name
+        FROM product_units u
+        JOIN products p ON p.id = u.product_id
+        JOIN warehouses w ON w.id = u.warehouse_id
+        WHERE u.id = ?
+        """,
+        (unit_id,),
+    ).fetchone()
+    if not unit:
+        return []
+    events: list[dict[str, Any]] = []
+    inbound_at = (unit["arrival_date"] or "").strip() or (unit["created_at"] or "")
+    if inbound_at and len(inbound_at) == 10:
+        inbound_at = f"{inbound_at} 00:00:00"
+    events.append({
+        "kind": "inbound",
+        "title": "Приход на склад",
+        "at": inbound_at,
+        "user_name": "",
+        "amount": float(unit["purchase_price"] or 0),
+        "currency_code": get_warehouse_currency(conn, unit["warehouse_id"])["code"],
+        "notes": unit["notes"] or "",
+        "warehouse_name": unit["warehouse_name"],
+        "sale_id": None,
+        "status": "ok",
+    })
+    for r in conn.execute(
+        """
+        SELECT r.*, w.name AS warehouse_name
+        FROM unit_reservations r
+        LEFT JOIN warehouses w ON w.id = r.warehouse_id
+        WHERE r.unit_id = ?
+        ORDER BY r.created_at
+        """,
+        (unit_id,),
+    ).fetchall():
+        events.append({
+            "kind": "reservation",
+            "title": f"Резерв ({r['status']})",
+            "at": r["created_at"] or "",
+            "user_name": r["user_name"] or r["client_name"] or "",
+            "amount": 0.0,
+            "currency_code": "",
+            "notes": (r["notes"] or "") + (f" · клиент {r['client_name']}" if r["client_name"] else ""),
+            "warehouse_name": r["warehouse_name"] or "",
+            "sale_id": None,
+            "status": r["status"],
+        })
+    for r in conn.execute(
+        """
+        SELECT s.id AS sale_id, s.created_at, s.user_name, s.status AS sale_status,
+               s.currency_code, s.total AS sale_total, s.notes AS sale_notes,
+               si.unit_price, si.subtotal, si.shop_profit, si.product_name,
+               si.quantity, w.name AS warehouse_name
+        FROM sale_item_units siu
+        JOIN sale_items si ON si.id = siu.sale_item_id
+        JOIN sales s ON s.id = si.sale_id
+        LEFT JOIN warehouses w ON w.id = s.warehouse_id
+        WHERE siu.unit_id = ?
+        ORDER BY s.created_at
+        """,
+        (unit_id,),
+    ).fetchall():
+        qty = max(1, int(r["quantity"] or 1))
+        amount = float(r["unit_price"] or 0) if qty == 1 else float(r["subtotal"] or 0) / qty
+        title = "Продажа" if r["sale_status"] == "completed" else f"Продажа ({r['sale_status']})"
+        events.append({
+            "kind": "sale",
+            "title": title,
+            "at": r["created_at"] or "",
+            "user_name": r["user_name"] or "",
+            "amount": round(amount, 2),
+            "currency_code": (r["currency_code"] or "TJS").upper(),
+            "notes": r["sale_notes"] or "",
+            "warehouse_name": r["warehouse_name"] or "",
+            "sale_id": r["sale_id"],
+            "status": r["sale_status"],
+            "profit": float(r["shop_profit"] or 0) / qty if qty else float(r["shop_profit"] or 0),
+            "product_name": r["product_name"] or "",
+        })
+    events.sort(key=lambda e: e.get("at") or "")
+    return events
+
+
+@app.get("/api/units/imei-history")
+async def search_units_imei_history(
+    q: str = Query(min_length=1),
+    x_pin: str | None = Header(default=None, alias="X-Pin"),
+):
+    """Smart IMEI search for dashboard: any status, with ops count and sold flag."""
+    check_pin(x_pin)
+    q = normalize_search_q(q)
+    if len(only_digits(q)) < 5 and not re.search(r"[A-Za-zА-Яа-я]", q):
+        return {"matches": []}
+    with db() as conn:
+        expire_reservations(conn)
+        sql = """
+            SELECT u.*, p.name AS product_name, p.model, p.color AS product_color,
+                   p.memory, p.sale_price, w.name AS warehouse_name
+            FROM product_units u
+            JOIN products p ON p.id = u.product_id
+            JOIN warehouses w ON w.id = u.warehouse_id
+            WHERE 1=1
+        """
+        uclause, uparams = unit_search_sql(q)
+        if not uclause:
+            # also allow short text model search via digits-only fail — require code or text
+            like = f"%{q}%"
+            sql += " AND (u.imei LIKE ? OR u.serial LIKE ? OR LOWER(p.name) LIKE LOWER(?) OR LOWER(p.model) LIKE LOWER(?))"
+            uparams = [like, like, like, like]
+        else:
+            sql += uclause
+        rows = conn.execute(
+            sql + " ORDER BY CASE u.status WHEN 'in_stock' THEN 0 WHEN 'reserved' THEN 1 ELSE 2 END, u.created_at DESC LIMIT 30",
+            uparams,
+        ).fetchall()
+        matches = []
+        for u in rows:
+            d = enrich_unit_row(u)
+            ops = _unit_ops_count(conn, u["id"])
+            sales_n = conn.execute(
+                "SELECT COUNT(*) FROM sale_item_units siu JOIN sale_items si ON si.id = siu.sale_item_id JOIN sales s ON s.id = si.sale_id WHERE siu.unit_id = ? AND s.status = 'completed'",
+                (u["id"],),
+            ).fetchone()[0]
+            last_sale = conn.execute(
+                """
+                SELECT s.id, s.created_at, s.user_name, si.unit_price, s.currency_code
+                FROM sale_item_units siu
+                JOIN sale_items si ON si.id = siu.sale_item_id
+                JOIN sales s ON s.id = si.sale_id
+                WHERE siu.unit_id = ? AND s.status = 'completed'
+                ORDER BY s.created_at DESC LIMIT 1
+                """,
+                (u["id"],),
+            ).fetchone()
+            d["ops_count"] = ops
+            d["sales_count"] = int(sales_n or 0)
+            d["is_sold"] = u["status"] == "sold" or int(sales_n or 0) > 0
+            d["last_sale"] = row_to_dict(last_sale) if last_sale else None
+            matches.append(d)
+    return {"matches": matches}
+
+
+@app.get("/api/units/{unit_id}/history")
+async def get_unit_history(unit_id: int, x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin)
+    with db() as conn:
+        expire_reservations(conn)
+        row = conn.execute(
+            """
+            SELECT u.*, p.name AS product_name, p.model, p.color AS product_color,
+                   p.memory, p.sale_price, w.name AS warehouse_name
+            FROM product_units u
+            JOIN products p ON p.id = u.product_id
+            JOIN warehouses w ON w.id = u.warehouse_id
+            WHERE u.id = ?
+            """,
+            (unit_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Устройство не найдено")
+        unit = enrich_unit_row(row)
+        events = _unit_history_events(conn, unit_id)
+        unit["ops_count"] = _unit_ops_count(conn, unit_id)
+        unit["is_sold"] = unit.get("status") == "sold" or any(
+            e["kind"] == "sale" and e.get("status") == "completed" for e in events
+        )
+    return {"unit": unit, "events": events}
 
 
 @app.post("/api/units/{unit_id}/complete-imei")
@@ -5101,10 +6743,12 @@ async def report_customs(
     period: str = Query(default="month", pattern="^(day|week|month|quarter|year|all)$"),
     date_from: str = "",
     date_to: str = "",
+    warehouse_id: int | None = None,
     x_pin: str | None = Header(default=None, alias="X-Pin"),
 ):
     check_pin(x_pin, min_role="owner")
     clause, params, label = _report_period_clause(period, date_from, date_to, "s.created_at")
+    wh_clause, wh_params = warehouse_sales_filter(warehouse_id)
     with db() as conn:
         total = conn.execute(
             f"""
@@ -5112,9 +6756,9 @@ async def report_customs(
             FROM sale_item_units siu
             JOIN sale_items si ON si.id = siu.sale_item_id
             JOIN sales s ON s.id = si.sale_id
-            WHERE s.status = 'completed' AND siu.customs_cleared = 1 {clause}
+            WHERE s.status = 'completed' AND siu.customs_cleared = 1 {clause}{wh_clause}
             """,
-            params,
+            params + wh_params,
         ).fetchone()
         rows = conn.execute(
             f"""
@@ -5123,13 +6767,20 @@ async def report_customs(
             FROM sale_item_units siu
             JOIN sale_items si ON si.id = siu.sale_item_id
             JOIN sales s ON s.id = si.sale_id
-            WHERE s.status = 'completed' AND siu.customs_cleared = 1 {clause}
+            WHERE s.status = 'completed' AND siu.customs_cleared = 1 {clause}{wh_clause}
             ORDER BY s.created_at DESC LIMIT 100
             """,
-            params,
+            params + wh_params,
         ).fetchall()
+        wh_name = ""
+        if warehouse_id:
+            row = conn.execute("SELECT name FROM warehouses WHERE id = ?", (warehouse_id,)).fetchone()
+            wh_name = row["name"] if row else f"#{warehouse_id}"
+            label = f"{label} · {wh_name}"
     return {
         "period_label": label,
+        "warehouse_id": warehouse_id,
+        "warehouse_name": wh_name,
         "total_customs": float(total["total"]),
         "units_count": int(total["cnt"]),
         "items": [row_to_dict(r) for r in rows],
@@ -5162,10 +6813,14 @@ async def create_unit(body: UnitIn, x_pin: str | None = Header(default=None, ali
             """
             INSERT INTO product_units
             (product_id, warehouse_id, imei, serial, status, notes, created_at,
-             customs_status, customs_cleared, customs_price)
-            VALUES (?, ?, ?, ?, 'in_stock', ?, ?, ?, ?, ?)
+             customs_status, customs_cleared, customs_price, purchase_price)
+            VALUES (?, ?, ?, ?, 'in_stock', ?, ?, ?, ?, ?, ?)
             """,
-            (body.product_id, wh, imei, serial, body.notes, utc_now(), cs, customs_cleared, customs_price),
+            (
+                body.product_id, wh, imei, serial, body.notes, utc_now(), cs, customs_cleared, customs_price,
+                float(body.purchase_price) if body.purchase_price is not None and body.purchase_price > 0
+                else float(product["purchase_price"] or 0),
+            ),
         )
         adjust_warehouse_stock(
             conn, wh, body.product_id, 1, "inbound",
@@ -5295,6 +6950,72 @@ async def update_unit_customs_status(
     return enrich_unit_row(row)
 
 
+class UnitPurchaseIn(BaseModel):
+    purchase_price: float = Field(ge=0)
+
+
+class UnitExtraCostIn(BaseModel):
+    extra_cost: float = Field(ge=0)
+
+
+def _unit_detail_row(conn: sqlite3.Connection, unit_id: int) -> dict[str, Any]:
+    row = conn.execute(
+        """
+        SELECT u.*, p.name AS product_name, p.color AS product_color,
+               p.purchase_price AS product_purchase_price, w.name AS warehouse_name
+        FROM product_units u
+        JOIN products p ON p.id = u.product_id
+        JOIN warehouses w ON w.id = u.warehouse_id
+        WHERE u.id = ?
+        """,
+        (unit_id,),
+    ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Устройство не найдено")
+    d = enrich_unit_row(row)
+    d["purchase_price"] = unit_purchase_price(row, {"purchase_price": row["product_purchase_price"]})
+    d["extra_cost"] = unit_extra_cost(row)
+    d["customs_price"] = d["extra_cost"]
+    return d
+
+
+@app.patch("/api/units/{unit_id}/purchase-price")
+async def update_unit_purchase_price(
+    unit_id: int, body: UnitPurchaseIn, x_pin: str | None = Header(default=None, alias="X-Pin")
+):
+    check_pin(x_pin, min_role="warehouse")
+    with db() as conn:
+        unit = conn.execute("SELECT * FROM product_units WHERE id = ?", (unit_id,)).fetchone()
+        if not unit:
+            raise HTTPException(status_code=404, detail="Устройство не найдено")
+        if unit["status"] == "sold":
+            raise HTTPException(status_code=400, detail="Устройство уже продано — себестоимость в чеке не меняется")
+        conn.execute(
+            "UPDATE product_units SET purchase_price = ? WHERE id = ?",
+            (body.purchase_price, unit_id),
+        )
+        return _unit_detail_row(conn, unit_id)
+
+
+@app.patch("/api/units/{unit_id}/extra-cost")
+async def update_unit_extra_cost(
+    unit_id: int, body: UnitExtraCostIn, x_pin: str | None = Header(default=None, alias="X-Pin")
+):
+    """Расходы на Б/У (ремонт и т.п.) — в карточке устройства, колонка «Расходы»."""
+    check_pin(x_pin, min_role="warehouse")
+    with db() as conn:
+        unit = conn.execute("SELECT * FROM product_units WHERE id = ?", (unit_id,)).fetchone()
+        if not unit:
+            raise HTTPException(status_code=404, detail="Устройство не найдено")
+        if unit["status"] == "sold":
+            raise HTTPException(status_code=400, detail="Устройство уже продано — расходы не меняются")
+        conn.execute(
+            "UPDATE product_units SET customs_price = ? WHERE id = ?",
+            (float(body.extra_cost or 0), unit_id),
+        )
+        return _unit_detail_row(conn, unit_id)
+
+
 @app.post("/api/units/{unit_id}/photo")
 async def upload_unit_photo(
     unit_id: int,
@@ -5408,10 +7129,13 @@ async def import_units_csv(
                 """
                 INSERT INTO product_units
                 (product_id, warehouse_id, imei, serial, status, notes, created_at,
-                 customs_status, customs_cleared)
-                VALUES (?, ?, ?, ?, 'in_stock', ?, ?, ?, ?)
+                 customs_status, customs_cleared, purchase_price)
+                VALUES (?, ?, ?, ?, 'in_stock', ?, ?, ?, ?, ?)
                 """,
-                (pid, wh_id, imei, serial, "CSV импорт", utc_now(), customs_status, cleared),
+                (
+                    pid, wh_id, imei, serial, "CSV импорт", utc_now(), customs_status, cleared,
+                    float(product["purchase_price"] or 0),
+                ),
             )
             adjust_warehouse_stock(conn, wh_id, pid, 1, "inbound", notes=f"CSV: {imei or serial}")
             conn.execute("UPDATE products SET track_units = 1 WHERE id = ?", (pid,))
@@ -5661,8 +7385,9 @@ async def warehouse_devices(warehouse_id: int, x_pin: str | None = Header(defaul
         kind = get_warehouse_receipt_kind(conn, warehouse_id)
         rows = conn.execute(
             """
-            SELECT u.*, p.name AS model, p.color, p.memory, p.purchase_price, p.supplier_name,
-                   p.sale_price, p.ownership_type, p.condition, p.category
+            SELECT u.*, p.name AS model, p.color, p.memory,
+                   p.purchase_price AS product_purchase_price,
+                   p.supplier_name, p.sale_price, p.ownership_type, p.condition, p.category
             FROM product_units u
             JOIN products p ON p.id = u.product_id
             WHERE u.warehouse_id = ? AND u.status = 'in_stock' AND p.category != 'accessory'
@@ -5676,7 +7401,7 @@ async def warehouse_devices(warehouse_id: int, x_pin: str | None = Header(defaul
             d["model"] = r["model"] or ""
             d["color"] = r["color"] or ""
             d["memory"] = r["memory"] or ""
-            d["purchase_price"] = float(r["purchase_price"] or 0)
+            d["purchase_price"] = unit_purchase_price(r, {"purchase_price": r["product_purchase_price"]})
             d["supplier_name"] = r["supplier_name"] or ""
             d["ownership_type"] = r["ownership_type"] or "own"
             items.append(d)
@@ -5697,7 +7422,16 @@ async def warehouse_devices(warehouse_id: int, x_pin: str | None = Header(defaul
             accessories = [
                 enrich_product(conn, r) | {"warehouse_quantity": r["warehouse_quantity"]} for r in acc
             ]
-    return {"kind": kind, "items": items, "accessories": accessories}
+        totals = warehouse_stock_money(conn, warehouse_id)
+    return {"kind": kind, "items": items, "accessories": accessories, "totals": totals}
+
+
+@app.get("/api/warehouses/{warehouse_id}/stock-value")
+async def warehouse_stock_value(warehouse_id: int, x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin)
+    with db() as conn:
+        resolve_warehouse_id(conn, warehouse_id)
+        return warehouse_stock_money(conn, warehouse_id)
 
 
 @app.get("/api/warehouses/{warehouse_id}/z-report")
@@ -5790,6 +7524,7 @@ async def import_z_register_file(
     file: UploadFile = File(...),
     sheet: str = Query(default=""),
     replace: bool = Query(default=False),
+    affect_cash: bool = Query(default=False),
     x_pin: str | None = Header(default=None, alias="X-Pin"),
 ):
     check_pin(x_pin, min_role="warehouse")
@@ -5798,7 +7533,10 @@ async def import_z_register_file(
         raise HTTPException(status_code=400, detail="Пустой файл")
     try:
         with db() as conn:
-            result = import_z_register_excel(conn, raw, file.filename or "import.xlsx", sheet, replace=replace)
+            result = import_z_register_excel(
+                conn, raw, file.filename or "import.xlsx", sheet,
+                replace=replace, affect_cash=affect_cash,
+            )
     except HTTPException:
         raise
     except Exception as exc:
@@ -5837,94 +7575,419 @@ async def warehouse_quick_sell(body: WarehouseQuickSellIn, x_pin: str | None = H
     return await create_sale(sale_in, x_pin)
 
 
+def _amount_bags(rows: list[tuple[str, float]]) -> list[dict[str, Any]]:
+    bags: dict[str, float] = {}
+    for cur, amt in rows:
+        code = (cur or "TJS").strip().upper() or "TJS"
+        bags[code] = bags.get(code, 0.0) + float(amt or 0)
+    out = []
+    for code in sorted(bags.keys(), key=lambda c: (0 if c == "USD" else 1, c)):
+        out.append({**currency_meta(code), "amount": round(bags[code], 2)})
+    return out
+
+
+def _shift_report_window(conn: sqlite3.Connection) -> tuple[str, str, str, dict[str, Any] | None]:
+    """Return (period, date_from, date_to, shift_dict|None). Open shift → day of opened_at."""
+    shift = get_open_shift(conn)
+    if shift:
+        day = (shift["opened_at"] or utc_now())[:10]
+        return "day", day, day, row_to_dict(shift)
+    # No open shift: calendar today
+    day = utc_now()[:10]
+    return "day", day, day, None
+
+
 @app.get("/api/pos/cash-register")
 async def pos_cash_register(
-    period: str = Query(default="day", pattern="^(day|week|month|all)$"),
+    period: str = Query(default="auto", pattern="^(auto|day|week|month|all)$"),
     x_pin: str | None = Header(default=None, alias="X-Pin"),
 ):
+    """POS cash: period KPIs (shift day or today) + all-time wallet balances."""
     check_pin(x_pin)
     with db() as conn:
-        dds = _report_dds(conn, period, "", "")
-        opiu = _report_opiu(conn, period, "", "")
-        fin = _finance_report(conn, period, "all", "", "")
-        clause, params, _ = _report_period_clause(period, "", "", "expense_date")
-        if period != "all" and not params:
-            clause = " AND expense_date >= ?"
-            params = [period_start(period)[:10]]
-        exp_rows = conn.execute(
-            f"SELECT * FROM expenses WHERE 1=1 {clause} ORDER BY expense_date DESC LIMIT 30",
-            params,
+        shift_row = get_open_shift(conn)
+        shift = row_to_dict(shift_row) if shift_row else None
+        if period == "auto":
+            _, use_from, use_to, _ = _shift_report_window(conn)
+            period_key = "day"
+        elif period == "all":
+            use_from, use_to, period_key = "", "", "all"
+        else:
+            use_from, use_to, period_key = "", "", period
+
+        cash = _period_cash_by_currency(
+            conn, "all" if use_from else period_key,
+            date_from=use_from, date_to=use_to,
+        )
+        if use_from and use_to and use_from == use_to:
+            cash["period_label"] = (f"Смена · {use_from}" if shift else f"Сегодня · {use_from}")
+
+        wallets = _period_cash_by_currency(conn, "all")  # all-time money in wallets
+        fin = _finance_report(conn, "all" if use_from else period_key, "all", use_from, use_to)
+
+        # Split: sales / manual inflows / expenses / payouts for the period
+        sale_clause, sale_params, _ = _report_period_clause(
+            "all" if use_from else period_key, use_from, use_to, "s.created_at"
+        )
+        sales_rows = conn.execute(
+            f"""
+            SELECT UPPER(COALESCE(NULLIF(TRIM(s.currency_code), ''), 'TJS')) AS cur,
+                   COALESCE(SUM(sp.amount), 0) AS amt
+            FROM sale_payments sp
+            JOIN sales s ON s.id = sp.sale_id
+            WHERE s.status = 'completed' AND COALESCE(s.affects_cash, 1) = 1 {sale_clause}
+            GROUP BY 1
+            """,
+            list(sale_params),
         ).fetchall()
-        methods = list_payment_methods(conn, active_only=True)
-        balances: list[dict[str, Any]] = []
-        for pm in methods:
-            amt = conn.execute(
-                """
-                SELECT COALESCE(SUM(sp.amount), 0)
-                FROM sale_payments sp
-                JOIN sales s ON s.id = sp.sale_id
-                WHERE s.status = 'completed' AND sp.method_code = ?
-                """
-                + (" AND s.created_at >= ?" if period != "all" else ""),
-                ([pm["code"], period_start(period)] if period != "all" else [pm["code"]]),
-            ).fetchone()[0]
-            recv_amt = conn.execute(
-                """
-                SELECT COALESCE(SUM(amount), 0) FROM receivable_payments
-                WHERE payment_method_code = ?
-                """
-                + (" AND created_at >= ?" if period != "all" else ""),
-                ([pm["code"], period_start(period)] if period != "all" else [pm["code"]]),
-            ).fetchone()[0]
-            manual_amt = 0.0
-            if _table_exists(conn, "cash_inflows"):
-                manual_amt = float(conn.execute(
-                    """
-                    SELECT COALESCE(SUM(amount_base), 0) FROM cash_inflows
-                    WHERE source_type = 'counterparty' AND payment_method_code = ?
-                    """
-                    + (" AND created_at >= ?" if period != "all" else ""),
-                    ([pm["code"], period_start(period)] if period != "all" else [pm["code"]]),
-                ).fetchone()[0])
-            inflow = float(amt) + float(recv_amt) + float(manual_amt)
-            out = 0.0
-            if True:
-                out = float(conn.execute(
-                    f"SELECT COALESCE(SUM(amount), 0) FROM expenses WHERE payment_method_code = ? {clause}",
-                    [pm["code"], *params] if clause else [pm["code"]],
-                ).fetchone()[0])
-            balances.append({
-                "code": pm["code"],
-                "name": pm["name"],
-                "method_type": pm["method_type"],
-                "inflow": inflow,
-                "outflow": out,
-                "net": inflow - out,
-            })
-        recent_inflows = []
+        sales_bags = _amount_bags([(r["cur"], r["amt"]) for r in sales_rows])
+
+        inflows_bags: list[dict[str, Any]] = []
+        recent_inflows: list[dict[str, Any]] = []
         if _table_exists(conn, "cash_inflows"):
-            iclause, iparams, _ = _report_period_clause(period, "", "", "created_at")
+            iclause, iparams, _ = _report_period_clause(
+                "all" if use_from else period_key, use_from, use_to, "created_at"
+            )
+            in_rows = conn.execute(
+                f"""
+                SELECT UPPER(COALESCE(NULLIF(TRIM(currency_code), ''), 'TJS')) AS cur,
+                       COALESCE(SUM(amount), 0) AS amt
+                FROM cash_inflows
+                WHERE source_type = 'counterparty' {iclause}
+                GROUP BY 1
+                """,
+                list(iparams),
+            ).fetchall()
+            inflows_bags = _amount_bags([(r["cur"], r["amt"]) for r in in_rows])
             recent_inflows = [
                 row_to_dict(r)
                 for r in conn.execute(
-                    f"SELECT * FROM cash_inflows WHERE 1=1 {iclause} ORDER BY created_at DESC LIMIT 20",
-                    iparams,
+                    f"SELECT * FROM cash_inflows WHERE 1=1 {iclause} ORDER BY created_at DESC LIMIT 30",
+                    list(iparams),
                 ).fetchall()
             ]
+
+        exp_clause, exp_params, _ = _report_period_clause(
+            "all" if use_from else period_key, use_from, use_to, "expense_date"
+        )
+        if period_key != "all" and not use_from and not exp_params:
+            exp_clause = " AND expense_date >= ?"
+            exp_params = [period_start(period_key)[:10]]
+        exp_kind_rows = conn.execute(
+            f"""
+            SELECT COALESCE(kind, 'expense') AS kind,
+                   COALESCE(SUM(amount), 0) AS amt
+            FROM expenses WHERE COALESCE(affects_cash, 1) = 1 {exp_clause}
+            GROUP BY 1
+            """,
+            list(exp_params),
+        ).fetchall()
+        exp_amt = sum(float(r["amt"]) for r in exp_kind_rows if (r["kind"] or "expense") != "payout")
+        pay_amt = sum(float(r["amt"]) for r in exp_kind_rows if (r["kind"] or "") == "payout")
+        expenses_bags = _amount_bags([("TJS", exp_amt)]) if exp_amt else []
+        payouts_bags = _amount_bags([("TJS", pay_amt)]) if pay_amt else []
+
+        exp_rows = conn.execute(
+            f"""
+            SELECT e.*, COALESCE(w.name, '') AS warehouse_name
+            FROM expenses e
+            LEFT JOIN warehouses w ON w.id = e.warehouse_id
+            WHERE COALESCE(e.affects_cash, 1) = 1
+              {exp_clause.replace('expense_date', 'e.expense_date') if exp_clause else ''}
+            ORDER BY e.expense_date DESC, e.id DESC LIMIT 40
+            """,
+            list(exp_params),
+        ).fetchall()
+
+        by_cur = cash["by_currency"]
     return {
-        "period": period,
-        "period_label": dds["period_label"],
-        "inflows": dds["operating_inflows"],
-        "total_inflows": dds["total_inflows"],
-        "total_outflows": dds["total_outflows"],
-        "net_cash": dds["net_operating_cash"],
+        "period": period_key,
+        "date_from": use_from,
+        "date_to": use_to,
+        "period_label": cash["period_label"],
+        "shift": shift,
+        "by_currency": by_cur,
+        "sales": sales_bags,
+        "manual_inflows": inflows_bags,
+        "expenses_bags": expenses_bags,
+        "payouts_bags": payouts_bags,
+        "total_inflows": None,
+        "total_outflows": None,
+        "net_cash": None,
         "revenue": fin["gross_revenue"],
         "profit": fin["shop_profit"],
-        "expenses_total": opiu["operating_expenses"],
+        "by_currency_finance": fin.get("by_currency") or [],
+        "expenses_total": exp_amt + pay_amt,
         "expenses": [row_to_dict(r) for r in exp_rows],
-        "balances": balances,
+        # Period movement per wallet (shift/today)
+        "balances_period": cash["balances"],
+        # All-time money currently in wallets (does not reset next day)
+        "balances": wallets["balances"],
+        "wallets_all_time": wallets["balances"],
         "cash_inflows": recent_inflows,
     }
+
+
+@app.get("/api/pos/cash-register/detail")
+async def pos_cash_register_detail(
+    kind: str = Query(default="inflow", pattern="^(inflow|outflow|net|wallet|profit)$"),
+    method_code: str = Query(default=""),
+    period: str = Query(default="auto", pattern="^(auto|day|week|month|all)$"),
+    date_from: str = "",
+    date_to: str = "",
+    x_pin: str | None = Header(default=None, alias="X-Pin"),
+):
+    """Lines explaining cash KPI / wallet balances (where +/− came from)."""
+    check_pin(x_pin)
+    with db() as conn:
+        if period == "auto" or (not date_from and not date_to and period == "day"):
+            _, date_from, date_to, _ = _shift_report_window(conn)
+            period = "all"  # use explicit dates
+        period_label = (
+            f"{date_from} — {date_to}" if date_from or date_to
+            else ("Всё время" if period == "all" else {"day": "Сегодня", "week": "Неделя", "month": "Месяц"}.get(period, period))
+        )
+        sale_clause, sale_params, _ = _report_period_clause(period, date_from, date_to, "s.created_at")
+        exp_clause, exp_params, _ = _report_period_clause(period, date_from, date_to, "expense_date")
+        if period != "all" and not date_from and not date_to and not exp_params:
+            exp_clause = " AND expense_date >= ?"
+            exp_params = [period_start(period)[:10]]
+        in_clause, in_params, _ = _report_period_clause(period, date_from, date_to, "created_at")
+        method = (method_code or "").strip()
+        lines: list[dict[str, Any]] = []
+
+        def add_line(
+            *,
+            at: str,
+            side: str,
+            source: str,
+            who: str,
+            amount: float,
+            currency: str,
+            note: str = "",
+            method_name: str = "",
+            ref: str = "",
+        ) -> None:
+            lines.append({
+                "at": at or "",
+                "side": side,
+                "source": source,
+                "who": who or "—",
+                "amount": float(amount or 0),
+                "currency_code": (currency or "TJS").upper(),
+                "note": note or "",
+                "method_name": method_name or "",
+                "ref": ref or "",
+            })
+
+        want_in = kind in ("inflow", "net", "wallet")
+        want_out = kind in ("outflow", "net", "wallet")
+        if kind == "profit":
+            want_in = want_out = False
+
+        if want_in:
+            pay_sql = f"""
+                SELECT s.created_at AS at, s.id AS sale_id, sp.amount,
+                       UPPER(COALESCE(NULLIF(TRIM(s.currency_code), ''), 'TJS')) AS currency_code,
+                       sp.method_code, COALESCE(pm.name, sp.method_code) AS method_name,
+                       COALESCE(NULLIF(s.user_name, ''), '—') AS who,
+                       COALESCE(w.name, '') AS warehouse_name
+                FROM sale_payments sp
+                JOIN sales s ON s.id = sp.sale_id
+                LEFT JOIN payment_methods pm ON pm.code = sp.method_code
+                LEFT JOIN warehouses w ON w.id = s.warehouse_id
+                WHERE s.status = 'completed' AND COALESCE(s.affects_cash, 1) = 1 {sale_clause}
+                ORDER BY s.created_at DESC LIMIT 400
+            """
+            for r in conn.execute(pay_sql, list(sale_params)).fetchall():
+                cur = r["currency_code"] or "TJS"
+                wcode = resolve_wallet_method_code(conn, r["method_code"] or "cash", cur)
+                if kind == "wallet" and method and wcode != method:
+                    continue
+                pm_show = get_payment_method(conn, wcode)
+                add_line(
+                    at=r["at"], side="+", source="Продажа",
+                    who=r["who"], amount=r["amount"], currency=cur,
+                    note=r["warehouse_name"] or "",
+                    method_name=(pm_show["name"] if pm_show else r["method_name"]),
+                    ref=f"#{r['sale_id']}",
+                )
+
+            recv_clause, recv_params, _ = _report_period_clause(period, "", "", "rp.created_at")
+            recv_sql = f"""
+                SELECT rp.created_at AS at,
+                       COALESCE(NULLIF(rp.pay_amount, 0), rp.amount) AS amount,
+                       rp.payment_method_code,
+                       COALESCE(pm.name, rp.payment_method_code) AS method_name,
+                       r.customer_name AS who, r.sale_id,
+                       UPPER(COALESCE(
+                           NULLIF(TRIM(rp.pay_currency_code), ''),
+                           NULLIF(TRIM(s.currency_code), ''),
+                           NULLIF(TRIM(w.currency_code), ''),
+                           'TJS'
+                       )) AS currency_code
+                FROM receivable_payments rp
+                JOIN receivables r ON r.id = rp.receivable_id
+                LEFT JOIN sales s ON s.id = r.sale_id
+                LEFT JOIN warehouses w ON w.id = COALESCE(r.warehouse_id, s.warehouse_id)
+                LEFT JOIN payment_methods pm ON pm.code = rp.payment_method_code
+                WHERE 1=1 {recv_clause}
+            """
+            recv_params = list(recv_params)
+            if kind == "wallet" and method:
+                recv_sql += " AND rp.payment_method_code = ?"
+                recv_params.append(method)
+            recv_sql += " ORDER BY rp.created_at DESC LIMIT 200"
+            for r in conn.execute(recv_sql, recv_params).fetchall():
+                add_line(
+                    at=r["at"], side="+", source="Погашение долга",
+                    who=r["who"], amount=r["amount"], currency=r["currency_code"],
+                    note=f"чек #{r['sale_id']}" if r["sale_id"] else "",
+                    method_name=r["method_name"],
+                )
+
+            if _table_exists(conn, "mutual_payments"):
+                m_clause, m_params, _ = _report_period_clause(period, "", "", "mp.created_at")
+                m_sql = f"""
+                    SELECT mp.created_at AS at,
+                           COALESCE(NULLIF(mp.pay_amount, 0), mp.amount) AS amount,
+                           mp.payment_method_code,
+                           COALESCE(pm.name, mp.payment_method_code) AS method_name,
+                           me.person_name AS who,
+                           me.product_note AS note,
+                           UPPER(COALESCE(
+                               NULLIF(TRIM(mp.pay_currency_code), ''),
+                               NULLIF(TRIM(me.currency_code), ''),
+                               'TJS'
+                           )) AS currency_code
+                    FROM mutual_payments mp
+                    JOIN mutual_entries me ON me.id = mp.entry_id
+                    LEFT JOIN payment_methods pm ON pm.code = mp.payment_method_code
+                    WHERE me.direction = 'owe_us' {m_clause}
+                """
+                mparams = list(m_params)
+                if kind == "wallet" and method:
+                    m_sql += " AND mp.payment_method_code = ?"
+                    mparams.append(method)
+                m_sql += " ORDER BY mp.created_at DESC LIMIT 200"
+                for r in conn.execute(m_sql, mparams).fetchall():
+                    add_line(
+                        at=r["at"], side="+", source="Погашение займа",
+                        who=r["who"], amount=r["amount"], currency=r["currency_code"],
+                        note=r["note"] or "", method_name=r["method_name"],
+                    )
+
+            if _table_exists(conn, "cash_inflows"):
+                man_sql = f"""
+                    SELECT created_at AS at, amount, amount_base, currency_code,
+                           payment_method_code, counterparty_name, source_type, notes
+                    FROM cash_inflows
+                    WHERE source_type = 'counterparty' {in_clause}
+                """
+                man_params = list(in_params)
+                if kind == "wallet" and method:
+                    man_sql += " AND payment_method_code = ?"
+                    man_params.append(method)
+                man_sql += " ORDER BY created_at DESC LIMIT 200"
+                for r in conn.execute(man_sql, man_params).fetchall():
+                    pm = get_payment_method(conn, r["payment_method_code"] or "cash")
+                    add_line(
+                        at=r["at"], side="+", source="Приход (контрагент)",
+                        who=r["counterparty_name"] or "—",
+                        amount=r["amount"], currency=r["currency_code"] or "TJS",
+                        note=r["notes"] or "",
+                        method_name=pm["name"] if pm else (r["payment_method_code"] or ""),
+                    )
+
+        if want_out:
+            out_sql = f"""
+                SELECT e.expense_date AS at, e.amount, e.category, e.description,
+                       e.payment_method_code, COALESCE(pm.name, e.payment_method_code) AS method_name,
+                       COALESCE(NULLIF(e.created_by, ''), '—') AS who
+                FROM expenses e
+                LEFT JOIN payment_methods pm ON pm.code = e.payment_method_code
+                WHERE COALESCE(e.affects_cash, 1) = 1 {exp_clause}
+            """
+            out_params = list(exp_params)
+            if kind == "wallet" and method:
+                out_sql += " AND e.payment_method_code = ?"
+                out_params.append(method)
+            out_sql += " ORDER BY e.expense_date DESC, e.id DESC LIMIT 200"
+            for r in conn.execute(out_sql, out_params).fetchall():
+                add_line(
+                    at=r["at"], side="−", source="Расход",
+                    who=r["who"], amount=r["amount"], currency="TJS",
+                    note=f"{r['category'] or ''} {r['description'] or ''}".strip(),
+                    method_name=r["method_name"] or "",
+                )
+
+            if kind in ("outflow", "net") or (kind == "wallet" and method in ("", "cash")):
+                # supplier payments (usually cash TJS)
+                if _table_exists(conn, "supplier_payments"):
+                    sup_clause, sup_params, _ = _report_period_clause(period, "", "", "created_at")
+                    sup_sql = f"""
+                        SELECT created_at AS at, amount, supplier_name, notes,
+                               COALESCE(payment_method_code, 'cash') AS payment_method_code
+                        FROM supplier_payments
+                        WHERE 1=1 {sup_clause}
+                    """
+                    sup_params = list(sup_params)
+                    if kind == "wallet" and method:
+                        sup_sql += " AND COALESCE(payment_method_code, 'cash') = ?"
+                        sup_params.append(method)
+                    for r in conn.execute(sup_sql + " ORDER BY created_at DESC LIMIT 100", sup_params).fetchall():
+                        pm = get_payment_method(conn, r["payment_method_code"] or "cash")
+                        add_line(
+                            at=r["at"], side="−", source="Оплата поставщику",
+                            who=r["supplier_name"] or "—", amount=r["amount"], currency="TJS",
+                            note=r["notes"] or "", method_name=pm["name"] if pm else "Наличные",
+                        )
+
+        if kind == "profit":
+            fin = _finance_report(conn, period, "all", "", "")
+            title = f"Прибыль · {period_label}"
+            return {
+                "kind": kind,
+                "title": title,
+                "period_label": period_label,
+                "summary": {
+                    "revenue": fin.get("gross_revenue"),
+                    "profit": fin.get("shop_profit"),
+                    "sales_count": fin.get("sales_count"),
+                },
+                "lines": [],
+                "by_currency": fin.get("by_currency") or [],
+            }
+
+        lines.sort(key=lambda x: x.get("at") or "", reverse=True)
+        method_name = ""
+        if method:
+            pm = get_payment_method(conn, method)
+            method_name = pm["name"] if pm else method
+        titles = {
+            "inflow": "Приход — откуда деньги",
+            "outflow": "Расход — куда ушли",
+            "net": "Чистыми — плюсы и минусы",
+            "wallet": f"Кошелёк: {method_name or method}",
+        }
+        by_currency = _money_sides_by_currency(lines)
+        return {
+            "kind": kind,
+            "title": f"{titles.get(kind, 'Детали')} · {period_label}",
+            "period_label": period_label,
+            "method_code": method,
+            "method_name": method_name,
+            "summary": {
+                "by_currency": by_currency,
+                "lines_count": len(lines),
+                # Never mix USD+TJS into one number
+                "plus": None,
+                "minus": None,
+                "net": None,
+            },
+            "by_currency": by_currency,
+            "lines": lines,
+        }
 
 
 @app.get("/api/stock/total")
@@ -6098,19 +8161,31 @@ async def stock_inbound_receipt(body: InboundReceiptIn, x_pin: str | None = Head
                 if dup:
                     raise HTTPException(status_code=400, detail="IMEI уже в системе")
             cs = "pending" if not int(product["customs_cleared"] or 0) and product["category"] == "phone" else "none"
+            unit_cost = (
+                float(body.unit_purchase_price)
+                if body.unit_purchase_price is not None and body.unit_purchase_price > 0
+                else float(product["purchase_price"] or 0)
+            )
+            if body.mode == "new" and body.product and body.product.purchase_price > 0:
+                unit_cost = float(body.product.purchase_price)
+            unit_extra = float(body.unit_extra_cost or 0)
+            if unit_extra <= 0 and body.mode == "new" and body.product:
+                unit_extra = float(body.product.customs_price or 0)
             cur_u = conn.execute(
                 """
                 INSERT INTO product_units
                 (product_id, warehouse_id, imei, serial, status, notes, created_at,
-                 customs_status, customs_cleared, battery_capacity, client_name, region, arrival_date)
-                VALUES (?, ?, ?, ?, 'in_stock', ?, ?, ?, ?, ?, ?, ?, ?)
+                 customs_status, customs_cleared, customs_price, battery_capacity,
+                 client_name, region, arrival_date, purchase_price)
+                VALUES (?, ?, ?, ?, 'in_stock', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     product_id, wh_id, imei, serial,
                     body.notes or "Приход на склад", utc_now(), cs,
-                    int(product["customs_cleared"] or 0), body.battery_capacity,
+                    int(product["customs_cleared"] or 0), unit_extra, body.battery_capacity,
                     body.client_name.strip(), body.region.strip(),
                     body.arrival_date.strip() or utc_now()[:10],
+                    unit_cost,
                 ),
             )
             unit_row = conn.execute("SELECT * FROM product_units WHERE id = ?", (cur_u.lastrowid,)).fetchone()
@@ -6544,13 +8619,17 @@ async def accessories_cash_register(
         return {
             "period": period,
             "period_label": fin["period_label"],
-            "total_inflows": total_in,
-            "total_outflows": float(exp_out),
-            "net_cash": total_in - float(exp_out),
+            "total_inflows": None,
+            "total_outflows": None,
+            "net_cash": None,
             "profit": fin["shop_profit"],
             "revenue": fin["revenue"],
             "expenses": fin["expenses"],
-            "inflows": [{"method_code": r["method_code"], "name": r["name"] or r["method_code"], "amount": float(r["amount"])} for r in inflows],
+            "by_currency": [
+                {**currency_meta("USD"), "inflow": round(float(total_in), 2), "outflow": 0.0, "net": round(float(total_in), 2)},
+                {**currency_meta("TJS"), "inflow": 0.0, "outflow": round(float(exp_out), 2), "net": round(-float(exp_out), 2)},
+            ],
+            "inflows": [{"method_code": r["method_code"], "name": r["name"] or r["method_code"], "amount": float(r["amount"]), "currency_code": "USD"} for r in inflows],
             "expense_lines": [row_to_dict(r) for r in exp_rows],
         }
 
@@ -6563,58 +8642,92 @@ async def list_suppliers(x_pin: str | None = Header(default=None, alias="X-Pin")
 
 
 def _creditors_list(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-    rows = conn.execute(
-        """
-        SELECT p.supplier_name,
-               COUNT(DISTINCT p.id) AS products_count,
-               COALESCE(SUM(ws.quantity), 0) AS total_stock,
-               COALESCE(SUM(p.purchase_price * ws.quantity), 0) AS stock_value
-        FROM products p
-        LEFT JOIN warehouse_stock ws ON ws.product_id = p.id
-        WHERE p.ownership_type = 'consignment' AND p.supplier_name != ''
-        GROUP BY p.supplier_name
-        ORDER BY p.supplier_name
-        """
-    ).fetchall()
-    result = []
-    for r in rows:
-        name = r["supplier_name"]
-        sold_due = conn.execute(
+    names = [
+        r[0]
+        for r in conn.execute(
             """
-            SELECT COALESCE(SUM(supplier_due), 0)
-            FROM sale_items si
-            JOIN sales s ON s.id = si.sale_id
-            WHERE si.ownership_type = 'consignment'
-              AND si.supplier_name = ?
-              AND s.status = 'completed'
+            SELECT DISTINCT supplier_name FROM products
+            WHERE ownership_type = 'consignment' AND supplier_name != ''
+            ORDER BY supplier_name
+            """
+        ).fetchall()
+    ]
+    result = []
+    for name in names:
+        products_count = conn.execute(
+            "SELECT COUNT(*) FROM products WHERE ownership_type = 'consignment' AND supplier_name = ?",
+            (name,),
+        ).fetchone()[0]
+        total_stock = conn.execute(
+            """
+            SELECT COALESCE(SUM(ws.quantity), 0)
+            FROM warehouse_stock ws
+            JOIN products p ON p.id = ws.product_id
+            WHERE p.ownership_type = 'consignment' AND p.supplier_name = ?
             """,
             (name,),
         ).fetchone()[0]
-        paid = conn.execute(
-            "SELECT COALESCE(SUM(amount), 0) FROM supplier_payments WHERE supplier_name = ?",
-            (name,),
-        ).fetchone()[0]
-        sales_count = conn.execute(
+        accrued_rows = conn.execute(
             """
-            SELECT COUNT(DISTINCT s.id)
+            SELECT UPPER(COALESCE(NULLIF(TRIM(s.currency_code), ''), 'TJS')) AS cur,
+                   COALESCE(SUM(si.supplier_due), 0) AS amt
             FROM sale_items si
             JOIN sales s ON s.id = si.sale_id
             WHERE si.ownership_type = 'consignment'
               AND si.supplier_name = ?
               AND s.status = 'completed'
-              AND si.supplier_due > 0
+            GROUP BY 1
+            """,
+            (name,),
+        ).fetchall()
+        paid_rows = conn.execute(
+            """
+            SELECT payment_method_code, COALESCE(SUM(amount), 0) AS amt
+            FROM supplier_payments
+            WHERE supplier_name = ?
+            GROUP BY 1
+            """,
+            (name,),
+        ).fetchall()
+        bags: dict[str, dict[str, float]] = {}
+        for r in accrued_rows:
+            code = (r["cur"] or "TJS").upper()
+            bags.setdefault(code, {"accrued_due": 0.0, "paid": 0.0})
+            bags[code]["accrued_due"] += float(r["amt"] or 0)
+        for r in paid_rows:
+            pm = get_payment_method(conn, r["payment_method_code"] or "cash")
+            code = payment_method_currency(pm) or "TJS"
+            bags.setdefault(code, {"accrued_due": 0.0, "paid": 0.0})
+            bags[code]["paid"] += float(r["amt"] or 0)
+        by_currency = []
+        for code in sorted(bags.keys(), key=lambda c: (0 if c == "USD" else 1, c)):
+            acc = round(bags[code]["accrued_due"], 2)
+            paid = round(bags[code]["paid"], 2)
+            by_currency.append({
+                **currency_meta(code),
+                "accrued_due": acc,
+                "paid": paid,
+                "balance": round(max(0.0, acc - paid), 2),
+            })
+        sales_count = conn.execute(
+            """
+            SELECT COUNT(DISTINCT s.id)
+            FROM sales s
+            JOIN sale_items si ON si.sale_id = s.id
+            WHERE s.status = 'completed' AND si.ownership_type = 'consignment' AND si.supplier_name = ?
             """,
             (name,),
         ).fetchone()[0]
         result.append({
             "supplier_name": name,
-            "products_count": r["products_count"],
-            "total_stock": r["total_stock"],
-            "stock_value": float(r["stock_value"]),
-            "accrued_due": float(sold_due),
-            "paid": float(paid),
-            "balance": float(sold_due) - float(paid),
-            "sales_count": int(sales_count or 0),
+            "products_count": products_count,
+            "total_stock": total_stock,
+            "stock_value": None,
+            "accrued_due": None,
+            "paid": None,
+            "balance": None,
+            "by_currency": by_currency,
+            "sales_count": sales_count,
         })
     return result
 
@@ -6624,14 +8737,28 @@ async def list_creditors(x_pin: str | None = Header(default=None, alias="X-Pin")
     check_pin(x_pin)
     with db() as conn:
         creditors = _creditors_list(conn)
-        total_balance = sum(c["balance"] for c in creditors if c["balance"] > 0)
+        totals: dict[str, float] = {}
+        for c in creditors:
+            for bag in c.get("by_currency") or []:
+                totals[bag["code"]] = totals.get(bag["code"], 0.0) + float(bag.get("balance") or 0)
+        by_currency = [
+            {**currency_meta(code), "balance": round(amt, 2)}
+            for code, amt in sorted(totals.items(), key=lambda x: (0 if x[0] == "USD" else 1, x[0]))
+        ]
         payments = conn.execute(
             "SELECT * FROM supplier_payments ORDER BY created_at DESC LIMIT 50"
         ).fetchall()
+        pay_out = []
+        for r in payments:
+            d = row_to_dict(r)
+            pm = get_payment_method(conn, d.get("payment_method_code") or "cash")
+            d["currency_code"] = payment_method_currency(pm) or "TJS"
+            pay_out.append(d)
     return {
         "creditors": creditors,
-        "total_balance": total_balance,
-        "recent_payments": [row_to_dict(r) for r in payments],
+        "total_balance": None,
+        "by_currency": by_currency,
+        "recent_payments": pay_out,
     }
 
 
@@ -6645,6 +8772,7 @@ async def list_creditor_sales(
         rows = conn.execute(
             """
             SELECT s.id AS sale_id, s.created_at, s.warehouse_id,
+                   UPPER(COALESCE(NULLIF(TRIM(s.currency_code), ''), 'TJS')) AS currency_code,
                    si.product_name, si.quantity, si.subtotal, si.supplier_due, si.shop_profit,
                    COALESCE(w.name, '—') AS warehouse_name
             FROM sale_items si
@@ -6817,9 +8945,7 @@ async def create_sale(body: SaleIn, x_pin: str | None = Header(default=None, ali
         warehouse_id = resolve_warehouse_id(conn, body.warehouse_id)
         user = resolve_user(conn, x_pin)
         shift = get_open_shift(conn)
-        if not shift:
-            raise HTTPException(status_code=400, detail="Сначала откройте смену")
-        shift_id = body.shift_id or shift["id"]
+        shift_id = body.shift_id or (shift["id"] if shift else None)
 
         subtotal = 0.0
         lines: list[dict[str, Any]] = []
@@ -6842,6 +8968,11 @@ async def create_sale(body: SaleIn, x_pin: str | None = Header(default=None, ali
                         status_code=400,
                         detail=f"«{product['name']}»: нужны IMEI — доступно {avail} из {item.quantity}",
                     )
+                picked_units = pick_units(
+                    conn, product["id"], warehouse_id, item.quantity, item.unit_ids or None
+                )
+                # Landed cost: себестоимость + колонка «Расходы» (repair/customs)
+                unit_costs = [unit_total_cost(u, product) for u in picked_units]
             else:
                 wh_stock = get_warehouse_stock(conn, warehouse_id, item.product_id)
                 if wh_stock < item.quantity:
@@ -6849,34 +8980,64 @@ async def create_sale(body: SaleIn, x_pin: str | None = Header(default=None, ali
                         status_code=400,
                         detail=f"Недостаточно «{product['name']}» на складе: доступно {wh_stock}",
                     )
-            calc = calc_line(product, item.quantity, item.unit_price)
+                picked_units = None
+                unit_costs = None
+            calc = calc_line(product, item.quantity, item.unit_price, unit_costs)
             subtotal += calc["subtotal"]
-            lines.append({"product": product, "qty": item.quantity, "unit_ids": item.unit_ids, "unit_checkouts": {u.unit_id: u for u in item.units}, **calc})
+            lines.append({
+                "product": product,
+                "qty": item.quantity,
+                "unit_ids": item.unit_ids,
+                "unit_checkouts": {u.unit_id: u for u in item.units},
+                "picked_units": picked_units,
+                **calc,
+            })
 
         total = max(0.0, subtotal - body.discount)
         now = utc_now()
         sale_currency = get_warehouse_currency(conn, warehouse_id)["code"]
         pay_currency = (body.pay_currency or sale_currency).upper().strip() or sale_currency
+        fx_rate = float(body.fx_rate) if body.fx_rate and body.fx_rate > 0 else None
         fx_note = ""
-        if pay_currency != sale_currency:
-            # Payments come in pay_currency — convert to warehouse/sale currency
-            converted_payments = []
-            for p in body.payments:
-                amt = convert_amount(conn, float(p.amount), pay_currency, sale_currency, at=now)
-                converted_payments.append({"method_code": p.method_code, "amount": round(amt, 2)})
-            # Absorb tiny FX rounding so full payment still matches total
-            paid_conv = sum(p["amount"] for p in converted_payments)
-            if converted_payments and abs(paid_conv - total) <= 0.05 and abs(paid_conv - total) > 0.001:
-                converted_payments[-1]["amount"] = round(
-                    converted_payments[-1]["amount"] + (total - paid_conv), 2
-                )
-            rate_pay = get_exchange_rate_at(conn, pay_currency, now)
-            rate_sale = get_exchange_rate_at(conn, sale_currency, now)
-            cross = rate_pay / rate_sale if rate_sale else rate_pay
-            fx_note = f"Конвертация: оплата {pay_currency} → {sale_currency}, курс 1 {pay_currency} = {cross:.4f} {sale_currency}"
-            pay_payload_src = converted_payments
-        else:
-            pay_payload_src = [{"method_code": p.method_code, "amount": p.amount} for p in body.payments] if body.payments else []
+        converted_payments: list[dict[str, Any]] = []
+        for p in body.payments:
+            cur = (p.currency_code or pay_currency or sale_currency).upper().strip() or sale_currency
+            amt_in = float(p.amount)
+            if cur == sale_currency:
+                amt = amt_in
+            elif fx_rate and fx_rate > 0 and cur == pay_currency and pay_currency != sale_currency:
+                amt = amt_in / fx_rate
+            else:
+                amt = convert_amount(conn, amt_in, cur, sale_currency, at=now)
+            converted_payments.append({
+                "method_code": p.method_code,
+                "amount": round(amt, 2),
+                "currency_code": cur,
+                "amount_input": amt_in,
+            })
+        # Absorb tiny FX rounding so full payment still matches total
+        paid_conv = sum(p["amount"] for p in converted_payments)
+        if converted_payments and abs(paid_conv - total) <= 0.05 and abs(paid_conv - total) > 0.001:
+            converted_payments[-1]["amount"] = round(
+                converted_payments[-1]["amount"] + (total - paid_conv), 2
+            )
+        if any(p["currency_code"] != sale_currency for p in converted_payments) or (
+            pay_currency != sale_currency and body.payments
+        ):
+            if fx_rate and pay_currency != sale_currency:
+                fx_note = f"Курс: 1 {sale_currency} = {fx_rate:.4f} {pay_currency}"
+            elif pay_currency != sale_currency:
+                rate_pay = get_exchange_rate_at(conn, pay_currency, now)
+                rate_sale = get_exchange_rate_at(conn, sale_currency, now)
+                cross = rate_pay / rate_sale if rate_sale else rate_pay
+                fx_note = f"Конвертация: 1 {pay_currency} = {cross:.4f} {sale_currency}"
+            mixed = []
+            for p in converted_payments:
+                if p["currency_code"] != sale_currency:
+                    mixed.append(f"{p['amount_input']:.2f} {p['currency_code']}→{p['amount']:.2f} {sale_currency}")
+            if mixed:
+                fx_note = (fx_note + " · " if fx_note else "") + "; ".join(mixed)
+        pay_payload_src = [{"method_code": p["method_code"], "amount": p["amount"]} for p in converted_payments]
 
         sale_notes = body.notes.strip()
         if fx_note:
@@ -6952,7 +9113,9 @@ async def create_sale(body: SaleIn, x_pin: str | None = Header(default=None, ali
             sale_item_id = cur_item.lastrowid
             if int(p["track_units"] or 0):
                 checkout_map = line.get("unit_checkouts") or {}
-                units = pick_units(conn, p["id"], warehouse_id, line["qty"], line["unit_ids"] or None)
+                units = line.get("picked_units") or pick_units(
+                    conn, p["id"], warehouse_id, line["qty"], line["unit_ids"] or None
+                )
                 for u in units:
                     co = checkout_map.get(u["id"])
                     resolved = resolve_unit_sale(conn, u, co, p)
@@ -7163,8 +9326,7 @@ async def create_trade_in(body: TradeInIn, x_pin: str | None = Header(default=No
             )
 
         shift = get_open_shift(conn)
-        if not shift:
-            raise HTTPException(status_code=400, detail="Сначала откройте смену")
+        shift_id = shift["id"] if shift else None
 
         now = utc_now()
         cur = conn.execute(
@@ -7175,7 +9337,7 @@ async def create_trade_in(body: TradeInIn, x_pin: str | None = Header(default=No
             VALUES (?, 0, 'trade_in', 'completed', ?, ?, ?, ?, ?, ?, ?)
             """,
             (total, body.notes or "Обмен (trade-in)", now,
-             given_wh, body.cash_amount, body.card_amount, body.received_value, shift["id"]),
+             given_wh, body.cash_amount, body.card_amount, body.received_value, shift_id),
         )
         sale_id = cur.lastrowid
 
@@ -7234,12 +9396,13 @@ async def create_trade_in(body: TradeInIn, x_pin: str | None = Header(default=No
             conn.execute(
                 """
                 INSERT INTO product_units
-                (product_id, warehouse_id, imei, serial, status, notes, created_at)
-                VALUES (?, ?, ?, ?, 'in_stock', 'Trade-in', ?)
+                (product_id, warehouse_id, imei, serial, status, notes, created_at, purchase_price)
+                VALUES (?, ?, ?, ?, 'in_stock', 'Trade-in', ?, ?)
                 """,
                 (
                     received_product_id, received_wh,
                     body.received_imei.strip(), body.received_serial.strip(), now,
+                    float(body.received_purchase_price or 0),
                 ),
             )
         adjust_warehouse_stock(
@@ -7328,9 +9491,15 @@ async def create_supplier_payment(body: SupplierPaymentIn, x_pin: str | None = H
 
 
 
-def _report_opiu(conn: sqlite3.Connection, period: str, date_from: str, date_to: str) -> dict[str, Any]:
+def _report_opiu(
+    conn: sqlite3.Connection,
+    period: str,
+    date_from: str,
+    date_to: str,
+    warehouse_id: int | None = None,
+) -> dict[str, Any]:
     clause, params, label = _report_period_clause(period, date_from, date_to)
-    fin = _finance_report(conn, period, "all", date_from, date_to)
+    fin = _finance_report(conn, period, "all", date_from, date_to, warehouse_id)
     exp_clause = clause.replace("s.created_at", "expense_date") if clause else ""
     if period != "all" and not date_from and not date_to:
         exp_clause = " AND expense_date >= ?"
@@ -7340,11 +9509,70 @@ def _report_opiu(conn: sqlite3.Connection, period: str, date_from: str, date_to:
     else:
         exp_params = []
     expenses = conn.execute(
-        f"SELECT category, department, COALESCE(SUM(amount), 0) AS total FROM expenses WHERE 1=1 {exp_clause} GROUP BY category, department",
+        f"""
+        SELECT category, department, warehouse_id,
+               COALESCE(SUM(amount), 0) AS total
+        FROM expenses
+        WHERE 1=1 {exp_clause}
+        GROUP BY category, department, warehouse_id
+        """,
         exp_params,
     ).fetchall()
-    total_expenses = sum(float(r["total"]) for r in expenses)
-    main_expenses = sum(float(r["total"]) for r in expenses if (r["department"] or "main") != "accessories")
+    total_expenses, main_expenses, expenses_by_warehouse, split = expenses_allocated_by_warehouse(
+        conn, exp_clause, exp_params
+    )
+    category_rows: list[dict[str, Any]] = []
+    if warehouse_id:
+        wh_amt = expense_amount_for_warehouse(expenses_by_warehouse, warehouse_id)
+        wh_row = next(
+            (x for x in expenses_by_warehouse if int(x.get("warehouse_id") or 0) == int(warehouse_id)),
+            None,
+        )
+        shared_share = 0.0
+        shared_total = sum(float(r["total"]) for r in expenses if r["warehouse_id"] is None)
+        if wh_row and shared_total > 0:
+            shared_share = float(wh_row.get("shared_amount") or 0) / shared_total
+        main_expenses = 0.0
+        for r in expenses:
+            amt = float(r["total"] or 0)
+            if r["warehouse_id"] is None:
+                part = round(amt * shared_share, 2)
+            elif int(r["warehouse_id"]) == int(warehouse_id):
+                part = amt
+            else:
+                part = 0.0
+            if part <= 0.0001:
+                continue
+            if (r["department"] or "main") != "accessories":
+                main_expenses += part
+            category_rows.append({
+                "category": r["category"],
+                "amount": part,
+                "department": r["department"] or "main",
+            })
+        # merge same category+department
+        merged: dict[tuple[str, str], float] = {}
+        for c in category_rows:
+            key = (c["category"], c["department"])
+            merged[key] = merged.get(key, 0.0) + float(c["amount"])
+        category_rows = [
+            {"category": k[0], "amount": round(v, 2), "department": k[1]}
+            for k, v in merged.items()
+            if v > 0.0001
+        ]
+        total_expenses = wh_amt
+        main_expenses = round(main_expenses, 2)
+        expenses_by_warehouse = [wh_row] if wh_row else []
+    else:
+        merged_cat: dict[tuple[str, str], float] = {}
+        for r in expenses:
+            key = (r["category"], r["department"] or "main")
+            merged_cat[key] = merged_cat.get(key, 0.0) + float(r["total"] or 0)
+        category_rows = [
+            {"category": k[0], "amount": round(v, 2), "department": k[1]}
+            for k, v in merged_cat.items()
+            if v > 0.0001
+        ]
     by_currency: list[dict[str, Any]] = []
     for c in fin.get("by_currency") or []:
         cur = dict(c)
@@ -7358,10 +9586,10 @@ def _report_opiu(conn: sqlite3.Connection, period: str, date_from: str, date_to:
     multi = len(by_currency) > 1
     gross_profit = fin["gross_revenue"] - fin["own_cogs"] - fin["supplier_due"]
     operating_profit = gross_profit - total_expenses if not multi else None
-    split = get_expense_warehouse_split(conn)
-    expenses_by_warehouse = allocate_expense_amount(total_expenses, split)
     return {
-        "period_label": label,
+        "period_label": fin.get("period_label") or label,
+        "warehouse_id": warehouse_id,
+        "warehouse_name": fin.get("warehouse_name") or "",
         "revenue": fin["gross_revenue"],
         "discounts": fin["discounts"],
         "net_revenue": fin["net_revenue"],
@@ -7370,7 +9598,7 @@ def _report_opiu(conn: sqlite3.Connection, period: str, date_from: str, date_to:
         "gross_profit": gross_profit,
         "operating_expenses": total_expenses,
         "main_operating_expenses": main_expenses,
-        "expenses_by_category": [{"category": r["category"], "amount": float(r["total"]), "department": r["department"] or "main"} for r in expenses],
+        "expenses_by_category": category_rows,
         "expenses_by_warehouse": expenses_by_warehouse,
         "expense_allocation": split,
         "operating_profit": operating_profit,
@@ -7381,34 +9609,54 @@ def _report_opiu(conn: sqlite3.Connection, period: str, date_from: str, date_to:
     }
 
 
-def _report_dds(conn: sqlite3.Connection, period: str, date_from: str, date_to: str) -> dict[str, Any]:
+def _report_dds(
+    conn: sqlite3.Connection,
+    period: str,
+    date_from: str,
+    date_to: str,
+    warehouse_id: int | None = None,
+) -> dict[str, Any]:
     clause, params, label = _report_period_clause(period, date_from, date_to, "s.created_at")
+    wh_clause, wh_params = warehouse_sales_filter(warehouse_id)
+    all_params = params + wh_params
     inflows = conn.execute(
         f"""
         SELECT sp.method_code, pm.name, pm.method_type, COALESCE(SUM(sp.amount), 0) AS amount
         FROM sale_payments sp
         JOIN sales s ON s.id = sp.sale_id
         LEFT JOIN payment_methods pm ON pm.code = sp.method_code
-        WHERE s.status = 'completed' {clause}
+        WHERE s.status = 'completed' {clause}{wh_clause}
         GROUP BY sp.method_code
         """,
-        params,
+        all_params,
     ).fetchall()
     total_in = sum(float(r["amount"]) for r in inflows)
     recv_clause = clause.replace("s.created_at", "rp.created_at")
-    recv_params = params
-    recv_in = conn.execute(
-        f"""
-        SELECT COALESCE(SUM(rp.amount), 0)
-        FROM receivable_payments rp
-        WHERE 1=1 {recv_clause.replace('s.', '') if 's.' in recv_clause else recv_clause}
-        """,
-        recv_params if recv_clause else [],
-    ).fetchone()[0]
+    if warehouse_id:
+        recv_in = conn.execute(
+            f"""
+            SELECT COALESCE(SUM(rp.amount), 0)
+            FROM receivable_payments rp
+            JOIN receivables r ON r.id = rp.receivable_id
+            JOIN sales s ON s.id = r.sale_id
+            WHERE s.warehouse_id = ? {recv_clause.replace('s.', 'rp.') if 's.' in recv_clause else recv_clause}
+            """,
+            [warehouse_id] + (params if recv_clause else []),
+        ).fetchone()[0]
+    else:
+        recv_in = conn.execute(
+            f"""
+            SELECT COALESCE(SUM(rp.amount), 0)
+            FROM receivable_payments rp
+            WHERE 1=1 {recv_clause.replace('s.', '') if 's.' in recv_clause else recv_clause}
+            """,
+            params if recv_clause else [],
+        ).fetchone()[0]
     total_in += float(recv_in)
     manual_inflows: list[dict[str, Any]] = []
     manual_total = 0.0
-    if _table_exists(conn, "cash_inflows"):
+    # Manual cash inflows are company-wide — include only for "all warehouses"
+    if not warehouse_id and _table_exists(conn, "cash_inflows"):
         man_clause = clause.replace("s.created_at", "ci.created_at")
         man_rows = conn.execute(
             f"""
@@ -7427,7 +9675,6 @@ def _report_dds(conn: sqlite3.Connection, period: str, date_from: str, date_to: 
         ]
         manual_total = sum(float(r["amount"]) for r in man_rows)
         total_in += manual_total
-    # Merge manual into operating_inflows by method
     inflow_map: dict[str, dict[str, Any]] = {}
     for r in inflows:
         code = r["method_code"]
@@ -7443,38 +9690,109 @@ def _report_dds(conn: sqlite3.Connection, period: str, date_from: str, date_to: 
         else:
             inflow_map[code] = dict(r)
     operating_inflows = list(inflow_map.values())
-    sup_clause = clause.replace("s.created_at", "created_at")
-    supplier_out = conn.execute(
-        f"SELECT COALESCE(SUM(amount), 0) FROM supplier_payments WHERE 1=1 {sup_clause.replace('s.', '') if 's.' in sup_clause else sup_clause}",
-        params if sup_clause else [],
-    ).fetchone()[0]
-    exp_clause = clause.replace("s.created_at", "expense_date")
-    if period != "all" and not date_from and not date_to:
-        exp_clause = " AND expense_date >= ?"
-        exp_params = [period_start(period)[:10]]
+    # Supplier payments / expenses: warehouse view = direct payouts + % of shared
+    if warehouse_id:
+        supplier_out = 0.0
+        exp_clause = clause.replace("s.created_at", "expense_date")
+        if period != "all" and not date_from and not date_to:
+            exp_clause = " AND expense_date >= ?"
+            exp_params = [period_start(period)[:10]]
+        else:
+            exp_params = [p[:10] if isinstance(p, str) and len(p) > 10 else p for p in params] if exp_clause else []
+        _, _, allocated, _ = expenses_allocated_by_warehouse(conn, exp_clause, exp_params)
+        expenses_out = expense_amount_for_warehouse(allocated, warehouse_id)
     else:
-        exp_params = [p[:10] if isinstance(p, str) and len(p) > 10 else p for p in params] if exp_clause else []
-    expenses_out = conn.execute(
-        f"SELECT COALESCE(SUM(amount), 0) FROM expenses WHERE 1=1 {exp_clause}",
-        exp_params,
-    ).fetchone()[0]
+        sup_clause = clause.replace("s.created_at", "created_at")
+        supplier_out = conn.execute(
+            f"SELECT COALESCE(SUM(amount), 0) FROM supplier_payments WHERE 1=1 {sup_clause.replace('s.', '') if 's.' in sup_clause else sup_clause}",
+            params if sup_clause else [],
+        ).fetchone()[0]
+        exp_clause = clause.replace("s.created_at", "expense_date")
+        if period != "all" and not date_from and not date_to:
+            exp_clause = " AND expense_date >= ?"
+            exp_params = [period_start(period)[:10]]
+        else:
+            exp_params = [p[:10] if isinstance(p, str) and len(p) > 10 else p for p in params] if exp_clause else []
+        expenses_out = conn.execute(
+            f"SELECT COALESCE(SUM(amount), 0) FROM expenses WHERE 1=1 {exp_clause}",
+            exp_params,
+        ).fetchone()[0]
     operating_out = float(supplier_out) + float(expenses_out)
     net_operating_cash = total_in - operating_out
     cutoff = _period_cutoff_start(period, date_from, date_to)
-    opening_balance = _cash_net_before(conn, cutoff) if period != "all" or date_from else 0.0
+    if warehouse_id:
+        opening_balance = 0.0
+        if period != "all" or date_from:
+            opening_balance = float(conn.execute(
+                """
+                SELECT COALESCE(SUM(sp.amount), 0)
+                FROM sale_payments sp
+                JOIN sales s ON s.id = sp.sale_id
+                WHERE s.status = 'completed' AND s.warehouse_id = ? AND s.created_at < ?
+                """,
+                (warehouse_id, cutoff),
+            ).fetchone()[0])
+    else:
+        opening_balance = _cash_net_before(conn, cutoff) if period != "all" or date_from else 0.0
     closing_balance = opening_balance + net_operating_cash
+    wh_name = ""
+    if warehouse_id:
+        row = conn.execute("SELECT name FROM warehouses WHERE id = ?", (warehouse_id,)).fetchone()
+        wh_name = row["name"] if row else f"#{warehouse_id}"
+        label = f"{label} · {wh_name}"
+    # Per-currency bags (no USD+TJS mix). Warehouse filter: sale currency only for that wh.
+    cash_bags = _period_cash_by_currency(conn, period if not date_from else "all")
+    by_currency = cash_bags["by_currency"]
+    if warehouse_id or date_from or date_to:
+        # Recompute narrow period/warehouse bags via sale payments only + TJS outs when company-wide
+        bags: dict[str, dict[str, float]] = {}
+        for r in conn.execute(
+            f"""
+            SELECT UPPER(COALESCE(NULLIF(TRIM(s.currency_code), ''), 'TJS')) AS cur,
+                   COALESCE(SUM(sp.amount), 0) AS amt
+            FROM sale_payments sp
+            JOIN sales s ON s.id = sp.sale_id
+            WHERE s.status = 'completed' {clause}{wh_clause}
+            GROUP BY 1
+            """,
+            all_params,
+        ).fetchall():
+            code = (r["cur"] or "TJS").upper()
+            bags.setdefault(code, {"inflow": 0.0, "outflow": 0.0})
+            bags[code]["inflow"] += float(r["amt"] or 0)
+        if not warehouse_id:
+            bags.setdefault("TJS", {"inflow": 0.0, "outflow": 0.0})
+            bags["TJS"]["outflow"] += float(operating_out)
+        by_currency = []
+        for code in sorted(bags.keys(), key=lambda c: (0 if c == "USD" else 1, c)):
+            inn = round(bags[code]["inflow"], 2)
+            out = round(bags[code]["outflow"], 2)
+            by_currency.append({
+                **currency_meta(code),
+                "inflow": inn, "outflow": out, "net": round(inn - out, 2),
+                "plus": inn, "minus": out,
+            })
     return {
         "period_label": label,
+        "warehouse_id": warehouse_id,
+        "warehouse_name": wh_name,
         "operating_inflows": operating_inflows,
         "receivable_collections": float(recv_in),
         "manual_inflows": manual_total,
-        "total_inflows": total_in,
+        "total_inflows": None,
         "supplier_payments": float(supplier_out),
         "operating_expenses": float(expenses_out),
-        "total_outflows": operating_out,
-        "net_operating_cash": net_operating_cash,
-        "opening_balance": opening_balance,
-        "closing_balance": closing_balance,
+        "total_outflows": None,
+        "net_operating_cash": None,
+        "opening_balance": None,
+        "closing_balance": None,
+        "by_currency": by_currency,
+        # Legacy mixed numbers kept only for debugging; UI must not use them
+        "_mixed_total_inflows": total_in,
+        "_mixed_total_outflows": operating_out,
+        "_mixed_net": net_operating_cash,
+        "_mixed_opening": opening_balance,
+        "_mixed_closing": closing_balance,
     }
 
 
@@ -7509,6 +9827,7 @@ def _report_financial_detail(
     pay_lines = conn.execute(
         f"""
         SELECT sp.method_code, pm.name, sp.amount, s.created_at, s.id AS sale_id,
+               UPPER(COALESCE(NULLIF(TRIM(s.currency_code), ''), 'TJS')) AS currency_code,
                COALESCE(w.name, '—') AS warehouse_name
         FROM sale_payments sp
         JOIN sales s ON s.id = sp.sale_id
@@ -7541,63 +9860,68 @@ def _report_financial_detail(
     recv_clause = clause.replace("s.created_at", "rp.created_at")
     recv_rows = conn.execute(
         f"""
-        SELECT rp.*, r.customer_name, r.customer_phone
+        SELECT rp.*, r.customer_name, r.customer_phone,
+               UPPER(COALESCE(NULLIF(TRIM(rp.pay_currency_code), ''), NULLIF(TRIM(s.currency_code), ''), 'TJS')) AS currency_code
         FROM receivable_payments rp
         JOIN receivables r ON r.id = rp.receivable_id
-        WHERE 1=1 {recv_clause.replace('s.', '') if 's.' in recv_clause else recv_clause}
+        LEFT JOIN sales s ON s.id = r.sale_id
+        WHERE 1=1 {recv_clause.replace('s.', 'rp.') if 's.' in recv_clause else recv_clause}
         ORDER BY rp.created_at DESC LIMIT 100
         """,
         params if recv_clause else [],
     ).fetchall()
 
-    split = get_expense_warehouse_split(conn)
     opiu = _report_opiu(conn, period, date_from, date_to)
-    total_expenses = float(opiu.get("operating_expenses") or 0)
+    split = opiu.get("expense_allocation") or get_expense_warehouse_split(conn)
+    expenses_by_wh = opiu.get("expenses_by_warehouse") or []
     wh_breakdown: list[dict[str, Any]] = []
     warehouses = conn.execute("SELECT id, name FROM warehouses ORDER BY name").fetchall()
     for wh in warehouses:
         wid = wh["id"]
-        rev = conn.execute(
+        cur_rows = conn.execute(
             f"""
-            SELECT COALESCE(SUM(s.total), 0)
+            SELECT UPPER(COALESCE(NULLIF(TRIM(s.currency_code), ''), 'TJS')) AS cur,
+                   COALESCE(SUM(s.total), 0) AS revenue,
+                   COALESCE(SUM((SELECT SUM(si.shop_profit) FROM sale_items si WHERE si.sale_id = s.id)), 0) AS profit,
+                   COALESCE(SUM((SELECT SUM(sp.amount) FROM sale_payments sp WHERE sp.sale_id = s.id)), 0) AS inflows
             FROM sales s
             WHERE s.status = 'completed' AND s.warehouse_id = ? {clause}
+            GROUP BY 1
             """,
             [wid, *params],
-        ).fetchone()[0]
-        profit = conn.execute(
-            f"""
-            SELECT COALESCE(SUM(si.shop_profit), 0)
-            FROM sale_items si
-            JOIN sales s ON s.id = si.sale_id
-            WHERE s.status = 'completed' AND s.warehouse_id = ? {clause}
-            """,
-            [wid, *params],
-        ).fetchone()[0]
-        inflow = conn.execute(
-            f"""
-            SELECT COALESCE(SUM(sp.amount), 0)
-            FROM sale_payments sp
-            JOIN sales s ON s.id = sp.sale_id
-            WHERE s.status = 'completed' AND s.warehouse_id = ? {clause}
-            """,
-            [wid, *params],
-        ).fetchone()[0]
-        wh_split = next((s for s in split if s["warehouse_id"] == wid), None)
-        pct = float(wh_split["pct"]) if wh_split else 0.0
-        total_pct = sum(float(s["pct"]) for s in split) or 100.0
-        exp_alloc = total_expenses * pct / total_pct if split else 0.0
+        ).fetchall()
+        by_currency = []
+        rev = profit = inflow = 0.0
+        for r in cur_rows:
+            code = (r["cur"] or "TJS").upper()
+            rv, pf, inf = float(r["revenue"] or 0), float(r["profit"] or 0), float(r["inflows"] or 0)
+            rev += rv
+            profit += pf
+            inflow += inf
+            by_currency.append({
+                **currency_meta(code),
+                "revenue": round(rv, 2),
+                "profit": round(pf, 2),
+                "inflows": round(inf, 2),
+            })
+        exp_row = next((x for x in expenses_by_wh if int(x.get("warehouse_id") or 0) == int(wid)), None)
+        wh_split = next((s for s in split if int(s["warehouse_id"]) == int(wid)), None)
+        pct_rule = float(wh_split["pct"]) if wh_split else 0.0
+        exp_alloc = float(exp_row["amount"]) if exp_row else 0.0
         wh_breakdown.append({
             "warehouse_id": wid,
             "warehouse_name": wh["name"],
-            "revenue": float(rev),
-            "profit": float(profit),
-            "inflows": float(inflow),
-            "expenses_allocated": round(exp_alloc, 2),
-            "pct": pct,
+            "revenue": None,
+            "profit": None,
+            "inflows": None,
+            "by_currency": by_currency,
+            "expenses_allocated": round(exp_alloc, 2),  # TJS: shared% + direct payouts
+            "pct": float(exp_row["pct"]) if exp_row else pct_rule,
+            "pct_rule": pct_rule,
+            "direct_amount": float(exp_row.get("direct_amount") or 0) if exp_row else 0.0,
+            "shared_amount": float(exp_row.get("shared_amount") or 0) if exp_row else 0.0,
         })
 
-    opiu = _report_opiu(conn, period, date_from, date_to)
     dds = _report_dds(conn, period, date_from, date_to)
     return {
         "kind": kind,
@@ -7615,106 +9939,128 @@ def _report_financial_detail(
     }
 
 
-def _report_balance(conn: sqlite3.Connection) -> dict[str, Any]:
-    cash_in = conn.execute(
-        """
-        SELECT COALESCE(SUM(sp.amount), 0) FROM sale_payments sp
-        JOIN sales s ON s.id = sp.sale_id
-        JOIN payment_methods pm ON pm.code = sp.method_code
-        WHERE s.status = 'completed' AND pm.method_type = 'cash'
-        """
-    ).fetchone()[0]
-    cash_out = conn.execute("SELECT COALESCE(SUM(amount), 0) FROM supplier_payments").fetchone()[0]
-    cash_out += conn.execute(
-        "SELECT COALESCE(SUM(amount), 0) FROM expenses WHERE payment_method_code = 'cash' OR payment_method_code IN (SELECT code FROM payment_methods WHERE method_type='cash')"
-    ).fetchone()[0]
-    shift_cash = conn.execute(
-        "SELECT COALESCE(SUM(opening_cash), 0) FROM shifts WHERE status = 'closed'"
-    ).fetchone()[0]
-    cash_balance = float(shift_cash) + float(cash_in) - float(cash_out)
-    inventory = conn.execute(
-        "SELECT COALESCE(SUM(p.purchase_price * ws.quantity), 0) FROM products p JOIN warehouse_stock ws ON ws.product_id = p.id"
-    ).fetchone()[0]
-    supplier_payable = 0.0
-    suppliers = conn.execute(
-        """
-        SELECT p.supplier_name,
-               COALESCE(SUM(CASE WHEN si.ownership_type='consignment' THEN si.supplier_due ELSE 0 END), 0) AS accrued
-        FROM sale_items si
-        JOIN sales s ON s.id = si.sale_id
-        JOIN products p ON p.id = si.product_id
-        WHERE s.status = 'completed' AND p.supplier_name != ''
-        GROUP BY p.supplier_name
-        """
-    ).fetchall()
-    for s in suppliers:
-        paid = conn.execute(
-            "SELECT COALESCE(SUM(amount), 0) FROM supplier_payments WHERE supplier_name = ?", (s["supplier_name"],)
-        ).fetchone()[0]
-        supplier_payable += max(0, float(s["accrued"]) - float(paid))
-    receivables_total = conn.execute(
-        """
-        SELECT COALESCE(SUM(r.amount_due), 0)
+def _report_balance(conn: sqlite3.Connection, warehouse_id: int | None = None) -> dict[str, Any]:
+    """Balance sheet as currency bags — never mix USD+TJS into one float."""
+    cash = _period_cash_by_currency(conn, "all")
+    cash_bags = {
+        (b["code"] or "TJS").upper(): float(b.get("net") or 0)
+        for b in (cash.get("by_currency") or [])
+    }
+    inv_rows = inventory_stock_value_by_currency(conn, "all", warehouse_id)
+    inv_bags = {(r.get("code") or "TJS").upper(): float(r.get("value") or 0) for r in inv_rows}
+    wh_clause, wh_params = warehouse_sales_filter(warehouse_id)
+    recv_rows = conn.execute(
+        f"""
+        SELECT UPPER(COALESCE(NULLIF(TRIM(s.currency_code), ''), 'TJS')) AS cur,
+               COALESCE(SUM(r.amount_due), 0) AS amt
         FROM receivables r
         JOIN sales s ON s.id = r.sale_id
-        WHERE r.status = 'open' AND s.status = 'completed'
-        """
-    ).fetchone()[0]
-    assets = cash_balance + float(inventory) + float(receivables_total)
-    liabilities = supplier_payable
-    equity = assets - liabilities
+        WHERE r.status = 'open' AND s.status = 'completed'{wh_clause}
+        GROUP BY 1
+        """,
+        wh_params,
+    ).fetchall()
+    recv_bags = {(r["cur"] or "TJS").upper(): float(r["amt"] or 0) for r in recv_rows}
+    pay_bags: dict[str, float] = {}
+    if warehouse_id:
+        for r in conn.execute(
+            f"""
+            SELECT UPPER(COALESCE(NULLIF(TRIM(s.currency_code), ''), 'TJS')) AS cur,
+                   COALESCE(SUM(si.supplier_due), 0) AS amt
+            FROM sale_items si
+            JOIN sales s ON s.id = si.sale_id
+            WHERE s.status = 'completed' AND si.ownership_type = 'consignment'{wh_clause}
+            GROUP BY 1
+            """,
+            wh_params,
+        ).fetchall():
+            pay_bags[(r["cur"] or "TJS").upper()] = float(r["amt"] or 0)
+    else:
+        for c in _creditors_list(conn):
+            for b in c.get("by_currency") or []:
+                code = b["code"]
+                pay_bags[code] = pay_bags.get(code, 0.0) + float(b.get("balance") or 0)
+    codes = sorted(set(cash_bags) | set(inv_bags) | set(recv_bags) | set(pay_bags) | {"USD", "TJS"},
+                   key=lambda c: (0 if c == "USD" else 1, c))
+    by_currency = []
+    for code in codes:
+        cash_v = round(cash_bags.get(code, 0.0), 2)
+        inv_v = round(inv_bags.get(code, 0.0), 2)
+        recv_v = round(recv_bags.get(code, 0.0), 2)
+        pay_v = round(pay_bags.get(code, 0.0), 2)
+        assets = round(cash_v + inv_v + recv_v, 2)
+        equity = round(assets - pay_v, 2)
+        by_currency.append({
+            **currency_meta(code),
+            "cash": cash_v,
+            "inventory": inv_v,
+            "receivables": recv_v,
+            "supplier_payables": pay_v,
+            "assets": assets,
+            "equity": equity,
+        })
+    wh_name = ""
+    if warehouse_id:
+        row = conn.execute("SELECT name FROM warehouses WHERE id = ?", (warehouse_id,)).fetchone()
+        wh_name = row["name"] if row else f"#{warehouse_id}"
     return {
-        "assets": {
-            "cash": cash_balance,
-            "inventory": float(inventory),
-            "receivables": float(receivables_total),
-            "total": assets,
-        },
-        "liabilities": {
-            "supplier_payables": supplier_payable,
-            "total": liabilities,
-        },
-        "equity": equity,
+        "warehouse_id": warehouse_id,
+        "warehouse_name": wh_name,
+        "by_currency": by_currency,
+        "assets": {"cash": None, "inventory": None, "receivables": None, "total": None},
+        "liabilities": {"supplier_payables": None, "total": None},
+        "equity": None,
     }
 
 
 def _report_by_cashier(
-    conn: sqlite3.Connection, period: str, date_from: str, date_to: str
+    conn: sqlite3.Connection,
+    period: str,
+    date_from: str,
+    date_to: str,
+    warehouse_id: int | None = None,
 ) -> dict[str, Any]:
     clause, params, label = _report_period_clause(period, date_from, date_to, "s.created_at")
+    wh_clause, wh_params = warehouse_sales_filter(warehouse_id)
+    all_params = params + wh_params
     rows = conn.execute(
         f"""
         SELECT
             COALESCE(NULLIF(s.user_name, ''), sh.user_name, '—') AS cashier_name,
             COALESCE(s.user_id, sh.user_id, 0) AS user_id,
+            UPPER(COALESCE(NULLIF(TRIM(s.currency_code), ''), 'TJS')) AS currency_code,
             COUNT(*) AS sales_count,
             COALESCE(SUM(s.total), 0) AS revenue
         FROM sales s
         LEFT JOIN shifts sh ON sh.id = s.shift_id
-        WHERE s.status = 'completed' {clause}
+        WHERE s.status = 'completed' {clause}{wh_clause}
         GROUP BY COALESCE(s.user_id, sh.user_id),
-                 COALESCE(NULLIF(s.user_name, ''), sh.user_name, '—')
+                 COALESCE(NULLIF(s.user_name, ''), sh.user_name, '—'),
+                 UPPER(COALESCE(NULLIF(TRIM(s.currency_code), ''), 'TJS'))
         ORDER BY revenue DESC
         """,
-        params,
+        all_params,
     ).fetchall()
     profit_rows = conn.execute(
         f"""
         SELECT COALESCE(s.user_id, sh.user_id, 0) AS user_id,
+               UPPER(COALESCE(NULLIF(TRIM(s.currency_code), ''), 'TJS')) AS currency_code,
                COALESCE(SUM(si.shop_profit), 0) AS profit
         FROM sales s
         JOIN sale_items si ON si.sale_id = s.id
         LEFT JOIN shifts sh ON sh.id = s.shift_id
-        WHERE s.status = 'completed' {clause}
-        GROUP BY COALESCE(s.user_id, sh.user_id, 0)
+        WHERE s.status = 'completed' {clause}{wh_clause}
+        GROUP BY COALESCE(s.user_id, sh.user_id, 0),
+                 UPPER(COALESCE(NULLIF(TRIM(s.currency_code), ''), 'TJS'))
         """,
-        params,
+        all_params,
     ).fetchall()
-    profit_map = {r["user_id"]: float(r["profit"]) for r in profit_rows}
+    profit_map = {(r["user_id"], (r["currency_code"] or "TJS").upper()): float(r["profit"]) for r in profit_rows}
     pay_rows = conn.execute(
         f"""
         SELECT
             COALESCE(s.user_id, sh.user_id, 0) AS user_id,
+            UPPER(COALESCE(NULLIF(TRIM(s.currency_code), ''), 'TJS')) AS currency_code,
             sp.method_code,
             pm.name,
             COALESCE(SUM(sp.amount), 0) AS amount
@@ -7722,31 +10068,42 @@ def _report_by_cashier(
         JOIN sales s ON s.id = sp.sale_id
         LEFT JOIN shifts sh ON sh.id = s.shift_id
         LEFT JOIN payment_methods pm ON pm.code = sp.method_code
-        WHERE s.status = 'completed' {clause}
-        GROUP BY COALESCE(s.user_id, sh.user_id, 0), sp.method_code
+        WHERE s.status = 'completed' {clause}{wh_clause}
+        GROUP BY COALESCE(s.user_id, sh.user_id, 0),
+                 UPPER(COALESCE(NULLIF(TRIM(s.currency_code), ''), 'TJS')),
+                 sp.method_code
         ORDER BY amount DESC
         """,
-        params,
+        all_params,
     ).fetchall()
-    pay_by_user: dict[int, list[dict[str, Any]]] = {}
+    pay_by_user: dict[tuple[Any, str], list[dict[str, Any]]] = {}
     for r in pay_rows:
-        pay_by_user.setdefault(r["user_id"], []).append({
+        key = (r["user_id"], (r["currency_code"] or "TJS").upper())
+        pay_by_user.setdefault(key, []).append({
             "method_code": r["method_code"],
             "name": r["name"] or r["method_code"],
             "amount": float(r["amount"]),
+            "currency_code": (r["currency_code"] or "TJS").upper(),
         })
     cashiers = []
     for r in rows:
         uid = r["user_id"] or 0
+        cur = (r["currency_code"] or "TJS").upper()
         cashiers.append({
             "user_id": uid,
             "cashier_name": r["cashier_name"],
+            "currency_code": cur,
             "sales_count": r["sales_count"],
             "revenue": float(r["revenue"]),
-            "profit": profit_map.get(uid, 0.0),
-            "by_payment": pay_by_user.get(uid, []),
+            "profit": profit_map.get((uid, cur), 0.0),
+            "by_payment": pay_by_user.get((uid, cur), []),
         })
-    return {"period_label": label, "cashiers": cashiers}
+    wh_name = ""
+    if warehouse_id:
+        row = conn.execute("SELECT name FROM warehouses WHERE id = ?", (warehouse_id,)).fetchone()
+        wh_name = row["name"] if row else f"#{warehouse_id}"
+        label = f"{label} · {wh_name}"
+    return {"period_label": label, "warehouse_id": warehouse_id, "warehouse_name": wh_name, "cashiers": cashiers}
 
 
 @app.get("/api/reports/opiu")
@@ -7754,11 +10111,12 @@ async def report_opiu(
     period: str = Query(default="month", pattern="^(day|week|month|quarter|year|all)$"),
     date_from: str = "",
     date_to: str = "",
+    warehouse_id: int | None = None,
     x_pin: str | None = Header(default=None, alias="X-Pin"),
 ):
     check_pin(x_pin, min_role="owner")
     with db() as conn:
-        return _report_opiu(conn, period, date_from, date_to)
+        return _report_opiu(conn, period, date_from, date_to, warehouse_id)
 
 
 @app.get("/api/reports/dds")
@@ -7766,11 +10124,12 @@ async def report_dds(
     period: str = Query(default="month", pattern="^(day|week|month|quarter|year|all)$"),
     date_from: str = "",
     date_to: str = "",
+    warehouse_id: int | None = None,
     x_pin: str | None = Header(default=None, alias="X-Pin"),
 ):
     check_pin(x_pin, min_role="owner")
     with db() as conn:
-        return _report_dds(conn, period, date_from, date_to)
+        return _report_dds(conn, period, date_from, date_to, warehouse_id)
 
 
 @app.get("/api/reports/detail")
@@ -7788,10 +10147,13 @@ async def report_detail(
 
 
 @app.get("/api/reports/balance")
-async def report_balance(x_pin: str | None = Header(default=None, alias="X-Pin")):
+async def report_balance(
+    warehouse_id: int | None = None,
+    x_pin: str | None = Header(default=None, alias="X-Pin"),
+):
     check_pin(x_pin, min_role="owner")
     with db() as conn:
-        return _report_balance(conn)
+        return _report_balance(conn, warehouse_id)
 
 
 @app.get("/api/reports/cashiers")
@@ -7799,11 +10161,12 @@ async def report_cashiers(
     period: str = Query(default="month", pattern="^(day|week|month|quarter|year|all)$"),
     date_from: str = "",
     date_to: str = "",
+    warehouse_id: int | None = None,
     x_pin: str | None = Header(default=None, alias="X-Pin"),
 ):
     check_pin(x_pin, min_role="owner")
     with db() as conn:
-        return _report_by_cashier(conn, period, date_from, date_to)
+        return _report_by_cashier(conn, period, date_from, date_to, warehouse_id)
 
 
 def _finance_by_currency(
@@ -7812,7 +10175,9 @@ def _finance_by_currency(
     params: list[Any],
     own_clause: str,
     own_params: list[Any],
+    warehouse_id: int | None = None,
 ) -> list[dict[str, Any]]:
+    wh_clause, wh_params = warehouse_sales_filter(warehouse_id)
     rows = conn.execute(
         f"""
         SELECT COALESCE(NULLIF(TRIM(s.currency_code), ''), 'TJS') AS currency_code,
@@ -7824,11 +10189,11 @@ def _finance_by_currency(
                COALESCE(SUM(si.quantity), 0) AS items_sold
         FROM sale_items si
         JOIN sales s ON s.id = si.sale_id
-        WHERE s.status = 'completed' {since_clause} {own_clause}
+        WHERE s.status = 'completed' {since_clause} {own_clause}{wh_clause}
         GROUP BY COALESCE(NULLIF(TRIM(s.currency_code), ''), 'TJS')
         ORDER BY currency_code
         """,
-        params + own_params,
+        params + own_params + wh_params,
     ).fetchall()
     result: list[dict[str, Any]] = []
     for r in rows:
@@ -7852,7 +10217,14 @@ def _finance_by_currency(
     return result
 
 
-def _finance_report(conn: sqlite3.Connection, period: str, scope: str, date_from: str, date_to: str) -> dict[str, Any]:
+def _finance_report(
+    conn: sqlite3.Connection,
+    period: str,
+    scope: str,
+    date_from: str,
+    date_to: str,
+    warehouse_id: int | None = None,
+) -> dict[str, Any]:
     if date_from or date_to:
         since_clause, params = date_filter_sql(date_from, date_to)
         period_label = f"{date_from or '…'} — {date_to or '…'}"
@@ -7865,13 +10237,15 @@ def _finance_report(conn: sqlite3.Connection, period: str, scope: str, date_from
         period_label = {"day": "Сегодня", "week": "Неделя", "month": "Месяц", "quarter": "Квартал", "year": "Год"}.get(period, period)
 
     own_clause, own_params = ownership_filter_sql(scope)
+    wh_clause, wh_params = warehouse_sales_filter(warehouse_id)
 
     base = f"""
         FROM sale_items si
         JOIN sales s ON s.id = si.sale_id
-        WHERE s.status = 'completed' {since_clause} {own_clause}
+        WHERE s.status = 'completed' {since_clause} {own_clause}{wh_clause}
     """
-    all_params = params + own_params
+    all_params = params + own_params + wh_params
+    sale_params = params + wh_params
 
     agg = conn.execute(
         f"""
@@ -7890,9 +10264,9 @@ def _finance_report(conn: sqlite3.Connection, period: str, scope: str, date_from
         f"""
         SELECT COALESCE(SUM(s.discount), 0)
         FROM sales s
-        WHERE s.status = 'completed' {since_clause.replace('s.created_at', 'created_at') if since_clause else ''}
+        WHERE s.status = 'completed' {since_clause}{wh_clause}
         """,
-        params,
+        sale_params,
     ).fetchone()[0] if scope == "all" else 0
 
     payment_rows = conn.execute(
@@ -7917,19 +10291,19 @@ def _finance_report(conn: sqlite3.Connection, period: str, scope: str, date_from
             ), 0) AS total_card,
             COALESCE(SUM(s.trade_in_value), 0) AS total_trade_in
         FROM sales s
-        WHERE s.status = 'completed' {since_clause.replace('s.created_at', 's.created_at') if since_clause else ''}
+        WHERE s.status = 'completed' {since_clause}{wh_clause}
         """,
-        params,
+        sale_params,
     ).fetchone()
 
     own_revenue = conn.execute(
         f"SELECT COALESCE(SUM(si.subtotal), 0) {base} AND si.ownership_type = 'own'",
-        params + (own_params if scope != "consignment" else []) if scope != "own" else all_params,
+        params + (own_params if scope != "consignment" else []) + wh_params if scope != "own" else all_params,
     ).fetchone()[0] if scope == "all" else (float(agg["gross_revenue"]) if scope == "own" else 0)
 
     cons_revenue = conn.execute(
         f"SELECT COALESCE(SUM(si.subtotal), 0) {base} AND si.ownership_type = 'consignment'",
-        all_params if scope != "own" else params,
+        all_params if scope != "own" else params + wh_params,
     ).fetchone()[0] if scope in ("all", "consignment") else 0
 
     revenue = float(agg["gross_revenue"])
@@ -7937,10 +10311,18 @@ def _finance_report(conn: sqlite3.Connection, period: str, scope: str, date_from
     own_cogs = float(agg["own_cogs"])
     supplier_due = float(agg["supplier_due"])
 
+    wh_name = ""
+    if warehouse_id:
+        row = conn.execute("SELECT name FROM warehouses WHERE id = ?", (warehouse_id,)).fetchone()
+        wh_name = row["name"] if row else f"#{warehouse_id}"
+        period_label = f"{period_label} · {wh_name}"
+
     return {
         "scope": scope,
         "period": period,
         "period_label": period_label,
+        "warehouse_id": warehouse_id,
+        "warehouse_name": wh_name,
         "sales_count": agg["sales_count"],
         "items_sold": agg["items_sold"],
         "gross_revenue": revenue,
@@ -7959,7 +10341,9 @@ def _finance_report(conn: sqlite3.Connection, period: str, scope: str, date_from
             {"method": r["payment_method"], "count": r["cnt"], "amount": float(r["amount"])}
             for r in payment_rows
         ],
-        "by_currency": _finance_by_currency(conn, since_clause, params, own_clause, own_params),
+        "by_currency": _finance_by_currency(
+            conn, since_clause, params, own_clause, own_params, warehouse_id
+        ),
     }
 
 
@@ -7968,6 +10352,7 @@ async def trade_ins_report(
     period: str = Query(default="month", pattern="^(day|week|month|quarter|year|all)$"),
     date_from: str = "",
     date_to: str = "",
+    warehouse_id: int | None = None,
     x_pin: str | None = Header(default=None, alias="X-Pin"),
 ):
     check_pin(x_pin)
@@ -7986,6 +10371,14 @@ async def trade_ins_report(
                 "quarter": "Квартал", "year": "Год",
             }.get(period, period)
 
+        wh_clause = ""
+        if warehouse_id:
+            wh_clause = " AND t.given_warehouse_id = ?"
+            params = list(params) + [warehouse_id]
+            row = conn.execute("SELECT name FROM warehouses WHERE id = ?", (warehouse_id,)).fetchone()
+            if row:
+                period_label = f"{period_label} · {row['name']}"
+
         agg = conn.execute(
             f"""
             SELECT COUNT(*) AS deals_count,
@@ -7995,7 +10388,7 @@ async def trade_ins_report(
                    COALESCE(SUM(t.cash_amount + t.card_amount), 0) AS total_money,
                    COALESCE(SUM(t.cash_amount + t.card_amount + t.received_value), 0) AS total_deal_value
             FROM trade_ins t
-            WHERE 1=1 {since_clause}
+            WHERE 1=1 {since_clause}{wh_clause}
             """,
             params,
         ).fetchone()
@@ -8012,7 +10405,7 @@ async def trade_ins_report(
             LEFT JOIN products rp ON rp.id = t.received_product_id
             LEFT JOIN warehouses gw ON gw.id = t.given_warehouse_id
             LEFT JOIN warehouses rw ON rw.id = t.received_warehouse_id
-            WHERE 1=1 {since_clause}
+            WHERE 1=1 {since_clause}{wh_clause}
             ORDER BY t.created_at DESC
             LIMIT 500
             """,
@@ -8027,7 +10420,7 @@ async def trade_ins_report(
                    COALESCE(SUM(t.received_value), 0) AS trade_credit
             FROM trade_ins t
             JOIN warehouses gw ON gw.id = t.given_warehouse_id
-            WHERE 1=1 {since_clause}
+            WHERE 1=1 {since_clause}{wh_clause}
             GROUP BY gw.name
             ORDER BY deals DESC
             """,
@@ -8054,11 +10447,12 @@ async def finance_report(
     scope: ReportScope = "all",
     date_from: str = "",
     date_to: str = "",
+    warehouse_id: int | None = None,
     x_pin: str | None = Header(default=None, alias="X-Pin"),
 ):
     check_pin(x_pin, min_role="owner")
     with db() as conn:
-        report = _finance_report(conn, period, scope, date_from, date_to)
+        report = _finance_report(conn, period, scope, date_from, date_to, warehouse_id)
         if scope in ("all", "consignment"):
             if date_from or date_to:
                 sup_since, sup_params = date_filter_sql(date_from, date_to)
@@ -8067,6 +10461,7 @@ async def finance_report(
             else:
                 sup_since = " AND s.created_at >= ?"
                 sup_params = [period_start(period)]
+            wh_clause, wh_params = warehouse_sales_filter(warehouse_id)
             suppliers = conn.execute(
                 f"""
                 SELECT si.supplier_name,
@@ -8076,16 +10471,26 @@ async def finance_report(
                        SUM(si.shop_profit) AS profit
                 FROM sale_items si
                 JOIN sales s ON s.id = si.sale_id
-                WHERE s.status = 'completed' AND si.ownership_type = 'consignment' {sup_since}
+                WHERE s.status = 'completed' AND si.ownership_type = 'consignment' {sup_since}{wh_clause}
                 GROUP BY si.supplier_name
                 ORDER BY revenue DESC
                 """,
-                sup_params,
+                list(sup_params) + wh_params,
             ).fetchall()
             report["by_supplier"] = [row_to_dict(r) for r in suppliers]
         else:
             report["by_supplier"] = []
+        if scope == "all" and not warehouse_id:
+            report["funds"] = funds_snapshot(conn)
     return report
+
+
+@app.get("/api/reports/funds")
+async def reports_funds(x_pin: str | None = Header(default=None, alias="X-Pin")):
+    """Снимок: остатки по складам + наличка/кошелёк в $ и смн."""
+    check_pin(x_pin, min_role="owner")
+    with db() as conn:
+        return funds_snapshot(conn)
 
 
 @app.get("/api/reports/combined")
@@ -8093,14 +10498,18 @@ async def combined_report(
     period: str = Query(default="month", pattern="^(day|week|month|quarter|year|all)$"),
     date_from: str = "",
     date_to: str = "",
+    warehouse_id: int | None = None,
     x_pin: str | None = Header(default=None, alias="X-Pin"),
 ):
     check_pin(x_pin, min_role="owner")
     with db() as conn:
+        all_rep = _finance_report(conn, period, "all", date_from, date_to, warehouse_id)
+        if not warehouse_id:
+            all_rep["funds"] = funds_snapshot(conn)
         return {
-            "all": _finance_report(conn, period, "all", date_from, date_to),
-            "own": _finance_report(conn, period, "own", date_from, date_to),
-            "consignment": _finance_report(conn, period, "consignment", date_from, date_to),
+            "all": all_rep,
+            "own": _finance_report(conn, period, "own", date_from, date_to, warehouse_id),
+            "consignment": _finance_report(conn, period, "consignment", date_from, date_to, warehouse_id),
         }
 
 
@@ -8120,21 +10529,7 @@ async def analytics_summary(
             low_sql += " AND ownership_type = ?"
             params.append(scope)
         low_stock = conn.execute(low_sql, params).fetchone()[0]
-        stock_sql = """
-            SELECT COALESCE(w.currency_code, 'TJS') AS currency_code,
-                   COALESCE(SUM(p.purchase_price * ws.quantity), 0) AS val
-            FROM products p
-            JOIN warehouse_stock ws ON ws.product_id = p.id
-            JOIN warehouses w ON w.id = ws.warehouse_id
-            WHERE ws.quantity > 0
-        """
-        if scope != "all":
-            stock_sql += " AND p.ownership_type = ?"
-        stock_sql += " GROUP BY COALESCE(w.currency_code, 'TJS')"
-        stock_by_cur = []
-        for row in conn.execute(stock_sql, params).fetchall():
-            code = (row["currency_code"] or "TJS").strip().upper() or "TJS"
-            stock_by_cur.append({**currency_meta(code), "value": float(row["val"])})
+        stock_by_cur = inventory_stock_value_by_currency(conn, scope)
         stock_value = sum(s["value"] for s in stock_by_cur)
         products_count = conn.execute(
             f"SELECT COUNT(*) FROM products {'WHERE ownership_type = ?' if scope != 'all' else ''}",
@@ -8208,14 +10603,15 @@ async def analytics_daily(
         rows = conn.execute(
             f"""
             SELECT DATE(s.created_at) AS day,
+                   UPPER(COALESCE(NULLIF(TRIM(s.currency_code), ''), 'TJS')) AS currency_code,
                    COUNT(DISTINCT s.id) AS sales,
                    COALESCE(SUM(si.subtotal), 0) AS revenue,
                    COALESCE(SUM(si.shop_profit), 0) AS profit
             FROM sale_items si
             JOIN sales s ON s.id = si.sale_id
             WHERE s.status = 'completed' AND DATE(s.created_at) >= ? {own_clause}
-            GROUP BY DATE(s.created_at)
-            ORDER BY day
+            GROUP BY DATE(s.created_at), UPPER(COALESCE(NULLIF(TRIM(s.currency_code), ''), 'TJS'))
+            ORDER BY day, currency_code
             """,
             [since, *own_params],
         ).fetchall()
@@ -8230,25 +10626,15 @@ async def dashboard(x_pin: str | None = Header(default=None, alias="X-Pin")):
         month = _finance_report(conn, "month", "all", "", "")
         own_month = _finance_report(conn, "month", "own", "", "")
         cons_month = _finance_report(conn, "month", "consignment", "", "")
-        suppliers = conn.execute(
-            """
-            SELECT supplier_name,
-                   COALESCE(SUM(supplier_due), 0) AS accrued
-            FROM sale_items si
-            JOIN sales s ON s.id = si.sale_id
-            WHERE si.ownership_type = 'consignment' AND s.status = 'completed'
-            GROUP BY supplier_name
-            """
-        ).fetchall()
-        balances = []
-        for s in suppliers:
-            paid = conn.execute(
-                "SELECT COALESCE(SUM(amount), 0) FROM supplier_payments WHERE supplier_name = ?",
-                (s["supplier_name"],),
-            ).fetchone()[0]
-            bal = float(s["accrued"]) - float(paid)
-            if bal > 0:
-                balances.append({"supplier_name": s["supplier_name"], "balance": bal})
+        balances = [
+            {
+                "supplier_name": c["supplier_name"],
+                "balance": None,
+                "by_currency": [b for b in (c.get("by_currency") or []) if float(b.get("balance") or 0) > 0.01],
+            }
+            for c in _creditors_list(conn)
+            if any(float(b.get("balance") or 0) > 0.01 for b in (c.get("by_currency") or []))
+        ]
         low_stock = conn.execute("SELECT COUNT(*) FROM products WHERE stock <= min_stock").fetchone()[0]
         expire_reservations(conn)
         stale_cutoff = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d %H:%M:%S")
@@ -8383,6 +10769,7 @@ async def dashboard_kpi_detail(
             f"""
             SELECT COALESCE(w.name, '—') AS warehouse_name,
                    s.warehouse_id,
+                   UPPER(COALESCE(NULLIF(TRIM(s.currency_code), ''), 'TJS')) AS currency_code,
                    COUNT(DISTINCT s.id) AS sales_count,
                    COALESCE(SUM(si.subtotal), 0) AS revenue,
                    COALESCE(SUM(si.shop_profit), 0) AS profit
@@ -8390,7 +10777,7 @@ async def dashboard_kpi_detail(
             JOIN sales s ON s.id = si.sale_id
             LEFT JOIN warehouses w ON w.id = s.warehouse_id
             WHERE s.status = 'completed' {since_clause} {wh_filter}
-            GROUP BY s.warehouse_id
+            GROUP BY s.warehouse_id, UPPER(COALESCE(NULLIF(TRIM(s.currency_code), ''), 'TJS'))
             ORDER BY revenue DESC
             """,
             since_params + wh_params,
@@ -8400,6 +10787,7 @@ async def dashboard_kpi_detail(
             f"""
             SELECT s.id AS sale_id, s.created_at, s.user_name AS cashier,
                    COALESCE(w.name, '—') AS warehouse_name,
+                   UPPER(COALESCE(NULLIF(TRIM(s.currency_code), ''), 'TJS')) AS currency_code,
                    si.product_name, si.quantity, si.subtotal, si.shop_profit,
                    si.ownership_type
             FROM sale_items si
@@ -8412,16 +10800,24 @@ async def dashboard_kpi_detail(
             since_params + wh_params,
         ).fetchall()
 
-        total_revenue = sum(float(r["revenue"]) for r in by_wh)
-        total_profit = sum(float(r["profit"]) for r in by_wh)
-        total = total_profit if metric == "profit_today" else total_revenue
+        bags: dict[str, dict[str, float]] = {}
+        for r in by_wh:
+            code = (r["currency_code"] or "TJS").upper()
+            bags.setdefault(code, {"gross_revenue": 0.0, "shop_profit": 0.0})
+            bags[code]["gross_revenue"] += float(r["revenue"] or 0)
+            bags[code]["shop_profit"] += float(r["profit"] or 0)
+        by_currency = [
+            {**currency_meta(code), **{k: round(v, 2) for k, v in vals.items()}}
+            for code, vals in sorted(bags.items(), key=lambda x: (0 if x[0] == "USD" else 1, x[0]))
+        ]
 
         return {
             "metric": metric,
             "title": title,
-            "total": total,
-            "total_revenue": total_revenue,
-            "total_profit": total_profit,
+            "total": None,
+            "total_revenue": None,
+            "total_profit": None,
+            "by_currency": by_currency,
             "by_warehouse": [row_to_dict(r) for r in by_wh],
             "items": [row_to_dict(r) for r in lines],
         }
@@ -8433,7 +10829,9 @@ class StocktakeStartIn(BaseModel):
 
 
 class StocktakeScanIn(BaseModel):
-    q: str = Field(min_length=1)
+    q: str = ""
+    unit_id: int | None = None
+    product_id: int | None = None
 
 
 class StocktakeCountIn(BaseModel):
@@ -8444,7 +10842,8 @@ class StocktakeCountIn(BaseModel):
 def _stocktake_expected(conn: sqlite3.Connection, warehouse_id: int) -> dict[str, Any]:
     products = conn.execute(
         """
-        SELECT p.id, p.name, p.model, p.color, p.category, p.track_units, ws.quantity AS qty
+        SELECT p.id, p.name, p.model, p.color, p.category, p.track_units, p.barcode,
+               ws.quantity AS qty
         FROM warehouse_stock ws
         JOIN products p ON p.id = ws.product_id
         WHERE ws.warehouse_id = ? AND ws.quantity > 0
@@ -8454,11 +10853,12 @@ def _stocktake_expected(conn: sqlite3.Connection, warehouse_id: int) -> dict[str
     ).fetchall()
     units = conn.execute(
         """
-        SELECT u.id, u.product_id, u.imei, u.serial, p.color, p.name AS product_name
+        SELECT u.id, u.product_id, u.imei, u.serial, p.color, p.name AS product_name,
+               p.model, p.barcode, p.track_units
         FROM product_units u
         JOIN products p ON p.id = u.product_id
         WHERE u.warehouse_id = ? AND u.status = 'in_stock'
-        ORDER BY p.name, u.imei
+        ORDER BY p.name, u.imei, u.serial
         """,
         (warehouse_id,),
     ).fetchall()
@@ -8503,6 +10903,10 @@ def _stocktake_summary(conn: sqlite3.Connection, session_id: int) -> dict[str, A
                 "track_units": int(p["track_units"] or 0),
             })
     missing_units = [u for u in expected["units"] if u["id"] not in scanned_unit_ids]
+    unit_expected = len(expected["units"])
+    acc_expected = sum(
+        int(p["qty"]) for p in expected["products"] if not int(p.get("track_units") or 0)
+    )
     return {
         "session": row_to_dict(session),
         "lines": [row_to_dict(r) for r in lines],
@@ -8510,12 +10914,14 @@ def _stocktake_summary(conn: sqlite3.Connection, session_id: int) -> dict[str, A
         "variances": variances,
         "missing_units": missing_units,
         "counted_total": sum(counted_by_product.values()),
-        "expected_total": sum(int(p["qty"]) for p in expected["products"]),
+        "expected_total": unit_expected + acc_expected,
     }
 
 
 def _resolve_stocktake_scan(conn: sqlite3.Connection, warehouse_id: int, q: str) -> dict[str, Any]:
     q = normalize_search_q(q)
+    if not q:
+        raise HTTPException(status_code=400, detail="Введите IMEI, серийник, штрихкод или название")
     uclause, uparams = unit_search_sql(q)
     units = conn.execute(
         f"""
@@ -8524,12 +10930,30 @@ def _resolve_stocktake_scan(conn: sqlite3.Connection, warehouse_id: int, q: str)
         JOIN products p ON p.id = u.product_id
         WHERE u.warehouse_id = ? AND u.status = 'in_stock'
         {uclause}
-        LIMIT 5
+        LIMIT 8
         """,
         [warehouse_id, *uparams],
     ).fetchall()
+    if not units:
+        # Name / model search → units of matching products on this warehouse
+        clause, params = product_search_sql(q)
+        units = conn.execute(
+            f"""
+            SELECT u.*, p.name AS product_name, p.color
+            FROM product_units u
+            JOIN products p ON p.id = u.product_id
+            WHERE u.warehouse_id = ? AND u.status = 'in_stock'
+            {clause}
+            ORDER BY p.name, u.imei
+            LIMIT 8
+            """,
+            [warehouse_id, *params],
+        ).fetchall()
     if len(units) > 1:
-        raise HTTPException(status_code=400, detail="Найдено несколько устройств — введите больше цифр IMEI")
+        raise HTTPException(
+            status_code=400,
+            detail="Найдено несколько устройств — выберите из списка или введите больше цифр IMEI",
+        )
     if len(units) == 1:
         unit = units[0]
         return {
@@ -8546,13 +10970,32 @@ def _resolve_stocktake_scan(conn: sqlite3.Connection, warehouse_id: int, q: str)
     if not product:
         raise HTTPException(status_code=404, detail="Товар или IMEI не найден")
     if int(product["track_units"] or 0):
-        raise HTTPException(status_code=400, detail="Для телефона отсканируйте IMEI (достаточно последних 5 цифр)")
+        raise HTTPException(status_code=400, detail="Для телефона выберите IMEI из списка или отсканируйте")
     stock = get_warehouse_stock(conn, warehouse_id, product["id"])
     if stock <= 0:
         raise HTTPException(status_code=400, detail="Товар не числится на этом складе")
     return {
         "product_id": product["id"], "unit_id": None, "quantity": 1,
         "imei": "", "serial": "", "color": product["color"] or "",
+    }
+
+
+def _stocktake_hit_from_unit(conn: sqlite3.Connection, warehouse_id: int, unit_id: int) -> dict[str, Any]:
+    unit = conn.execute(
+        """
+        SELECT u.*, p.name AS product_name, p.color
+        FROM product_units u
+        JOIN products p ON p.id = u.product_id
+        WHERE u.id = ? AND u.warehouse_id = ? AND u.status = 'in_stock'
+        """,
+        (unit_id, warehouse_id),
+    ).fetchone()
+    if not unit:
+        raise HTTPException(status_code=404, detail="Устройство не найдено на этом складе")
+    return {
+        "product_id": unit["product_id"], "unit_id": unit["id"], "quantity": 1,
+        "imei": unit["imei"] or "", "serial": unit["serial"] or "",
+        "color": unit["color"] or "",
     }
 
 
@@ -8599,7 +11042,20 @@ async def stocktake_scan(session_id: int, body: StocktakeScanIn, x_pin: str | No
         ).fetchone()
         if not session:
             raise HTTPException(status_code=404, detail="Открытая инвентаризация не найдена")
-        hit = _resolve_stocktake_scan(conn, session["warehouse_id"], body.q)
+        if body.unit_id:
+            hit = _stocktake_hit_from_unit(conn, session["warehouse_id"], body.unit_id)
+        elif body.product_id and not (body.q or "").strip():
+            product = conn.execute("SELECT * FROM products WHERE id = ?", (body.product_id,)).fetchone()
+            if not product:
+                raise HTTPException(status_code=404, detail="Товар не найден")
+            if int(product["track_units"] or 0):
+                raise HTTPException(status_code=400, detail="Для телефона выберите конкретный IMEI")
+            hit = {
+                "product_id": product["id"], "unit_id": None, "quantity": 1,
+                "imei": "", "serial": "", "color": product["color"] or "",
+            }
+        else:
+            hit = _resolve_stocktake_scan(conn, session["warehouse_id"], body.q)
         if hit.get("unit_id"):
             dup = conn.execute(
                 "SELECT id FROM stocktake_lines WHERE session_id = ? AND unit_id = ?",
