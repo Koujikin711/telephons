@@ -562,6 +562,8 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     _add_column(conn, "expenses", "kind", "TEXT NOT NULL DEFAULT 'expense'")
     _add_column(conn, "sales", "affects_cash", "INTEGER NOT NULL DEFAULT 1")
     _add_column(conn, "expenses", "affects_cash", "INTEGER NOT NULL DEFAULT 1")
+    _add_column(conn, "sale_payments", "pay_currency_code", "TEXT NOT NULL DEFAULT ''")
+    _add_column(conn, "sale_payments", "pay_amount", "REAL")
     # Mark Excel-imported rows for display when created_by is empty
     if _table_exists(conn, "expenses"):
         conn.execute(
@@ -572,18 +574,7 @@ def migrate_db(conn: sqlite3.Connection) -> None:
               AND description = 'Excel импорт ОПиУ'
             """
         )
-    # Excel / Z-import must not inflate POS cash wallets by default
-    if _table_exists(conn, "sales"):
-        conn.execute(
-            """
-            UPDATE sales SET affects_cash = 0
-            WHERE COALESCE(affects_cash, 1) = 1
-              AND (
-                user_name LIKE 'Z-импорт%'
-                OR COALESCE(notes, '') LIKE 'Z-импорт%'
-              )
-            """
-        )
+    # Excel ОПиУ expenses stay out of cash (they were paper totals, not till moves)
     if _table_exists(conn, "expenses"):
         conn.execute(
             """
@@ -593,6 +584,19 @@ def migrate_db(conn: sqlite3.Connection) -> None:
                 description = 'Excel импорт ОПиУ'
                 OR created_by = 'Excel импорт'
               )
+            """
+        )
+    # Backfill till currency on sale payments (what actually entered the drawer)
+    if _table_exists(conn, "sale_payments"):
+        conn.execute(
+            """
+            UPDATE sale_payments
+            SET pay_currency_code = COALESCE(
+                    (SELECT NULLIF(TRIM(s.currency_code), '') FROM sales s WHERE s.id = sale_payments.sale_id),
+                    'TJS'
+                ),
+                pay_amount = COALESCE(NULLIF(pay_amount, 0), amount)
+            WHERE COALESCE(TRIM(pay_currency_code), '') = ''
             """
         )
 
@@ -655,6 +659,19 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     )
     _seed_finance_defaults(conn)
     _backfill_sale_payments(conn)
+    # Z-import phone sales → касса (смн / $), once
+    if _table_exists(conn, "sales") and get_setting(conn, "z_sales_in_cash_v1", "") != "1":
+        conn.execute(
+            """
+            UPDATE sales SET affects_cash = 1
+            WHERE COALESCE(affects_cash, 1) = 0
+              AND (
+                user_name = 'Z-импорт'
+                OR user_name LIKE 'Z-импорт%'
+              )
+            """
+        )
+        set_setting(conn, "z_sales_in_cash_v1", "1")
 
     conn.executescript(
         """
@@ -2036,7 +2053,12 @@ def _import_z_register_rows(
             (total, row["comments"] or "Z-импорт Excel", sale_date, warehouse_id, total, total, currency_code, cash_flag),
         )
         sale_id = int(cur_s.lastrowid)
-        insert_sale_payments(conn, sale_id, [{"method_code": "cash", "amount": total}])
+        insert_sale_payments(conn, sale_id, [{
+            "method_code": "cash",
+            "amount": total,
+            "pay_currency_code": currency_code,
+            "pay_amount": total,
+        }])
         cur_item = conn.execute(
             """
             INSERT INTO sale_items
@@ -2474,7 +2496,12 @@ def _import_accessory_z_rows(
                 (total, row["comments"] or "Z-импорт аксессуаров", sale_date, warehouse_id, total, total, currency_code),
             )
             sale_id = int(cur_s.lastrowid)
-            insert_sale_payments(conn, sale_id, [{"method_code": "cash", "amount": total}])
+            insert_sale_payments(conn, sale_id, [{
+            "method_code": "cash",
+            "amount": total,
+            "pay_currency_code": currency_code,
+            "pay_amount": total,
+        }])
             conn.execute(
                 """
                 INSERT INTO sale_items
@@ -3417,7 +3444,12 @@ def process_sale_payments(
         pm = get_payment_method(conn, code)
         if not pm:
             raise HTTPException(status_code=400, detail=f"Способ оплаты «{code}» не найден")
-        normalized.append({"method_code": code, "amount": amount})
+        normalized.append({
+            "method_code": code,
+            "amount": amount,
+            "pay_currency_code": str(p.get("pay_currency_code") or p.get("currency_code") or "").strip().upper(),
+            "pay_amount": float(p["pay_amount"]) if p.get("pay_amount") not in (None, "") else amount,
+        })
         codes.append(code)
         if pm["method_type"] == "cash":
             cash_amount += amount
@@ -3692,9 +3724,19 @@ def _period_cutoff_start(period: str, date_from: str, date_to: str) -> str:
 
 def insert_sale_payments(conn: sqlite3.Connection, sale_id: int, payments: list[dict[str, float | str]]) -> None:
     for p in payments:
+        amount = float(p["amount"])
+        pay_cur = str(p.get("pay_currency_code") or p.get("currency_code") or "").strip().upper()
+        pay_amt = p.get("pay_amount")
+        if pay_amt is None or pay_amt == "":
+            pay_amt = amount
+        else:
+            pay_amt = float(pay_amt)
         conn.execute(
-            "INSERT INTO sale_payments (sale_id, method_code, amount) VALUES (?, ?, ?)",
-            (sale_id, p["method_code"], p["amount"]),
+            """
+            INSERT INTO sale_payments (sale_id, method_code, amount, pay_currency_code, pay_amount)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (sale_id, p["method_code"], amount, pay_cur, pay_amt),
         )
 
 
@@ -4029,11 +4071,194 @@ def mark_unit_sold_full(
     fulfill_unit_reservation(conn, unit_id)
 
 
-def restore_units_for_sale(conn: sqlite3.Connection, sale_id: int) -> None:
-    conn.execute(
-        "UPDATE product_units SET status = 'in_stock', sale_id = NULL WHERE sale_id = ?",
-        (sale_id,),
+def is_partnership_warehouse(conn: sqlite3.Connection, warehouse_id: int | None) -> bool:
+    if not warehouse_id:
+        return False
+    row = conn.execute(
+        f"SELECT 1 FROM warehouses WHERE id = ? AND {_partnership_warehouse_clause()} LIMIT 1",
+        (int(warehouse_id),),
+    ).fetchone()
+    return bool(row)
+
+
+def sale_return_target_warehouse(
+    conn: sqlite3.Connection, sale_id: int, sale_warehouse_id: int | None
+) -> tuple[int, bool]:
+    """Куда вернуть товар при отмене продажи.
+
+    Партнёрская продажа → склад Б/У (не обратно в партнёрство).
+    Остальное → исходный склад продажи.
+    """
+    sale_wh = int(sale_warehouse_id or get_default_warehouse_id(conn))
+    partnership = is_partnership_warehouse(conn, sale_wh)
+    if not partnership:
+        row = conn.execute(
+            f"""
+            SELECT 1
+            FROM product_units u
+            JOIN warehouses w ON w.id = u.warehouse_id
+            LEFT JOIN products p ON p.id = u.product_id
+            WHERE u.sale_id = ?
+              AND ({_partnership_warehouse_clause("w.name")}
+                   OR COALESCE(p.condition, '') = 'partnership')
+            LIMIT 1
+            """,
+            (sale_id,),
+        ).fetchone()
+        partnership = bool(row)
+    if partnership:
+        return resolve_bu_warehouse_id(conn), True
+    return sale_wh, False
+
+
+def find_or_create_used_product_for_return(
+    conn: sqlite3.Connection,
+    product: sqlite3.Row,
+    purchase_price: float,
+) -> int:
+    """Карточка Б/У для возврата партнёрского телефона (тот же name/memory/color)."""
+    name = (product["name"] or "").strip()
+    model = (product["model"] or name).strip()
+    memory = (product["memory"] or "").strip()
+    color = (product["color"] or "").strip()
+    category = (product["category"] or "phone").strip() or "phone"
+    existing = conn.execute(
+        """
+        SELECT id FROM products
+        WHERE category = ?
+          AND LOWER(TRIM(name)) = LOWER(TRIM(?))
+          AND LOWER(TRIM(COALESCE(model, ''))) = LOWER(TRIM(?))
+          AND LOWER(TRIM(COALESCE(memory, ''))) = LOWER(TRIM(?))
+          AND LOWER(TRIM(COALESCE(color, ''))) = LOWER(TRIM(?))
+          AND condition = 'used'
+        LIMIT 1
+        """,
+        (category, name, model, memory, color),
+    ).fetchone()
+    if existing:
+        pid = int(existing["id"])
+        if purchase_price > 0:
+            conn.execute(
+                "UPDATE products SET purchase_price = ? WHERE id = ?",
+                (purchase_price, pid),
+            )
+        return pid
+    sale_price = float(product["sale_price"] or 0) or round(purchase_price * 1.15, 2)
+    cur = conn.execute(
+        """
+        INSERT INTO products
+        (name, category, ownership_type, supplier_name, brand, sku, barcode,
+         purchase_price, sale_price, stock, min_stock, created_at,
+         model, color, size, memory, ram, customs_cleared, customs_price, specs_extra,
+         condition, track_units, image_url)
+        VALUES (?, ?, ?, '', ?, '', '', ?, ?, 0, 0, ?,
+                ?, ?, ?, ?, ?, 0, 0, ?, 'used', 1, '')
+        """,
+        (
+            name,
+            category,
+            product["ownership_type"] or "own",
+            product["brand"] or "",
+            purchase_price,
+            sale_price,
+            utc_now(),
+            model,
+            color,
+            product["size"] or "",
+            memory,
+            product["ram"] or "",
+            product["specs_extra"] or "",
+        ),
     )
+    return int(cur.lastrowid)
+
+
+def restore_units_for_sale(
+    conn: sqlite3.Connection,
+    sale_id: int,
+    *,
+    return_warehouse_id: int | None = None,
+    to_bu: bool = False,
+) -> list[dict[str, Any]]:
+    """Вернуть единицы в наличие. При to_bu — на склад Б/У и в карточку used (партнёрский возврат)."""
+    units = conn.execute(
+        "SELECT * FROM product_units WHERE sale_id = ?",
+        (sale_id,),
+    ).fetchall()
+    restored: list[dict[str, Any]] = []
+    for unit in units:
+        old_product_id = int(unit["product_id"])
+        old_wh = int(unit["warehouse_id"])
+        target_wh = int(return_warehouse_id or old_wh)
+        product = conn.execute(
+            "SELECT * FROM products WHERE id = ?", (old_product_id,)
+        ).fetchone()
+        product_id = old_product_id
+        purchase = float(unit["purchase_price"] or 0) if "purchase_price" in unit.keys() else 0.0
+        if purchase <= 0 and product:
+            purchase = float(product["purchase_price"] or 0)
+        customs = float(unit["customs_price"] or 0) if "customs_price" in unit.keys() else 0.0
+
+        if to_bu and target_wh != old_wh:
+            from_cur = get_warehouse_currency(conn, old_wh)["code"]
+            to_cur = get_warehouse_currency(conn, target_wh)["code"]
+            if from_cur != to_cur:
+                if purchase > 0:
+                    converted = _safe_convert(conn, purchase, from_cur, to_cur)
+                    if converted > 0:
+                        purchase = converted
+                if customs > 0:
+                    converted_c = _safe_convert(conn, customs, from_cur, to_cur)
+                    if converted_c > 0:
+                        customs = converted_c
+            if product and (
+                (product["condition"] or "") == "partnership"
+                or is_partnership_warehouse(conn, old_wh)
+            ):
+                product_id = find_or_create_used_product_for_return(conn, product, purchase)
+
+        note_extra = ""
+        if to_bu:
+            note_extra = "Возврат партнёрства → Б/У"
+        old_notes = (unit["notes"] or "").strip() if "notes" in unit.keys() else ""
+        if note_extra and note_extra not in old_notes:
+            new_notes = f"{old_notes}; {note_extra}".strip("; ").strip()
+        else:
+            new_notes = old_notes
+
+        conn.execute(
+            """
+            UPDATE product_units
+            SET status = 'in_stock', sale_id = NULL,
+                product_id = ?, warehouse_id = ?,
+                purchase_price = CASE WHEN ? > 0 THEN ? ELSE purchase_price END,
+                customs_price = CASE WHEN ? > 0 THEN ? ELSE customs_price END,
+                notes = ?
+            WHERE id = ?
+            """,
+            (
+                product_id,
+                target_wh,
+                purchase,
+                purchase,
+                customs,
+                customs,
+                new_notes,
+                int(unit["id"]),
+            ),
+        )
+        if old_product_id != product_id:
+            sync_product_stock(conn, old_product_id)
+        restored.append(
+            {
+                "unit_id": int(unit["id"]),
+                "product_id": product_id,
+                "warehouse_id": target_wh,
+                "old_product_id": old_product_id,
+                "old_warehouse_id": old_wh,
+            }
+        )
+    return restored
 
 
 def get_default_warehouse_id(conn: sqlite3.Connection) -> int:
@@ -4554,8 +4779,13 @@ def _period_cash_by_currency(
         return resolved
 
     pay_sql = f"""
-        SELECT UPPER(COALESCE(NULLIF(TRIM(s.currency_code), ''), 'TJS')) AS cur,
-               sp.method_code, SUM(sp.amount) AS amt
+        SELECT UPPER(COALESCE(
+                   NULLIF(TRIM(sp.pay_currency_code), ''),
+                   NULLIF(TRIM(s.currency_code), ''),
+                   'TJS'
+               )) AS cur,
+               sp.method_code,
+               SUM(COALESCE(NULLIF(sp.pay_amount, 0), sp.amount)) AS amt
         FROM sale_payments sp
         JOIN sales s ON s.id = sp.sale_id
         WHERE s.status = 'completed' AND COALESCE(s.affects_cash, 1) = 1 {sale_clause}
@@ -4715,6 +4945,41 @@ def _period_cash_by_currency(
     }
 
 
+def till_summary_from_balances(balances: list[dict[str, Any]]) -> dict[str, Any]:
+    """Сводка кассы: нал смн / нал $ / карта (безнал) — то, что реально в ящике."""
+    cash_tjs = 0.0
+    cash_usd = 0.0
+    card_by_cur: dict[str, float] = {}
+    for b in balances or []:
+        mtype = (b.get("method_type") or "").strip().lower()
+        bound = (b.get("currency_code") or "").strip().upper()
+        for row in b.get("by_currency") or []:
+            code = str(row.get("code") or "TJS").upper()
+            net = float(row.get("net") or 0)
+            if mtype == "cash":
+                use = bound or code
+                if use == "USD":
+                    cash_usd += net
+                else:
+                    cash_tjs += net
+            else:
+                card_by_cur[code] = card_by_cur.get(code, 0.0) + net
+    card_bags = [
+        {**currency_meta(c), "amount": round(v, 2), "net": round(v, 2)}
+        for c, v in sorted(card_by_cur.items(), key=lambda x: (0 if x[0] == "USD" else 1, x[0]))
+        if abs(v) > 0.0001
+    ]
+    if not card_bags:
+        card_bags = [{**currency_meta("TJS"), "amount": 0.0, "net": 0.0}]
+    return {
+        "cash_tjs": round(cash_tjs, 2),
+        "cash_usd": round(cash_usd, 2),
+        "card": card_bags,
+        "cash_tjs_meta": currency_meta("TJS"),
+        "cash_usd_meta": currency_meta("USD"),
+    }
+
+
 def funds_snapshot(conn: sqlite3.Connection) -> dict[str, Any]:
     """Current money: stock per warehouse + cash/wallet by USD/TJS."""
     rates = latest_exchange_rates(conn)
@@ -4738,9 +5003,13 @@ def funds_snapshot(conn: sqlite3.Connection) -> dict[str, Any]:
 
     for r in conn.execute(
         """
-        SELECT UPPER(COALESCE(NULLIF(TRIM(s.currency_code), ''), 'TJS')) AS cur,
+        SELECT UPPER(COALESCE(
+                   NULLIF(TRIM(sp.pay_currency_code), ''),
+                   NULLIF(TRIM(s.currency_code), ''),
+                   'TJS'
+               )) AS cur,
                COALESCE(pm.method_type, 'card') AS method_type,
-               SUM(sp.amount) AS amt
+               SUM(COALESCE(NULLIF(sp.pay_amount, 0), sp.amount)) AS amt
         FROM sale_payments sp
         JOIN sales s ON s.id = sp.sale_id
         LEFT JOIN payment_methods pm ON pm.code = sp.method_code
@@ -4753,9 +5022,13 @@ def funds_snapshot(conn: sqlite3.Connection) -> dict[str, Any]:
     if _table_exists(conn, "receivable_payments"):
         for r in conn.execute(
             """
-            SELECT UPPER(COALESCE(NULLIF(TRIM(s.currency_code), ''), 'TJS')) AS cur,
+            SELECT UPPER(COALESCE(
+                       NULLIF(TRIM(rp.pay_currency_code), ''),
+                       NULLIF(TRIM(s.currency_code), ''),
+                       'TJS'
+                   )) AS cur,
                    COALESCE(pm.method_type, 'cash') AS method_type,
-                   SUM(rp.amount) AS amt
+                   SUM(COALESCE(NULLIF(rp.pay_amount, 0), rp.amount)) AS amt
             FROM receivable_payments rp
             JOIN receivables r ON r.id = rp.receivable_id
             JOIN sales s ON s.id = r.sale_id
@@ -5265,7 +5538,7 @@ async def web_manifest():
 async def health():
     return {
         "status": "ok",
-        "build": "z-import-resale-v1",
+        "build": "cash-till-currency-v1",
         "db": str(DB_PATH),
         "db_exists": DB_PATH.exists(),
     }
@@ -7631,8 +7904,12 @@ async def pos_cash_register(
         )
         sales_rows = conn.execute(
             f"""
-            SELECT UPPER(COALESCE(NULLIF(TRIM(s.currency_code), ''), 'TJS')) AS cur,
-                   COALESCE(SUM(sp.amount), 0) AS amt
+            SELECT UPPER(COALESCE(
+                       NULLIF(TRIM(sp.pay_currency_code), ''),
+                       NULLIF(TRIM(s.currency_code), ''),
+                       'TJS'
+                   )) AS cur,
+                   COALESCE(SUM(COALESCE(NULLIF(sp.pay_amount, 0), sp.amount)), 0) AS amt
             FROM sale_payments sp
             JOIN sales s ON s.id = sp.sale_id
             WHERE s.status = 'completed' AND COALESCE(s.affects_cash, 1) = 1 {sale_clause}
@@ -7700,6 +7977,8 @@ async def pos_cash_register(
         ).fetchall()
 
         by_cur = cash["by_currency"]
+        till = till_summary_from_balances(wallets["balances"])
+        till_period = till_summary_from_balances(cash["balances"])
     return {
         "period": period_key,
         "date_from": use_from,
@@ -7724,6 +8003,8 @@ async def pos_cash_register(
         # All-time money currently in wallets (does not reset next day)
         "balances": wallets["balances"],
         "wallets_all_time": wallets["balances"],
+        "till": till,
+        "till_period": till_period,
         "cash_inflows": recent_inflows,
     }
 
@@ -7787,8 +8068,13 @@ async def pos_cash_register_detail(
 
         if want_in:
             pay_sql = f"""
-                SELECT s.created_at AS at, s.id AS sale_id, sp.amount,
-                       UPPER(COALESCE(NULLIF(TRIM(s.currency_code), ''), 'TJS')) AS currency_code,
+                SELECT s.created_at AS at, s.id AS sale_id,
+                       COALESCE(NULLIF(sp.pay_amount, 0), sp.amount) AS amount,
+                       UPPER(COALESCE(
+                           NULLIF(TRIM(sp.pay_currency_code), ''),
+                           NULLIF(TRIM(s.currency_code), ''),
+                           'TJS'
+                       )) AS currency_code,
                        sp.method_code, COALESCE(pm.name, sp.method_code) AS method_name,
                        COALESCE(NULLIF(s.user_name, ''), '—') AS who,
                        COALESCE(w.name, '') AS warehouse_name
@@ -9037,7 +9323,12 @@ async def create_sale(body: SaleIn, x_pin: str | None = Header(default=None, ali
                     mixed.append(f"{p['amount_input']:.2f} {p['currency_code']}→{p['amount']:.2f} {sale_currency}")
             if mixed:
                 fx_note = (fx_note + " · " if fx_note else "") + "; ".join(mixed)
-        pay_payload_src = [{"method_code": p["method_code"], "amount": p["amount"]} for p in converted_payments]
+        pay_payload_src = [{
+            "method_code": p["method_code"],
+            "amount": p["amount"],
+            "pay_currency_code": p["currency_code"],
+            "pay_amount": p["amount_input"],
+        } for p in converted_payments]
 
         sale_notes = body.notes.strip()
         if fx_note:
@@ -9243,16 +9534,55 @@ async def void_sale(sale_id: int, x_pin: str | None = Header(default=None, alias
         sale = conn.execute("SELECT * FROM sales WHERE id = ? AND status = 'completed'", (sale_id,)).fetchone()
         if not sale:
             raise HTTPException(status_code=404, detail="Продажа не найдена")
-        warehouse_id = sale["warehouse_id"] or get_default_warehouse_id(conn)
-        restore_units_for_sale(conn, sale_id)
+        sale_wh = sale["warehouse_id"] or get_default_warehouse_id(conn)
+        target_wh, to_bu = sale_return_target_warehouse(conn, sale_id, sale_wh)
+        restored = restore_units_for_sale(
+            conn,
+            sale_id,
+            return_warehouse_id=target_wh if to_bu else None,
+            to_bu=to_bu,
+        )
+        # Единицы по IMEI — на целевой склад (партнёрство → Б/У), не обратно в партнёрство.
+        for ru in restored:
+            adjust_warehouse_stock(
+                conn,
+                int(ru["warehouse_id"]),
+                int(ru["product_id"]),
+                1,
+                "void",
+                reference_id=sale_id,
+                notes=(
+                    f"Возврат партнёрства → Б/У, продажа #{sale_id}"
+                    if to_bu
+                    else f"Возврат продажи #{sale_id}"
+                ),
+            )
+        # Позиции без серийников (аксессуары и т.п.) — на склад продажи.
         for item in conn.execute("SELECT * FROM sale_items WHERE sale_id = ?", (sale_id,)).fetchall():
-            if item["product_id"]:
-                adjust_warehouse_stock(
-                    conn, warehouse_id, item["product_id"], item["quantity"],
-                    "void", reference_id=sale_id, notes=f"Возврат продажи #{sale_id}",
-                )
+            if not item["product_id"]:
+                continue
+            linked = conn.execute(
+                """
+                SELECT COUNT(*) FROM sale_item_units siu
+                WHERE siu.sale_item_id = ?
+                """,
+                (item["id"],),
+            ).fetchone()[0]
+            if int(linked or 0) > 0:
+                continue
+            adjust_warehouse_stock(
+                conn,
+                sale_wh,
+                item["product_id"],
+                item["quantity"],
+                "void",
+                reference_id=sale_id,
+                notes=f"Возврат продажи #{sale_id}",
+            )
         _close_receivables_for_return(conn, sale_id, now)
-        note_suffix = f" [Возврат {now[:10]}]"
+        note_suffix = (
+            f" [Возврат {now[:10]} → Б/У]" if to_bu else f" [Возврат {now[:10]}]"
+        )
         conn.execute(
             """
             UPDATE sales
@@ -9262,7 +9592,7 @@ async def void_sale(sale_id: int, x_pin: str | None = Header(default=None, alias
             """,
             (note_suffix, sale_id),
         )
-    return {"ok": True}
+    return {"ok": True, "return_to_bu": to_bu, "warehouse_id": target_wh}
 
 
 # --- Trade-in ---

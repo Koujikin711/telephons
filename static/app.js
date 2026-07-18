@@ -38,14 +38,13 @@ function warehouseKind(whId) {
 
 function whStockColumns(kind) {
   if (kind === "used") {
-    return ["Модель", "Цвет", "Память", "Аккум.", "IMEI", "Себест.", "Клиент", ""];
+    return ["Приход", "Наименование", "Батар.", "IMEI", "Память", "Цвет", "Себест.", "Расходы", "Клиент / коммент.", ""];
   }
-  return ["Дата", "Модель", "Цвет", "Память", "Регион", "IMEI", "Себест.", "Поставщик", ""];
+  return ["Приход", "Наименование", "Регион", "IMEI", "Память", "Цвет", "Себест.", "Расходы", "Поставщик", ""];
 }
 let tiGivenProducts = [];
 let currentUser = null;
 let allowedPages = null;
-let openShift = null;
 let imeiPickerResolve = null;
 let catalogProducts = [];
 let catalogDetailId = null;
@@ -103,7 +102,7 @@ function isNetworkError(err) {
 const ROLE_LABELS = { owner: "Владелец", warehouse: "Кладовщик", cashier: "Кассир", accessories: "Аксессуары" };
 
 const ADVANCED_PAGES = new Set([
-  "dashboard", "products-own", "products-consignment", "imei",
+  "dashboard", "products-own", "products-consignment",
   "creditors", "analytics", "users", "sales",
 ]);
 
@@ -210,11 +209,47 @@ function posPayCurrency() {
 function posPayMoney(n) {
   return fmtCurrency(n, currency_meta(posPayCurrency()));
 }
+/** Rate: 1 sale_currency = rate pay_currency (editable). */
+function posFxRateSaleToPay() {
+  const inp = document.getElementById("pos-fx-rate");
+  if (inp && inp.value !== "" && +inp.value > 0) return +inp.value;
+  return convertMoney(1, posSaleCurrency(), posPayCurrency());
+}
+function posConvertSaleToPay(amount) {
+  const r = posFxRateSaleToPay();
+  if (r == null || r <= 0) return null;
+  return (+amount || 0) * r;
+}
+function posConvertToSale(amount, fromCur) {
+  const sale = posSaleCurrency();
+  const from = (fromCur || sale).toUpperCase();
+  if (!from || from === sale) return +amount || 0;
+  const pay = posPayCurrency();
+  if (from === pay) {
+    const r = posFxRateSaleToPay();
+    if (r == null || r <= 0) return null;
+    return (+amount || 0) / r;
+  }
+  return convertMoney(amount, from, sale);
+}
+function syncPosFxRateFromSettings(force = false) {
+  const inp = document.getElementById("pos-fx-rate");
+  if (!inp) return;
+  if (!force && inp.dataset.manual === "1") return;
+  const rate = convertMoney(1, posSaleCurrency(), posPayCurrency());
+  if (rate != null && rate > 0) {
+    inp.value = String(Math.round(rate * 10000) / 10000);
+    inp.dataset.manual = "0";
+  } else {
+    inp.value = "";
+  }
+}
 function refreshPosFxUi() {
   const enable = document.getElementById("pos-fx-enable");
   const fields = document.getElementById("pos-fx-fields");
   const sel = document.getElementById("pos-fx-currency");
   const hint = document.getElementById("pos-fx-rate-hint");
+  const caption = document.getElementById("pos-fx-rate-caption");
   const totalEl = document.getElementById("pos-fx-total");
   const totalLabel = document.getElementById("pos-fx-total-label");
   if (!enable || !fields || !sel) return;
@@ -233,29 +268,57 @@ function refreshPosFxUi() {
     return;
   }
   const payCur = sel.value;
-  const rate = convertMoney(1, saleCur, payCur);
+  if (caption) caption.textContent = `1 ${saleCur} = … ${payCur}`;
+  syncPosFxRateFromSettings(false);
+  const rate = posFxRateSaleToPay();
   if (hint) {
     if (rate == null) {
-      hint.textContent = `Нет курса ${saleCur === "USD" || payCur === "USD" ? "USD" : payCur} в Настройках`;
+      hint.textContent = `Нет курса в настройках — введите курс вручную`;
       hint.style.color = "var(--danger)";
     } else {
-      hint.textContent = `1 ${saleCur} = ${rate.toFixed(4)} ${payCur} (курс из настроек)`;
+      const fromSettings = convertMoney(1, saleCur, payCur);
+      const custom = document.getElementById("pos-fx-rate")?.dataset.manual === "1";
+      hint.textContent = custom
+        ? `Свой курс: 1 ${saleCur} = ${(+rate).toFixed(4)} ${payCur}`
+        : `Авто из настроек: 1 ${saleCur} = ${(+rate).toFixed(4)} ${payCur}`;
       hint.style.color = "";
+      if (fromSettings == null && !custom) hint.style.color = "var(--danger)";
     }
   }
   const dueWh = cartTotalDue();
-  const duePay = convertMoney(dueWh, saleCur, payCur);
+  const duePay = posConvertSaleToPay(dueWh);
   if (totalLabel) totalLabel.textContent = `К оплате (${payCur})`;
   if (totalEl) totalEl.textContent = duePay == null ? "—" : posPayMoney(duePay);
   updateSplitSummary();
 }
 function finFmt(block, field = "gross_revenue") {
   const rows = block?.by_currency;
-  if (rows?.length > 1) {
-    return rows.map((c) => fmtCurrency(c[field], c)).join("<br>");
+  if (rows?.length) {
+    const bags = { USD: 0, TJS: 0 };
+    for (const c of rows) {
+      const code = String(c.code || "TJS").toUpperCase();
+      bags[code] = (bags[code] || 0) + (+c[field] || 0);
+    }
+    // Prefer labeled bags whenever currency rows exist (incl. single-currency)
+    if (rows.length > 1 || (bags.USD && bags.TJS) || rows.length === 1) {
+      if (rows.length > 1 || (Math.abs(bags.USD) > 0.005 && Math.abs(bags.TJS) > 0.005)) {
+        return formatCurrencyBags(bags);
+      }
+      const only = rows[0];
+      return fmtCurrency(only[field] ?? block?.[field], currency_meta(only.code));
+    }
   }
-  if (rows?.length === 1) return fmtCurrency(block[field], rows[0]);
-  return fmt(block?.[field]);
+  const v = block?.[field];
+  if (v == null) return "—";
+  return fmt(v);
+}
+
+function moneyLine(amount, currencyCode) {
+  return fmtCurrency(amount, currency_meta(currencyCode || "TJS"));
+}
+
+function creditorBagsHtml(c, field = "balance") {
+  return formatSideBags(c?.by_currency || [], field);
 }
 const pct = (a, b) => b ? Math.round((a / b) * 100) : 0;
 const catLabel = (c) => ({ phone: "Телефон", accessory: "Аксессуар" }[c] || c);
@@ -521,13 +584,11 @@ function sortCatalogItems(items, sort) {
 const PAGE_TITLES = {
   dashboard: "Обзор",
   pos: "Касса",
-  shifts: "Смена",
   sales: "Продажи",
   warehouses: "Склад",
   "products-own": "Собственные товары",
   "products-consignment": "Под реализацию",
   accessories: "Аксессуары",
-  imei: "IMEI / Серийники",
   users: "Пользователи",
   reports: "Отчёты",
   debtors: "Взаиморасчёты",
@@ -578,17 +639,13 @@ async function refreshSession() {
     const data = await api("/api/auth/check", { method: "POST", body: JSON.stringify({ pin: pin || "" }) });
     currentUser = data.user;
     allowedPages = data.pages;
-    openShift = data.open_shift;
     if (typeof data.simple_ui === "boolean") serverSimpleUi = data.simple_ui;
   } catch {
     if (authRequired) throw new Error("auth");
-    const shiftData = await api("/api/shifts/current").catch(() => ({ shift: null }));
-    openShift = shiftData.shift;
   }
   updateTopbar();
   applyRoleNav();
   applySimpleNav();
-  updatePosShiftHint();
 }
 
 function applySimpleNav() {
@@ -615,6 +672,7 @@ function applySimpleNav() {
   if (whSel && phoneWarehouses().length <= 1) {
     whSel.classList.add("hidden");
   }
+}
 
 function updateAdvancedUiToggle() {
   const cb = document.getElementById("toggle-advanced-ui");
@@ -641,24 +699,8 @@ function updateTopbar() {
     localStorage.removeItem(PIN_KEY);
     currentUser = null;
     allowedPages = null;
-    openShift = null;
     showLogin();
   });
-}
-
-function updatePosShiftHint() {
-  const hint = document.getElementById("pos-shift-hint");
-  const btn = document.getElementById("checkout-btn");
-  if (!hint) return;
-  if (openShift) {
-    hint.classList.add("hidden");
-    hint.textContent = "";
-  } else {
-    hint.classList.remove("hidden");
-    hint.innerHTML = 'Смена не открыта — <button type="button" class="link-btn" id="pos-goto-shift">открыть смену</button>';
-    document.getElementById("pos-goto-shift")?.addEventListener("click", () => navigate("shifts"));
-    if (btn) btn.disabled = true;
-  }
 }
 
 function applyRoleNav() {
@@ -746,13 +788,11 @@ function navigate(page) {
   const loaders = {
     dashboard: loadDashboard,
     pos: loadPos,
-    shifts: loadShiftsPage,
     sales: loadSales,
     warehouses: loadWarehousesPage,
     "products-own": loadOwnProducts,
     "products-consignment": loadConsProducts,
     accessories: loadAccessoriesPage,
-    imei: loadImeiPage,
     reservations: loadReservationsPage,
     users: loadUsersPage,
     settings: loadSettingsPage,
@@ -797,6 +837,7 @@ function startClock() {
 async function loadWarehouses() {
   warehouses = await api("/api/warehouses");
   fillWarehouseSelect(document.getElementById("pos-warehouse"), defaultWarehouseId(), { phonesOnly: true });
+  fillWarehouseSelect(document.getElementById("pos-exp-warehouse"), defaultWarehouseId(), { phonesOnly: true });
   fillWarehouseSelect(document.getElementById("pf-warehouse"), defaultWarehouseId());
   fillWarehouseSelect(document.getElementById("sm-to-warehouse"), null, { empty: true });
 }
@@ -848,11 +889,9 @@ async function init() {
     bindCreditors();
     bindReports();
     bindAnalytics();
-    bindImei();
     bindUsers();
     bindSettings();
     bindStocktake();
-    bindShifts();
     window.addEventListener("online", () => { updateTopbar(); flushOfflineQueue(); });
     window.addEventListener("offline", updateTopbar);
     if ("serviceWorker" in navigator) {
@@ -905,23 +944,23 @@ async function loadDashboard() {
   });
   document.getElementById("dash-today").innerHTML = `
     ${renderCurrencyBreakdown(d.month.by_currency)}
-    <div class="metric-row"><span>Выручка сегодня</span><strong>${finFmt(d.today, "gross_revenue")}</strong></div>
-    <div class="metric-row"><span>Прибыль сегодня</span><strong>${finFmt(d.today, "shop_profit")}</strong></div>
-    <div class="metric-row"><span>К оплате поставщикам</span><strong>${fmt(d.today.supplier_due)}</strong></div>
-    <div class="metric-row"><span>Себестоимость (свои)</span><strong>${fmt(d.today.own_cogs)}</strong></div>
+    <div class="metric-row"><span>Выручка сегодня</span><strong class="value-multi">${finFmt(d.today, "gross_revenue")}</strong></div>
+    <div class="metric-row"><span>Прибыль сегодня</span><strong class="value-multi">${finFmt(d.today, "shop_profit")}</strong></div>
+    <div class="metric-row"><span>К оплате поставщикам</span><strong class="value-multi">${finFmt(d.today, "supplier_due")}</strong></div>
+    <div class="metric-row"><span>Себестоимость (свои)</span><strong class="value-multi">${finFmt(d.today, "own_cogs")}</strong></div>
   `;
   document.getElementById("dash-split").innerHTML = `
-    <div class="metric-row"><span><span class="tag tag-own">Свои</span> Выручка</span><strong>${fmt(d.own_month.gross_revenue)}</strong></div>
-    <div class="metric-row"><span><span class="tag tag-own">Свои</span> Прибыль</span><strong>${fmt(d.own_month.shop_profit)}</strong></div>
-    <div class="metric-row"><span><span class="tag tag-cons">Реализация</span> Выручка</span><strong>${fmt(d.consignment_month.gross_revenue)}</strong></div>
-    <div class="metric-row"><span><span class="tag tag-cons">Реализация</span> Комиссия</span><strong>${fmt(d.consignment_month.shop_profit)}</strong></div>
-    <div class="metric-row"><span><span class="tag tag-cons">Реализация</span> Долг поставщикам</span><strong>${fmt(d.consignment_month.supplier_due)}</strong></div>
+    <div class="metric-row"><span><span class="tag tag-own">Свои</span> Выручка</span><strong class="value-multi">${finFmt(d.own_month, "gross_revenue")}</strong></div>
+    <div class="metric-row"><span><span class="tag tag-own">Свои</span> Прибыль</span><strong class="value-multi">${finFmt(d.own_month, "shop_profit")}</strong></div>
+    <div class="metric-row"><span><span class="tag tag-cons">Реализация</span> Выручка</span><strong class="value-multi">${finFmt(d.consignment_month, "gross_revenue")}</strong></div>
+    <div class="metric-row"><span><span class="tag tag-cons">Реализация</span> Комиссия</span><strong class="value-multi">${finFmt(d.consignment_month, "shop_profit")}</strong></div>
+    <div class="metric-row"><span><span class="tag tag-cons">Реализация</span> Долг поставщикам</span><strong class="value-multi">${finFmt(d.consignment_month, "supplier_due")}</strong></div>
   `;
-  const sup = d.supplier_balances;
+  const sup = d.supplier_balances || [];
   document.getElementById("dash-suppliers-card").classList.toggle("hidden", !sup.length);
   document.getElementById("dash-suppliers").innerHTML = sup.length
     ? `<table class="data-table"><thead><tr><th>Поставщик</th><th>К выплате</th></tr></thead><tbody>
-        ${sup.map((s) => `<tr><td>${esc(s.supplier_name)}</td><td><strong>${fmt(s.balance)}</strong></td></tr>`).join("")}
+        ${sup.map((s) => `<tr><td>${esc(s.supplier_name)}</td><td class="value-multi"><strong>${creditorBagsHtml(s, "balance")}</strong></td></tr>`).join("")}
        </tbody></table>`
     : '<p style="color:var(--muted)">Нет задолженности</p>';
 
@@ -935,7 +974,7 @@ async function loadDashboard() {
     const rows = [];
     if (alerts.imei_pending_stale > 0) {
       rows.push(`<div class="dash-alert dash-alert-warn"><strong>⚠ IMEI не внесён &gt; 3 дней: ${alerts.imei_pending_stale}</strong>
-        <button class="btn btn-ghost btn-sm" onclick="navigate('imei')">Открыть IMEI</button></div>`);
+        <button class="btn btn-ghost btn-sm" onclick="navigate('warehouses')">Открыть склад</button></div>`);
     }
     if (alerts.no_imei_stock > 0) {
       rows.push(`<div class="dash-alert"><span>На складе без IMEI: <strong>${alerts.no_imei_stock}</strong></span></div>`);
@@ -978,18 +1017,20 @@ async function openKpiDetail(metric) {
         </tr>`).join("") || '<tr><td colspan="4" style="text-align:center;color:var(--muted)">Всё в норме</td></tr>';
     } else {
       const isProfit = metric === "profit_today";
-      summaryEl.innerHTML = `Итого: <strong>${fmt(isProfit ? data.total_profit : data.total_revenue)}</strong>`;
+      const field = isProfit ? "shop_profit" : "gross_revenue";
+      summaryEl.innerHTML = `Итого: <strong class="value-multi">${formatSideBags(data.by_currency || [], field)}</strong>`;
       if (data.by_warehouse?.length) {
         byWhEl.classList.remove("hidden");
         byWhEl.innerHTML = `
           <h4>По складам</h4>
-          <table class="data-table"><thead><tr><th>Склад</th><th>Чеков</th><th>Выручка</th><th>Прибыль</th></tr></thead><tbody>
+          <table class="data-table"><thead><tr><th>Склад</th><th>Валюта</th><th>Чеков</th><th>Выручка</th><th>Прибыль</th></tr></thead><tbody>
             ${data.by_warehouse.map((w) => `
               <tr>
                 <td><strong>${esc(w.warehouse_name)}</strong></td>
+                <td>${esc(w.currency_code || "TJS")}</td>
                 <td>${w.sales_count}</td>
-                <td>${fmt(w.revenue)}</td>
-                <td>${fmt(w.profit)}</td>
+                <td>${moneyLine(w.revenue, w.currency_code)}</td>
+                <td>${moneyLine(w.profit, w.currency_code)}</td>
               </tr>`).join("")}
           </tbody></table>`;
       } else {
@@ -1004,7 +1045,7 @@ async function openKpiDetail(metric) {
           <td><strong>${esc(r.warehouse_name)}</strong></td>
           <td>${esc(r.product_name)}</td>
           <td>${r.quantity}</td>
-          <td><strong>${fmt(isProfit ? r.shop_profit : r.subtotal)}</strong></td>
+          <td><strong>${moneyLine(isProfit ? r.shop_profit : r.subtotal, r.currency_code)}</strong></td>
           <td>${esc(r.cashier || "—")}</td>
         </tr>`).join("") || '<tr><td colspan="7" style="text-align:center;color:var(--muted)">Нет продаж за период</td></tr>';
     }
@@ -1018,16 +1059,142 @@ function bindDashboard() {
   document.getElementById("kpi-detail-close")?.addEventListener("click", () => {
     document.getElementById("kpi-detail-modal")?.close();
   });
+  document.getElementById("unit-history-close")?.addEventListener("click", () => {
+    document.getElementById("unit-history-modal")?.close();
+  });
+  const imeInp = document.getElementById("dash-imei-search");
+  imeInp?.addEventListener("input", debounce((e) => {
+    const q = e.target.value.trim();
+    if (q.replace(/\D/g, "").length < 5 && q.length < 5) {
+      hideDashImeiResults();
+      return;
+    }
+    runDashImeiSearch(q);
+  }, 220));
+  imeInp?.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") hideDashImeiResults();
+    if (e.key === "Enter") {
+      e.preventDefault();
+      const first = document.querySelector("#dash-imei-results .pos-search-item");
+      if (first) first.click();
+    }
+  });
+  document.addEventListener("click", (e) => {
+    const wrap = document.querySelector(".dash-imei-wrap");
+    if (wrap && !wrap.contains(e.target)) hideDashImeiResults();
+  });
 }
+
+function hideDashImeiResults() {
+  const box = document.getElementById("dash-imei-results");
+  if (box) {
+    box.classList.add("hidden");
+    box.innerHTML = "";
+  }
+}
+
+function unitStatusLabel(u) {
+  if (u.is_sold || u.status === "sold") return { text: "Продан", cls: "sold" };
+  if (u.status === "reserved" || u.is_reserved) return { text: "Резерв", cls: "reserved" };
+  if (u.status === "in_stock") return { text: "На складе", cls: "stock" };
+  return { text: u.status || "—", cls: "" };
+}
+
+async function runDashImeiSearch(q) {
+  const box = document.getElementById("dash-imei-results");
+  if (!box) return;
+  try {
+    const data = await api(`/api/units/imei-history?q=${encodeURIComponent(q)}`);
+    const items = data.matches || [];
+    if (!items.length) {
+      box.innerHTML = `<div class="pos-search-empty">Ничего не найдено</div>`;
+      box.classList.remove("hidden");
+      return;
+    }
+    box.innerHTML = items.map((u, idx) => {
+      const st = unitStatusLabel(u);
+      const last = u.last_sale
+        ? ` · продажа ${fmtCurrency(u.last_sale.unit_price, currency_meta(u.last_sale.currency_code || "TJS"))} (${(u.last_sale.created_at || "").slice(0, 10)})`
+        : "";
+      return `<button type="button" class="pos-search-item" data-idx="${idx}">
+        <span class="psi-name">${esc(u.product_name || u.model || "Устройство")}
+          <span class="dash-imei-status ${st.cls}">${st.text}</span>
+        </span>
+        <span class="psi-price">${u.ops_count || 0} оп.</span>
+        <span class="psi-meta">${esc([u.imei || u.serial, u.product_color || u.color, u.memory, u.warehouse_name].filter(Boolean).join(" · "))}${esc(last)}</span>
+      </button>`;
+    }).join("");
+    box.classList.remove("hidden");
+    box.querySelectorAll(".pos-search-item").forEach((btn) => {
+      btn.addEventListener("click", () => openUnitHistory(items[+btn.dataset.idx].id));
+    });
+  } catch (err) {
+    box.innerHTML = `<div class="pos-search-empty">${esc(err.message)}</div>`;
+    box.classList.remove("hidden");
+  }
+}
+
+async function openUnitHistory(unitId) {
+  hideDashImeiResults();
+  try {
+    const data = await api(`/api/units/${unitId}/history`);
+    const u = data.unit || {};
+    const events = data.events || [];
+    const st = unitStatusLabel(u);
+    document.getElementById("unit-history-title").textContent =
+      `${u.imei || u.serial || "#" + u.id} · ${u.product_name || u.model || "Устройство"}`;
+    document.getElementById("unit-history-sub").textContent =
+      `${st.text} · ${u.warehouse_name || ""} · ${u.ops_count || events.length} операций` +
+      (u.product_color || u.memory ? ` · ${[u.product_color, u.memory].filter(Boolean).join(" / ")}` : "");
+    const box = document.getElementById("unit-history-content");
+    if (!events.length) {
+      box.innerHTML = '<p class="hint">История пуста</p>';
+    } else {
+      box.innerHTML = `<div class="unit-history-timeline">${events.map((e) => {
+        const money = e.amount
+          ? fmtCurrency(e.amount, currency_meta(e.currency_code || "TJS"))
+          : "";
+        const who = e.user_name ? ` · ${esc(e.user_name)}` : "";
+        const saleBtn = e.sale_id
+          ? ` <button type="button" class="btn btn-ghost btn-sm" data-open-sale="${e.sale_id}">Чек #${e.sale_id}</button>`
+          : "";
+        return `<div class="unit-history-event ${esc(e.kind)}">
+          <div class="uhe-top">
+            <span class="uhe-title">${esc(e.title)}</span>
+            <span class="uhe-amount">${money}</span>
+          </div>
+          <div class="uhe-meta">${esc((e.at || "").slice(0, 16))}${who}${e.warehouse_name ? ` · ${esc(e.warehouse_name)}` : ""}${e.notes ? ` · ${esc(e.notes)}` : ""}${saleBtn}</div>
+        </div>`;
+      }).join("")}</div>`;
+      box.querySelectorAll("[data-open-sale]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          document.getElementById("unit-history-modal")?.close();
+          showSale(+btn.dataset.openSale);
+        });
+      });
+    }
+    document.getElementById("unit-history-modal")?.showModal();
+  } catch (err) {
+    toast(err.message, "error");
+  }
+}
+
+window.openUnitHistory = openUnitHistory;
+window.runDashImeiSearch = runDashImeiSearch;
 
 /* ── POS ── */
 let posInType = "counterparty";
 
 function bindPos() {
-  document.getElementById("pos-warehouse")?.addEventListener("change", () => {
-    cart = [];
-    const fx = document.getElementById("pos-fx-enable");
-    if (fx) fx.checked = false;
+  document.getElementById("pos-warehouse")?.addEventListener("change", (e) => {
+    const sel = e.currentTarget;
+    const keep = sel?.dataset.keepCart === "1";
+    if (sel) delete sel.dataset.keepCart;
+    if (!keep) {
+      cart = [];
+      const fx = document.getElementById("pos-fx-enable");
+      if (fx) fx.checked = false;
+    }
     const curHint = document.getElementById("pos-currency-hint");
     if (curHint) {
       const cur = warehouseCurrency(posWhId());
@@ -1062,42 +1229,167 @@ function bindPos() {
     const payCur = posPayCurrency();
     const fxOn = !!document.getElementById("pos-fx-enable")?.checked && payCur !== saleCur;
     let total = cartTotalDue();
+    let fillCur = saleCur;
     if (fxOn) {
-      const conv = convertMoney(total, saleCur, payCur);
-      if (conv == null) { toast("Нет курса валюты в настройках", "error"); return; }
+      const conv = posConvertSaleToPay(total);
+      if (conv == null) { toast("Укажите курс конвертации", "error"); return; }
       total = Math.round(conv * 100) / 100;
+      fillCur = payCur;
     }
-    document.querySelectorAll(".split-pay-input").forEach((inp) => { inp.value = inp.dataset.method === "cash" ? total : ""; });
+    document.querySelectorAll(".split-pay-input").forEach((inp) => {
+      inp.value = inp.dataset.method === "cash" ? total : "";
+      const curSel = inp.closest(".split-pay-row")?.querySelector(".split-pay-currency");
+      if (curSel) curSel.value = fillCur;
+    });
     updateSplitSummary();
   });
   document.getElementById("split-payments")?.addEventListener("input", (e) => {
-    if (e.target.classList.contains("split-pay-input")) updateSplitSummary();
+    if (e.target.classList.contains("split-pay-input") || e.target.classList.contains("split-pay-currency")) {
+      updateSplitSummary();
+    }
   });
-  document.getElementById("cart-discount").addEventListener("input", renderCart);
-  document.getElementById("checkout-btn").addEventListener("click", checkout);
+  document.getElementById("split-payments")?.addEventListener("change", (e) => {
+    if (e.target.classList.contains("split-pay-currency")) updateSplitSummary();
+  });
+  document.getElementById("cart-discount")?.addEventListener("input", renderCart);
+  document.getElementById("checkout-btn")?.addEventListener("click", checkout);
   document.getElementById("pos-fx-enable")?.addEventListener("change", () => {
+    const rateInp = document.getElementById("pos-fx-rate");
+    if (rateInp) rateInp.dataset.manual = "0";
+    syncPosFxRateFromSettings(true);
     refreshPosFxUi();
     renderSplitPayments();
   });
   document.getElementById("pos-fx-currency")?.addEventListener("change", () => {
+    const rateInp = document.getElementById("pos-fx-rate");
+    if (rateInp) rateInp.dataset.manual = "0";
+    syncPosFxRateFromSettings(true);
     refreshPosFxUi();
     renderSplitPayments();
   });
-  document.getElementById("clear-cart-btn").addEventListener("click", () => { cart = []; renderCart(); });
+  document.getElementById("pos-fx-rate")?.addEventListener("input", () => {
+    const inp = document.getElementById("pos-fx-rate");
+    if (inp) inp.dataset.manual = "1";
+    refreshPosFxUi();
+  });
+  document.getElementById("clear-cart-btn")?.addEventListener("click", () => { cart = []; renderCart(); });
   document.getElementById("pos-cash-refresh")?.addEventListener("click", loadPosCashRegister);
+  document.getElementById("pos-shift-open")?.addEventListener("click", async () => {
+    try {
+      const opening = prompt("Стартовые наличные в кассе (смн)?", "0");
+      if (opening === null) return;
+      await api("/api/shifts/open", {
+        method: "POST",
+        body: JSON.stringify({ opening_cash: Math.max(0, +opening || 0) }),
+      });
+      toast("Смена открыта");
+      loadPosCashRegister();
+    } catch (err) { toast(err.message, "error"); }
+  });
+  document.getElementById("pos-shift-close")?.addEventListener("click", async () => {
+    try {
+      const cur = await api("/api/shifts/current");
+      if (!cur.shift?.id) { toast("Нет открытой смены", "error"); return; }
+      const sum = cur.summary || {};
+      const box = document.getElementById("shift-close-summary");
+      if (box) {
+        box.textContent = `Продаж: ${sum.sales_count || 0} · ожидалось наличных: ${fmt(sum.expected_cash || 0)}`;
+      }
+      document.getElementById("shift-close-cash").value = String(sum.expected_cash || 0);
+      document.getElementById("shift-close-notes").value = "";
+      document.getElementById("shift-close-form").dataset.shiftId = String(cur.shift.id);
+      document.getElementById("shift-close-modal")?.showModal();
+    } catch (err) { toast(err.message, "error"); }
+  });
+  document.getElementById("shift-close-cancel")?.addEventListener("click", () => {
+    document.getElementById("shift-close-modal")?.close();
+  });
+  document.getElementById("shift-close-form")?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const id = +document.getElementById("shift-close-form").dataset.shiftId;
+    if (!id) return;
+    try {
+      const r = await api(`/api/shifts/${id}/close`, {
+        method: "POST",
+        body: JSON.stringify({
+          actual_cash: Math.max(0, +document.getElementById("shift-close-cash").value || 0),
+          actual_card: 0,
+          notes: document.getElementById("shift-close-notes").value.trim(),
+        }),
+      });
+      document.getElementById("shift-close-modal")?.close();
+      const diff = r.cash_difference != null ? ` · разница ${fmt(r.cash_difference)}` : "";
+      toast(`Смена закрыта${diff}`);
+      loadPosCashRegister();
+    } catch (err) { toast(err.message, "error"); }
+  });
+  document.getElementById("unit-extra-cancel")?.addEventListener("click", () => {
+    document.getElementById("unit-extra-modal")?.close();
+  });
+  document.getElementById("unit-extra-form")?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const id = +document.getElementById("unit-extra-form").dataset.unitId;
+    if (!id) return;
+    try {
+      await api(`/api/units/${id}/extra-cost`, {
+        method: "PATCH",
+        body: JSON.stringify({ extra_cost: Math.max(0, +document.getElementById("unit-extra-amount").value || 0) }),
+      });
+      document.getElementById("unit-extra-modal")?.close();
+      toast("Расходы сохранены");
+      loadWarehouseStock();
+    } catch (err) { toast(err.message, "error"); }
+  });
   fillPaySelect(document.getElementById("pos-exp-pay"));
+  let posExpType = "expense";
+  const syncPosExpTypeUi = () => {
+    const isPayout = posExpType === "payout";
+    document.getElementById("pos-exp-expense-fields")?.classList.toggle("hidden", isPayout);
+    document.getElementById("pos-exp-payout-fields")?.classList.toggle("hidden", !isPayout);
+    const cat = document.getElementById("pos-exp-category");
+    const payee = document.getElementById("pos-exp-payee");
+    const wh = document.getElementById("pos-exp-warehouse");
+    if (cat) cat.required = !isPayout;
+    if (payee) payee.required = isPayout;
+    if (wh) wh.required = isPayout;
+    const btn = document.getElementById("pos-exp-submit");
+    if (btn) btn.textContent = isPayout ? "Добавить выплату" : "Добавить расход";
+  };
+  document.querySelectorAll("#pos-exp-type-tabs .seg").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll("#pos-exp-type-tabs .seg").forEach((b) => b.classList.remove("active"));
+      btn.classList.add("active");
+      posExpType = btn.dataset.expType || "expense";
+      syncPosExpTypeUi();
+    });
+  });
+  syncPosExpTypeUi();
   document.getElementById("pos-expense-form")?.addEventListener("submit", async (e) => {
     e.preventDefault();
     try {
-      await api("/api/expenses", { method: "POST", body: JSON.stringify({
-        category: document.getElementById("pos-exp-category").value.trim(),
+      const isPayout = posExpType === "payout";
+      const body = {
+        kind: isPayout ? "payout" : "expense",
         amount: +document.getElementById("pos-exp-amount").value,
         expense_date: new Date().toISOString().slice(0, 10),
         description: document.getElementById("pos-exp-desc").value,
         payment_method_code: document.getElementById("pos-exp-pay").value,
-      }) });
-      toast("Расход добавлен");
+      };
+      if (isPayout) {
+        body.payee = document.getElementById("pos-exp-payee").value.trim();
+        body.warehouse_id = +document.getElementById("pos-exp-warehouse").value;
+        body.category = "Выплата";
+        if (!body.warehouse_id) throw new Error("Выберите склад");
+        if (!body.payee) throw new Error("Укажите, кому выплатили");
+      } else {
+        body.category = document.getElementById("pos-exp-category").value.trim();
+      }
+      await api("/api/expenses", { method: "POST", body: JSON.stringify(body) });
+      toast(isPayout ? "Выплата добавлена" : "Расход добавлен");
       document.getElementById("pos-expense-form").reset();
+      syncPosExpTypeUi();
+      fillPaySelect(document.getElementById("pos-exp-pay"));
+      fillWarehouseSelect(document.getElementById("pos-exp-warehouse"), defaultWarehouseId(), { phonesOnly: true });
       loadPosCashRegister();
     } catch (err) { toast(err.message, "error"); }
   });
@@ -1115,8 +1407,134 @@ function bindPos() {
     });
   });
   document.getElementById("pos-in-debtor")?.addEventListener("change", onPosDebtorSelected);
+  document.getElementById("pos-in-currency")?.addEventListener("change", updatePosInFxUI);
   document.getElementById("pos-inflow-form")?.addEventListener("submit", submitPosInflow);
   bindDebtorCheckout();
+}
+
+function formatSideBags(rows, field) {
+  const bags = { USD: 0, TJS: 0 };
+  for (const r of rows || []) {
+    const code = String(r.code || "TJS").toUpperCase();
+    bags[code] = (bags[code] || 0) + (+r[field] || 0);
+  }
+  return formatCurrencyBags(bags);
+}
+
+function inferWalletCurrency(b) {
+  const ex = String(b?.currency_code || "").toUpperCase();
+  if (ex === "USD" || ex === "TJS") return ex;
+  const blob = `${b?.name || ""} ${b?.code || ""}`.toLowerCase();
+  if (/доллар|dollar|usd|\$/.test(blob)) return "USD";
+  if (/сомон|смн|\btjs\b|наличн/.test(blob) && !/доллар|dollar|usd/.test(blob)) return "TJS";
+  return "";
+}
+
+/** One currency for bound wallets ($ or смн). Bags only for multi-currency wallets. */
+function formatWalletField(b, field) {
+  const cur = inferWalletCurrency(b);
+  const rows = b?.by_currency || [];
+  if (cur === "USD" || cur === "TJS") {
+    const row = rows.find((r) => String(r.code).toUpperCase() === cur);
+    const val = row ? +row[field] || 0 : 0;
+    return fmtCurrency(val, currency_meta(cur));
+  }
+  return formatSideBags(rows, field);
+}
+
+let posCashWindow = { date_from: "", date_to: "", shift: null };
+
+function formatAmountBags(bags) {
+  if (!(bags || []).length) return fmtCurrency(0, currency_meta("TJS"));
+  return (bags || []).map((b) => fmtCurrency(b.amount || 0, b)).join(" · ");
+}
+
+async function openPosCashDetail(kind, methodCode = "") {
+  try {
+    // Wallets = all-time; period KPIs = shift/today window
+    const useAll = kind === "wallet";
+    let url = `/api/pos/cash-register/detail?kind=${encodeURIComponent(kind)}&period=${useAll ? "all" : "auto"}`;
+    if (!useAll && posCashWindow.date_from) {
+      url += `&date_from=${encodeURIComponent(posCashWindow.date_from)}&date_to=${encodeURIComponent(posCashWindow.date_to || posCashWindow.date_from)}`;
+    }
+    if (methodCode) url += `&method_code=${encodeURIComponent(methodCode)}`;
+    const r = await api(url);
+    const titleEl = document.getElementById("kpi-detail-title");
+    const sumEl = document.getElementById("kpi-detail-summary");
+    const byWh = document.getElementById("kpi-detail-by-wh");
+    const thead = document.getElementById("kpi-detail-thead");
+    const tbody = document.getElementById("kpi-detail-tbody");
+    if (titleEl) titleEl.textContent = r.title || "Детали кассы";
+    if (byWh) { byWh.classList.add("hidden"); byWh.innerHTML = ""; }
+    const s = r.summary || {};
+    const curBags = s.by_currency || r.by_currency || [];
+    if (sumEl) {
+      if (kind === "profit") {
+        const finBags = (r.by_currency || []).map((c) => ({
+          code: c.code,
+          revenue: c.gross_revenue,
+          profit: c.shop_profit ?? c.net_profit,
+        }));
+        sumEl.innerHTML = `
+          <div class="metric-row"><span>Выручка</span><div class="value value-multi">${formatSideBags(finBags, "revenue")}</div></div>
+          <div class="metric-row"><span>Прибыль</span><div class="value value-multi">${formatSideBags(finBags, "profit")}</div></div>
+          <div class="metric-row"><span>Продаж</span><strong>${s.sales_count || 0}</strong></div>`;
+      } else {
+        sumEl.innerHTML = `
+          <div class="metric-row"><span>Приход (+)</span><div class="value value-multi" style="color:var(--success)">${formatSideBags(curBags, "plus")}</div></div>
+          <div class="metric-row"><span>Расход (−)</span><div class="value value-multi" style="color:var(--danger, #c44)">${formatSideBags(curBags, "minus")}</div></div>
+          <div class="metric-row"><span>Итого</span><div class="value value-multi">${formatSideBags(curBags, "net")}</div></div>
+          <div class="metric-row"><span>Записей</span><strong>${s.lines_count || 0}</strong></div>`;
+      }
+    }
+    if (thead) {
+      thead.innerHTML = kind === "profit"
+        ? "<tr><th colspan=\"5\">Детализация по валютам — в отчёте Финансы</th></tr>"
+        : "<tr><th>Дата</th><th>+/−</th><th>Откуда / куда</th><th>Кто / способ</th><th>Сумма</th></tr>";
+    }
+    if (tbody) {
+      if (kind === "profit") {
+        tbody.innerHTML = (r.by_currency || []).map((c) => `
+          <tr>
+            <td colspan="2"><strong>${esc(c.name || c.code)}</strong></td>
+            <td>выручка ${fmtCurrency(c.gross_revenue, c)}</td>
+            <td colspan="2">прибыль ${fmtCurrency(c.shop_profit ?? c.net_profit, c)}</td>
+          </tr>`).join("") || '<tr><td colspan="5" class="muted">Нет данных</td></tr>';
+      } else {
+        tbody.innerHTML = (r.lines || []).map((l) => {
+          const money = fmtCurrency(l.amount, currency_meta(l.currency_code || "TJS"));
+          const who = [l.who, l.method_name, l.ref].filter(Boolean).join(" · ");
+          const note = [l.note].filter(Boolean).join("");
+          return `<tr>
+            <td>${esc((l.at || "").slice(0, 16))}</td>
+            <td><strong style="color:${l.side === "+" ? "var(--success)" : "var(--danger, #c44)"}">${l.side}</strong></td>
+            <td>${esc(l.source)}${note ? `<br><span class="hint">${esc(note)}</span>` : ""}</td>
+            <td>${esc(who || "—")}</td>
+            <td><strong>${money}</strong></td>
+          </tr>`;
+        }).join("") || '<tr><td colspan="5" style="text-align:center;color:var(--muted)">Нет движений за период</td></tr>';
+      }
+    }
+    document.getElementById("kpi-detail-modal")?.showModal();
+  } catch (err) {
+    toast(err.message, "error");
+  }
+}
+
+function syncPosShiftUi(shift) {
+  const status = document.getElementById("pos-shift-status");
+  const openBtn = document.getElementById("pos-shift-open");
+  const closeBtn = document.getElementById("pos-shift-close");
+  if (shift?.id) {
+    const opened = (shift.opened_at || "").slice(0, 16).replace("T", " ");
+    if (status) status.innerHTML = `<strong style="color:var(--success)">Смена открыта</strong> · ${esc(shift.user_name || "")} · с ${esc(opened)}`;
+    openBtn?.classList.add("hidden");
+    closeBtn?.classList.remove("hidden");
+  } else {
+    if (status) status.innerHTML = `<strong style="color:var(--danger, #c44)">Смена не открыта</strong> — откройте смену, чтобы вести отчёт дня`;
+    openBtn?.classList.remove("hidden");
+    closeBtn?.classList.add("hidden");
+  }
 }
 
 async function loadPosCashRegister() {
@@ -1124,48 +1542,166 @@ async function loadPosCashRegister() {
   const tb = document.getElementById("pos-expenses-tbody");
   if (!kpi) return;
   try {
-    const r = await api("/api/pos/cash-register?period=day");
+    const r = await api("/api/pos/cash-register?period=auto");
+    posCashWindow = {
+      date_from: r.date_from || "",
+      date_to: r.date_to || "",
+      shift: r.shift || null,
+    };
+    syncPosShiftUi(r.shift);
+    const periodEl = document.getElementById("pos-cash-period-label");
+    if (periodEl) periodEl.textContent = r.period_label || "";
+
+    const tillBox = document.getElementById("pos-till-summary");
+    if (tillBox) {
+      const t = r.till || {};
+      const cardTxt = formatAmountBags(t.card);
+      tillBox.innerHTML = `
+        <div class="pos-till-card accent-green" title="Наличные сомони в кассе">
+          <div class="label">Наличные смн</div>
+          <div class="value">${fmtCurrency(t.cash_tjs || 0, t.cash_tjs_meta || currency_meta("TJS"))}</div>
+        </div>
+        <div class="pos-till-card accent-blue" title="Наличные доллары в кассе">
+          <div class="label">Наличные $</div>
+          <div class="value">${fmtCurrency(t.cash_usd || 0, t.cash_usd_meta || currency_meta("USD"))}</div>
+        </div>
+        <div class="pos-till-card accent-warn" title="Карта / Alif / перевод и др.">
+          <div class="label">Карта / безнал</div>
+          <div class="value value-multi">${cardTxt}</div>
+        </div>`;
+    }
+
+    const bags = r.by_currency || [];
+    const finBags = (r.by_currency_finance || []).map((c) => ({
+      code: c.code,
+      profit: c.shop_profit ?? c.net_profit,
+    }));
     kpi.innerHTML = `
-      <div class="kpi accent-blue"><div class="label">Приход</div><div class="value">${fmt(r.total_inflows)}</div></div>
-      <div class="kpi accent-warn"><div class="label">Расход</div><div class="value">${fmt(r.total_outflows)}</div></div>
-      <div class="kpi accent-green"><div class="label">Чистыми</div><div class="value">${fmt(r.net_cash)}</div></div>
-      <div class="kpi"><div class="label">Прибыль</div><div class="value">${fmt(r.profit)}</div></div>`;
+      <div class="kpi accent-blue" title="Оплаты продаж за период"><div class="label">Продажи</div><div class="value value-multi">${formatAmountBags(r.sales)}</div></div>
+      <div class="kpi accent-blue row-clickable" data-cash-kind="inflow" title="Ручные приходы"><div class="label">Приходы</div><div class="value value-multi">${formatAmountBags(r.manual_inflows)}</div></div>
+      <div class="kpi accent-warn" title="Операционные расходы"><div class="label">Расходы</div><div class="value value-multi">${formatAmountBags(r.expenses_bags)}</div></div>
+      <div class="kpi accent-warn" title="Выплаты"><div class="label">Выплаты</div><div class="value value-multi">${formatAmountBags(r.payouts_bags)}</div></div>
+      <div class="kpi accent-green row-clickable" data-cash-kind="net" title="Приход − расход за период"><div class="label">Чистыми за период</div><div class="value value-multi">${formatSideBags(bags, "net")}</div></div>
+      <div class="kpi row-clickable" data-cash-kind="profit" title="Товарная прибыль продаж"><div class="label">Прибыль</div><div class="value value-multi">${formatSideBags(finBags, "profit")}</div></div>`;
+    kpi.querySelectorAll("[data-cash-kind]").forEach((el) => {
+      el.addEventListener("click", () => openPosCashDetail(el.dataset.cashKind));
+    });
     const balBox = document.getElementById("pos-balances");
     if (balBox) {
-      balBox.innerHTML = (r.balances || []).map((b) => `
-        <div class="pos-balance-row">
-          <span>${esc(b.name)}</span>
-          <strong>${fmt(b.net)}</strong>
-          <small>+${fmt(b.inflow || 0)} / −${fmt(b.outflow || 0)}</small>
-        </div>`).join("") || '<p class="muted">Нет данных</p>';
+      const wallets = r.wallets_all_time || r.balances || [];
+      balBox.innerHTML = wallets.map((b) => {
+        const bound = inferWalletCurrency(b);
+        const mainCls = bound ? "wallet-amt" : "value value-multi";
+        return `
+        <button type="button" class="pos-balance-row pos-balance-btn" data-method="${esc(b.code)}" title="Остаток за всё время — нажмите для деталей">
+          <span>${esc(b.name)}${bound ? ` <small class="hint">(${bound === "USD" ? "$" : "смн"})</small>` : ""}</span>
+          <strong class="${mainCls}">${formatWalletField(b, "net")}</strong>
+          <small>всего: +${formatWalletField(b, "inflow")} / −${formatWalletField(b, "outflow")}</small>
+        </button>`;
+      }).join("") || '<p class="muted">Нет данных</p>';
+      balBox.querySelectorAll(".pos-balance-btn").forEach((btn) => {
+        btn.addEventListener("click", () => openPosCashDetail("wallet", btn.dataset.method || ""));
+      });
     }
-    if (tb) {
-      tb.innerHTML = (r.expenses || []).map((e) =>
-        `<tr><td>${esc(e.expense_date)}</td><td>${esc(e.category)}</td><td><strong>${fmt(e.amount)}</strong></td></tr>`
-      ).join("") || '<tr><td colspan="3" style="text-align:center;color:var(--muted)">Нет расходов</td></tr>';
-    }
-    const inTb = document.getElementById("pos-inflows-tbody");
-    if (inTb) {
-      inTb.innerHTML = (r.cash_inflows || []).map((row) => {
-        const src = row.source_type === "debtor"
-          ? `Долг: ${row.counterparty_name || "—"}`
-          : (row.counterparty_name || "Контрагент");
-        const sum = row.currency_code && row.currency_code !== (storeConfig.currency?.code || "TJS")
-          ? `${fmtCurrency(row.amount, currency_meta(row.currency_code))} · ${fmt(row.amount_base)}`
-          : fmt(row.amount_base ?? row.amount);
-        return `<tr><td>${esc((row.created_at || "").slice(0, 16))}</td><td>${esc(src)}</td><td><strong>${sum}</strong></td></tr>`;
-      }).join("") || '<tr><td colspan="3" style="text-align:center;color:var(--muted)">Нет приходов</td></tr>';
-    }
+    await loadPosCashLines();
   } catch (err) {
     kpi.innerHTML = `<p class="muted">${esc(err.message)}</p>`;
   }
 }
 
+async function loadPosCashLines(fromId) {
+  const inSel = document.getElementById("pos-in-lines-period");
+  const expSel = document.getElementById("pos-exp-lines-period");
+  let period = "week";
+  if (fromId === "pos-in-lines-period" && inSel) period = inSel.value;
+  else if (fromId === "pos-exp-lines-period" && expSel) period = expSel.value;
+  else period = inSel?.value || expSel?.value || "week";
+  if (inSel) inSel.value = period;
+  if (expSel) expSel.value = period;
+  const inLbl = document.getElementById("pos-in-lines-label");
+  const expLbl = document.getElementById("pos-exp-lines-label");
+  if (inLbl) inLbl.textContent = "Загрузка…";
+  if (expLbl) expLbl.textContent = "Загрузка…";
+  try {
+    const r = await api(`/api/pos/cash-lines?period=${encodeURIComponent(period)}`);
+    const label = `${r.period_label || ""} · ${(r.expenses || []).length} расх. / ${(r.cash_inflows || []).length} прих.`;
+    if (inLbl) inLbl.textContent = label;
+    if (expLbl) expLbl.textContent = label;
+    const tb = document.getElementById("pos-expenses-tbody");
+    if (tb) {
+      try {
+        tb.innerHTML = (r.expenses || []).map((e) => {
+          const who = e.kind === "payout" && e.payee ? e.payee : (e.category || "—");
+          const wh = e.warehouse_name || (e.warehouse_id ? `#${e.warehouse_id}` : "общие");
+          return `<tr>
+            <td>${esc(e.expense_date)}</td>
+            <td>${esc(who)}${e.kind === "payout" ? ` <small class="hint">выплата</small>` : ""}</td>
+            <td>${esc(wh)}</td>
+            <td><strong>${fmt(e.amount)}</strong></td>
+            <td><button type="button" class="btn btn-danger btn-sm" onclick="deletePosExpense(${e.id})" title="Удалить">✕</button></td>
+          </tr>`;
+        }).join("") || '<tr><td colspan="5" style="text-align:center;color:var(--muted)">Нет записей за период</td></tr>';
+      } catch (renderErr) {
+        tb.innerHTML = `<tr><td colspan="5" class="muted">${esc(renderErr.message)}</td></tr>`;
+      }
+    }
+    const inTb = document.getElementById("pos-inflows-tbody");
+    if (inTb) {
+      try {
+        inTb.innerHTML = (r.cash_inflows || []).map((row) => {
+          const src = row.source_type === "debtor"
+            ? `Долг: ${row.counterparty_name || "—"}`
+            : (row.counterparty_name || "Контрагент");
+          let sum;
+          try {
+            sum = row.currency_code && row.currency_code !== (storeConfig.currency?.code || "TJS")
+              ? `${fmtCurrency(row.amount, currency_meta(row.currency_code))} · ${fmt(row.amount_base)}`
+              : fmt(row.amount_base ?? row.amount);
+          } catch {
+            sum = String(row.amount_base ?? row.amount ?? "—");
+          }
+          return `<tr>
+            <td>${esc((row.created_at || "").slice(0, 16))}</td>
+            <td>${esc(src)}</td>
+            <td><strong>${sum}</strong></td>
+            <td><button type="button" class="btn btn-danger btn-sm" onclick="deletePosInflow(${row.id})" title="Удалить">✕</button></td>
+          </tr>`;
+        }).join("") || '<tr><td colspan="4" style="text-align:center;color:var(--muted)">Нет записей за период</td></tr>';
+      } catch (renderErr) {
+        inTb.innerHTML = `<tr><td colspan="4" class="muted">${esc(renderErr.message)}</td></tr>`;
+      }
+    }
+  } catch (err) {
+    if (inLbl) inLbl.textContent = err.message;
+    if (expLbl) expLbl.textContent = err.message;
+    toast(err.message, "error");
+  }
+}
+window.loadPosCashLines = loadPosCashLines;
+
+window.deletePosExpense = async (id) => {
+  if (!id || !confirm("Удалить этот расход / выплату?")) return;
+  try {
+    await api(`/api/expenses/${id}`, { method: "DELETE" });
+    toast("Удалено");
+    loadPosCashRegister();
+  } catch (err) { toast(err.message, "error"); }
+};
+
+window.deletePosInflow = async (id) => {
+  if (!id || !confirm("Удалить этот приход?")) return;
+  try {
+    await api(`/api/pos/cash-inflows/${id}`, { method: "DELETE" });
+    toast("Удалено");
+    loadPosCashRegister();
+  } catch (err) { toast(err.message, "error"); }
+};
 
 async function loadPos() {
   if (!warehouses.length) await loadWarehouses();
   await refreshSession();
   fillWarehouseSelect(document.getElementById("pos-warehouse"), document.getElementById("pos-warehouse").value || defaultWarehouseId(), { phonesOnly: true });
+  fillWarehouseSelect(document.getElementById("pos-exp-warehouse"), defaultWarehouseId(), { phonesOnly: true });
   fillPaySelect(document.getElementById("pos-exp-pay"));
   fillPaySelect(document.getElementById("pos-in-pay"));
   await loadProducts();
@@ -1177,7 +1713,6 @@ async function loadPos() {
   }
   hidePosSearchResults();
   focusScanInput("pos-search");
-  updatePosShiftHint();
 }
 
 async function loadProducts() {
@@ -1226,15 +1761,24 @@ async function runPosSmartSearch(q, autoPick = false) {
     const items = [];
     if (hit.match_type === "unit") {
       for (const u of hit.matches || []) {
+        const otherWh = whId && +u.warehouse_id !== whId;
         items.push({
           kind: "unit",
           product_id: u.product_id,
           unit_id: u.id,
+          warehouse_id: u.warehouse_id,
           name: u.product_name || u.model || "Устройство",
-          meta: [u.imei || u.serial, u.product_color || u.color, u.memory, u.warehouse_name].filter(Boolean).join(" · "),
+          meta: [
+            u.imei || u.serial,
+            u.product_color || u.color,
+            u.memory,
+            otherWh ? `склад: ${u.warehouse_name || u.warehouse_id}` : u.warehouse_name,
+          ].filter(Boolean).join(" · "),
           price: u.sale_price,
           product: null,
           reserved: !!u.is_reserved,
+          other_warehouse: otherWh,
+          warehouse_name: u.warehouse_name || "",
         });
       }
     } else if (hit.match_type === "product") {
@@ -1265,7 +1809,7 @@ async function runPosSmartSearch(q, autoPick = false) {
     }
     box.innerHTML = items.map((it, idx) => `
       <button type="button" class="pos-search-item${it.out ? " out" : ""}" data-idx="${idx}">
-        <span class="psi-name">${esc(it.name)}${it.reserved ? ' <span class="tag">резерв</span>' : ""}</span>
+        <span class="psi-name">${esc(it.name)}${it.reserved ? ' <span class="tag">резерв</span>' : ""}${it.other_warehouse ? ' <span class="tag">др. склад</span>' : ""}</span>
         <span class="psi-price">${it.price != null ? posMoney(it.price) : ""}</span>
         <span class="psi-meta">${esc(it.meta || "")}</span>
       </button>`).join("");
@@ -1296,19 +1840,55 @@ async function selectPosSearchItem(it) {
   focusScanInput("pos-search");
 }
 
+function updatePosInFxUI() {
+  const sel = document.getElementById("pos-in-debtor");
+  const opt = sel?.selectedOptions?.[0];
+  const debtCur = (opt?.dataset?.currency || "TJS").toUpperCase();
+  const payCur = (document.getElementById("pos-in-currency")?.value || "TJS").toUpperCase();
+  const wrap = document.getElementById("pos-in-fx-wrap");
+  const needFx = posInType === "debtor" && !!opt?.value && payCur !== debtCur;
+  wrap?.classList.toggle("hidden", !needFx);
+  if (needFx) {
+    const rateEl = document.getElementById("pos-in-fx-rate");
+    if (rateEl && !+rateEl.value) {
+      const r = defaultUsdToTjsRate?.() ?? getRate("USD");
+      if (r != null && r > 0) rateEl.value = r;
+    }
+  }
+}
+
 async function loadPosDebtorsSelect() {
   const sel = document.getElementById("pos-in-debtor");
   if (!sel) return;
   try {
-    const rows = await api("/api/receivables?status=open");
-    sel.innerHTML = `<option value="">Выберите должника…</option>` + (rows || []).map((r) =>
-      `<option value="${r.id}" data-due="${r.amount_due}">${esc(r.customer_name || "Без имени")} — долг ${fmt(r.amount_due)}${r.products ? ` · ${esc(String(r.products).slice(0, 40))}` : ""}</option>`
-    ).join("");
-    if (!rows?.length) {
-      document.getElementById("pos-in-debtor-hint").textContent = "Открытых долгов нет";
-    } else {
-      document.getElementById("pos-in-debtor-hint").textContent = "Выберите должника — сумма спишется с долга";
+    const [receivables, mutual] = await Promise.all([
+      api("/api/receivables?status=open").catch(() => []),
+      api("/api/mutual-entries?status=open").catch(() => []),
+    ]);
+    const saleOpts = (receivables || []).map((r) => {
+      const cur = (r.currency_code || "TJS").toUpperCase();
+      const due = +r.amount_due || 0;
+      const label = `${r.customer_name || "Без имени"} — ${fmtCurrency(due, currency_meta(cur))}${r.products ? ` · ${String(r.products).slice(0, 36)}` : ""} · продажа`;
+      return `<option value="r:${r.id}" data-due="${due}" data-currency="${cur}">${esc(label)}</option>`;
+    });
+    const mutualOpts = (mutual || [])
+      .filter((m) => m.direction === "owe_us")
+      .map((m) => {
+        const cur = (m.currency_code || "TJS").toUpperCase();
+        const due = +m.amount_due || 0;
+        const note = m.product_note || m.notes || "";
+        const label = `${m.person_name || "Без имени"} — ${fmtCurrency(due, currency_meta(cur))}${note ? ` · ${String(note).slice(0, 36)}` : ""} · займ`;
+        return `<option value="m:${m.id}" data-due="${due}" data-currency="${cur}">${esc(label)}</option>`;
+      });
+    const all = [...mutualOpts, ...saleOpts];
+    sel.innerHTML = `<option value="">Выберите должника…</option>` + all.join("");
+    const hint = document.getElementById("pos-in-debtor-hint");
+    if (hint) {
+      hint.textContent = all.length
+        ? "Займы и долги по продажам — сумма спишется с выбранного долга"
+        : "Открытых долгов нет (взаиморасчёты с типом «нам должны» или продажи в долг)";
     }
+    updatePosInFxUI();
   } catch (err) {
     sel.innerHTML = `<option value="">Ошибка загрузки</option>`;
   }
@@ -1318,10 +1898,14 @@ function onPosDebtorSelected() {
   const sel = document.getElementById("pos-in-debtor");
   const opt = sel?.selectedOptions?.[0];
   const due = +(opt?.dataset?.due || 0);
+  const cur = (opt?.dataset?.currency || "TJS").toUpperCase();
   const amount = document.getElementById("pos-in-amount");
-  if (due > 0 && amount && !+amount.value) amount.value = due;
+  const currencyEl = document.getElementById("pos-in-currency");
+  if (due > 0 && amount) amount.value = due;
+  if (currencyEl && cur) currencyEl.value = cur;
   const hint = document.getElementById("pos-in-debtor-hint");
-  if (hint && due > 0) hint.textContent = `К погашению: ${fmt(due)}`;
+  if (hint && due > 0) hint.textContent = `К погашению: ${fmtCurrency(due, currency_meta(cur))}`;
+  updatePosInFxUI();
 }
 
 async function submitPosInflow(e) {
@@ -1333,15 +1917,25 @@ async function submitPosInflow(e) {
   if (!(amount > 0)) { toast("Укажите сумму", "error"); return; }
   try {
     if (posInType === "debtor") {
-      const receivable_id = +document.getElementById("pos-in-debtor").value;
-      if (!receivable_id) { toast("Выберите должника", "error"); return; }
-      await api("/api/pos/cash-inflow", {
-        method: "POST",
-        body: JSON.stringify({
-          amount, currency_code, payment_method_code,
-          source_type: "debtor", receivable_id, notes,
-        }),
-      });
+      const raw = document.getElementById("pos-in-debtor").value || "";
+      if (!raw) { toast("Выберите должника", "error"); return; }
+      const [kind, idStr] = raw.split(":");
+      const id = +idStr;
+      if (!id || (kind !== "r" && kind !== "m")) { toast("Выберите должника", "error"); return; }
+      const opt = document.getElementById("pos-in-debtor")?.selectedOptions?.[0];
+      const debtCur = (opt?.dataset?.currency || "TJS").toUpperCase();
+      const body = {
+        amount, currency_code, payment_method_code,
+        source_type: "debtor", notes,
+      };
+      if (kind === "m") body.mutual_entry_id = id;
+      else body.receivable_id = id;
+      if (currency_code !== debtCur) {
+        const fx = +document.getElementById("pos-in-fx-rate")?.value || 0;
+        if (!(fx > 0)) { toast("Укажите курс: сколько сомони за 1 доллар", "error"); return; }
+        body.fx_rate = fx;
+      }
+      await api("/api/pos/cash-inflow", { method: "POST", body: JSON.stringify(body) });
       toast("Оплата долга принята");
     } else {
       const counterparty_name = document.getElementById("pos-in-counterparty").value.trim();
@@ -1362,6 +1956,7 @@ async function submitPosInflow(e) {
     });
     document.getElementById("pos-in-counterparty-block")?.classList.remove("hidden");
     document.getElementById("pos-in-debtor-block")?.classList.add("hidden");
+    document.getElementById("pos-in-fx-wrap")?.classList.add("hidden");
     const cp = document.getElementById("pos-in-counterparty");
     if (cp) cp.required = true;
     loadPosCashRegister();
@@ -1371,8 +1966,19 @@ async function submitPosInflow(e) {
 }
 
 
+function switchPosWarehouse(warehouseId, { clearCart = true } = {}) {
+  const sel = document.getElementById("pos-warehouse");
+  if (!sel) return false;
+  const id = String(warehouseId);
+  if (sel.value === id) return true;
+  if (!clearCart) sel.dataset.keepCart = "1";
+  sel.value = id;
+  sel.dispatchEvent(new Event("change"));
+  return sel.value === id;
+}
+
 async function addToCart(id, preselectedUnitId = null, productOverride = null) {
-  const whId = +document.getElementById("pos-warehouse").value;
+  let whId = +document.getElementById("pos-warehouse").value;
   let p = productOverride || products.find((x) => x.id === id);
   if (!p) {
     try { p = await api(`/api/products/${id}`); } catch { toast("Товар не найден", "error"); return; }
@@ -1394,8 +2000,16 @@ async function addToCart(id, preselectedUnitId = null, productOverride = null) {
         return;
       }
       if (+picked.warehouse_id !== whId) {
-        toast("Устройство на другом складе", "error");
-        return;
+        if (cart.length) {
+          toast(`Устройство на складе «${picked.warehouse_name || picked.warehouse_id}». Очистите чек или смените склад.`, "error");
+          return;
+        }
+        if (!switchPosWarehouse(picked.warehouse_id, { clearCart: false })) {
+          toast("Не удалось переключить склад", "error");
+          return;
+        }
+        whId = +picked.warehouse_id;
+        toast(`Склад: ${picked.warehouse_name || picked.warehouse_id}`);
       }
       const used = cart.flatMap((c) => c.unit_ids || []);
       if (used.includes(picked.id)) { toast("Уже в чеке", "error"); return; }
@@ -1575,10 +2189,13 @@ function renderCart() {
       <span class="tag tag-${c.product.ownership_type === "consignment" ? "cons" : "own"}" style="font-size:.6rem">${ownLabel(c.product.ownership_type)}</span>${imeiLabel}</div>
       ${qtyCtrl}
       <div class="ci-price-wrap">
-        <input type="number" class="input sm ci-price${custom ? " is-custom" : ""}" min="0.01" step="0.01"
-          value="${price}" title="Цена продажи (прайс ${posMoney(catalog)})"
-          onchange="setCartPrice(${idx}, this.value)" oninput="setCartPrice(${idx}, this.value, true)">
-        <button type="button" class="btn btn-ghost btn-sm ci-price-reset" title="По прайсу" onclick="resetCartPrice(${idx})">↺</button>
+        <span class="ci-price-label">Цена</span>
+        <div class="ci-price-row">
+          <input type="number" class="input sm ci-price${custom ? " is-custom" : ""}" min="0.01" step="0.01"
+            value="${price}" title="Цена продажи (прайс ${posMoney(catalog)})"
+            onchange="setCartPrice(${idx}, this.value)" oninput="setCartPrice(${idx}, this.value, true)">
+          <button type="button" class="btn btn-ghost btn-sm ci-price-reset" title="По прайсу" onclick="resetCartPrice(${idx})">↺</button>
+        </div>
       </div>
       <strong class="ci-line-sum">${posMoney(line)}</strong>
       ${c.unit_ids?.length ? `<button class="btn btn-ghost btn-sm" onclick="removeCartLine(${idx})">×</button>` : `<span></span>`}
@@ -1589,7 +2206,7 @@ function renderCart() {
   document.getElementById("cart-total").textContent = posMoney(Math.max(0, sub - disc));
   renderSplitPayments();
   refreshPosFxUi();
-  document.getElementById("checkout-btn").disabled = !openShift;
+  document.getElementById("checkout-btn").disabled = cart.length === 0;
 }
 
 window.setCartPrice = (idx, value, soft = false) => {
@@ -1678,11 +2295,6 @@ function bindDebtorCheckout() {
 }
 
 async function checkout() {
-  if (!openShift) {
-    toast("Сначала откройте смену", "error");
-    navigate("shifts");
-    return;
-  }
   const discount = +document.getElementById("cart-discount").value || 0;
   const warehouse_id = +document.getElementById("pos-warehouse").value;
   const total = cartTotalDue();
@@ -1692,30 +2304,34 @@ async function checkout() {
   try {
     const paymentsRaw = collectSplitPayments();
     if (fxOn) {
-      const probe = convertMoney(1, payCur, saleCur);
-      if (probe == null) {
-        toast(`Нет курса для ${payCur} → ${saleCur}. Добавьте курс в Настройках.`, "error");
+      const rate = posFxRateSaleToPay();
+      if (rate == null || rate <= 0) {
+        toast(`Укажите курс 1 ${saleCur} → ${payCur}`, "error");
         return;
       }
     }
-    const paidUi = paymentsRaw.reduce((s, p) => s + p.amount, 0);
-    const totalUi = fxOn ? convertMoney(total, saleCur, payCur) : total;
-    if (totalUi == null) {
-      toast("Нет курса валюты в настройках", "error");
-      return;
+    let paidSale = 0;
+    for (const p of paymentsRaw) {
+      const conv = posConvertToSale(p.amount, p.currency_code || saleCur);
+      if (conv == null) {
+        toast("Не удалось пересчитать оплату по курсу", "error");
+        return;
+      }
+      paidSale += conv;
     }
-    if (paidUi <= 0 && total > 0) { toast("Укажите суммы оплаты", "error"); return; }
+    if (paidSale <= 0 && total > 0) { toast("Укажите суммы оплаты", "error"); return; }
     let debtor_name = "";
     let debtor_phone = "";
-    if (totalUi - paidUi > 0.01) {
-      const debtor = await promptDebtorModal(totalUi, paidUi, fxOn ? payCur : saleCur);
+    if (total - paidSale > 0.01) {
+      const debtor = await promptDebtorModal(total, paidSale, saleCur);
       if (!debtor) return;
       debtor_name = debtor.name;
       debtor_phone = debtor.phone;
-    } else if (Math.abs(totalUi - paidUi) > 0.01) {
+    } else if (Math.abs(total - paidSale) > 0.01) {
       toast("Сумма оплат не совпадает с итогом", "error");
       return;
     }
+    const fxRate = fxOn ? posFxRateSaleToPay() : null;
     const payload = {
       items: cart.map((c) => ({
         product_id: c.product_id,
@@ -1736,6 +2352,7 @@ async function checkout() {
       debtor_name,
       debtor_phone,
       pay_currency: fxOn ? payCur : "",
+      fx_rate: fxRate || undefined,
     };
     let sale;
     try {
@@ -1758,12 +2375,14 @@ async function checkout() {
     document.getElementById("cart-discount").value = "0";
     const fx = document.getElementById("pos-fx-enable");
     if (fx) fx.checked = false;
+    const rateInp = document.getElementById("pos-fx-rate");
+    if (rateInp) rateInp.dataset.manual = "0";
     renderCart();
     await loadProducts();
     await refreshSession();
     showReceipt(sale);
     loadPosCashRegister();
-    if (totalUi - paidUi > 0.01) loadDebtorsPage();
+    if (total - paidSale > 0.01) loadDebtorsPage();
     toast("Продажа проведена");
   } catch (e) { toast(e.message, "error"); }
 }
@@ -2069,11 +2688,11 @@ window.showSale = async (id) => {
 };
 
 window.returnSale = async (id) => {
-  if (!confirm("Оформить возврат? Товары вернутся на склад, долг клиента закроется, начисление поставщику отменится.")) return;
+  if (!confirm("Оформить возврат? Телефон с партнёрства вернётся на Б/У (по IMEI), остальные — на свой склад. Долг клиента закроется.")) return;
   try {
-    await api(`/api/sales/${id}/void`, { method: "POST" });
+    const res = await api(`/api/sales/${id}/void`, { method: "POST" });
     document.getElementById("sale-detail-modal")?.close();
-    toast("Возврат оформлен");
+    toast(res?.return_to_bu ? "Возврат: телефон на складе Б/У" : "Возврат оформлен");
     loadSales();
     if (currentPage === "debtors") loadDebtorsPage();
     if (currentPage === "creditors") loadCreditorsPage();
@@ -2226,10 +2845,10 @@ function bindWarehouses() {
     document.getElementById(id)?.addEventListener("change", updateInboundFields);
   });
   document.getElementById("ib-existing-product")?.addEventListener("change", onInboundExistingSelect);
-  document.getElementById("wh-show-total").onclick = () => {
-    if (!whStockViewTotal) showAllWarehousesStock();
-    else loadWarehouseStock();
-  };
+  document.getElementById("wh-show-total").onclick = () => showAllWarehousesStock();
+  document.getElementById("wh-detail-back")?.addEventListener("click", closeWhDetailModal);
+  document.getElementById("wh-detail-close")?.addEventListener("click", closeWhDetailModal);
+  document.getElementById("wh-detail-search")?.addEventListener("input", debounce(() => applyWhDetailSearch(), 160));
   document.getElementById("wh-refresh-movements").onclick = loadWarehouseMovements;
   document.getElementById("transfer-doc-close").onclick = () => document.getElementById("transfer-doc-modal").close();
   document.getElementById("transfer-doc-print").onclick = () => printTransferDocument();
@@ -2252,29 +2871,60 @@ function bindWarehouses() {
 
 async function loadWarehousesPage() {
   if (!warehouses.length) await loadWarehouses();
+  selectedWarehouseId = null;
+  whStockViewTotal = false;
   renderWarehouseList();
   populateImportWarehouseSelect();
-  if (whStockViewTotal) {
-    await loadWarehouseStock();
-  } else if (!selectedWarehouseId) {
-    showAllWarehousesStock();
-  } else {
-    await loadWarehouseStock();
-  }
   await loadWarehouseMovements();
 }
 
-window.showAllWarehousesStock = () => {
+window.showAllWarehousesStock = async () => {
   whStockViewTotal = true;
   selectedWarehouseId = null;
-  const btn = document.getElementById("wh-show-total");
-  if (btn) {
-    btn.textContent = "Сводка по всем складам";
-    btn.classList.add("active");
-  }
+  whViewMode = "stock";
   renderWarehouseList();
-  loadWarehouseStock();
+  await loadWarehouseStock();
+  openWhDetailModal();
 };
+
+function openWhDetailModal() {
+  const search = document.getElementById("wh-detail-search");
+  if (search) search.value = "";
+  const modal = document.getElementById("wh-detail-modal");
+  modal?.showModal();
+  const wrap = document.getElementById("wh-stock-table-wrap");
+  if (wrap) wrap.scrollLeft = 0;
+  requestAnimationFrame(() => search?.focus());
+}
+function closeWhDetailModal() {
+  document.getElementById("wh-detail-modal")?.close();
+}
+
+function applyWhDetailSearch() {
+  const q = (document.getElementById("wh-detail-search")?.value || "").trim().toLowerCase();
+  const digits = q.replace(/\D/g, "");
+  const matchText = (text) => {
+    const t = String(text || "").toLowerCase();
+    if (!q) return true;
+    if (t.includes(q)) return true;
+    if (digits.length >= 3) {
+      const td = t.replace(/\D/g, "");
+      if (td.includes(digits)) return true;
+    }
+    return false;
+  };
+  // Stock / summary table
+  document.querySelectorAll("#wh-stock-tbody tr").forEach((tr) => {
+    tr.style.display = matchText(tr.textContent) ? "" : "none";
+  });
+  // Z-report / full Excel tables (all sections)
+  document.querySelectorAll("#wh-z-report tbody tr, #wh-z-content tbody tr").forEach((tr) => {
+    tr.style.display = matchText(tr.textContent) ? "" : "none";
+  });
+  // Keep horizontal scroll at start so first columns stay visible
+  const wrap = document.getElementById("wh-stock-table-wrap");
+  if (wrap && !q) wrap.scrollLeft = 0;
+}
 
 function populateImportWarehouseSelect() {
   const sel = document.getElementById("wh-import-warehouse");
@@ -2388,18 +3038,11 @@ async function submitProductsImport(e) {
 
 function renderWarehouseList() {
   const tb = document.getElementById("wh-list-tbody");
-  const allActive = whStockViewTotal ? " wh-row-active" : "";
-  const allRow = warehouses.length > 1 ? `
-    <tr class="wh-row wh-row-all${allActive}" onclick="showAllWarehousesStock()">
-      <td><strong>Все склады</strong></td>
-      <td><span class="muted">Общая сводка</span></td>
-      <td colspan="2"></td>
-    </tr>` : "";
-  tb.innerHTML = allRow + phoneWarehouses().map((w) => `
+  tb.innerHTML = phoneWarehouses().map((w) => `
     <tr class="wh-row${!whStockViewTotal && w.id === selectedWarehouseId ? " wh-row-active" : ""}" data-id="${w.id}" onclick="selectWarehouse(${w.id})">
       <td><strong>${esc(w.name)}</strong>${w.is_default ? ' <span class="tag tag-own" style="font-size:.6rem">по умолч.</span>' : ""}</td>
       <td>${dash(w.address)}</td>
-      <td><button type="button" class="btn btn-ghost btn-sm" onclick="event.stopPropagation(); selectWarehouse(${w.id})">Остатки</button></td>
+      <td>${esc((w.currency?.code || w.currency_code || "—"))}</td>
       <td onclick="event.stopPropagation()">
         <button class="btn btn-ghost btn-sm" onclick="editWarehouse(${w.id})">✎</button>
         <button class="btn btn-danger" onclick="deleteWarehouse(${w.id})">✕</button>
@@ -2407,18 +3050,43 @@ function renderWarehouseList() {
     </tr>`).join("") || '<tr><td colspan="4" style="text-align:center;color:var(--muted)">Нет складов</td></tr>';
 }
 
-window.selectWarehouse = (id) => {
+window.selectWarehouse = async (id) => {
   selectedWarehouseId = id;
   whStockViewTotal = false;
   whViewMode = "stock";
-  const btn = document.getElementById("wh-show-total");
-  if (btn) {
-    btn.textContent = "← Все склады";
-    btn.classList.remove("active");
-  }
+  document.querySelectorAll("#wh-main-tabs .seg").forEach((x) => x.classList.toggle("active", x.dataset.whView === "stock"));
   renderWarehouseList();
-  loadWarehouseStock();
+  openWhDetailModal();
+  await loadWarehouseStock();
 };
+
+function renderWhStockTotals(totals) {
+  const el = document.getElementById("wh-stock-totals");
+  if (!el) return;
+  if (!totals || (totals.value == null && !totals.value_usd && !totals.value_tjs)) {
+    el.classList.add("hidden");
+    el.innerHTML = "";
+    return;
+  }
+  const usd = currency_meta("USD");
+  const tjs = currency_meta("TJS");
+  const count = (totals.units_count || 0) + (totals.qty_items || 0);
+  el.innerHTML = `
+    <div class="wst-label">Итого остаток на складе${count ? ` · ${count} шт.` : ""}</div>
+    <div class="wst-item"><strong>${fmtCurrency(totals.value_usd ?? 0, usd)}</strong><span>в долларах</span></div>
+    <div class="wst-item"><strong>${fmtCurrency(totals.value_tjs ?? 0, tjs)}</strong><span>в сомони</span></div>
+    ${totals.currency_code && totals.currency_code !== "USD" && totals.currency_code !== "TJS"
+      ? `<div class="wst-item"><strong>${fmtCurrency(totals.value ?? 0, totals.currency || currency_meta(totals.currency_code))}</strong><span>валюта склада</span></div>`
+      : ""}`;
+  el.classList.remove("hidden");
+}
+
+function hideWhStockTotals() {
+  const el = document.getElementById("wh-stock-totals");
+  if (!el) return;
+  el.classList.add("hidden");
+  el.innerHTML = "";
+}
 
 async function loadWarehouseStock() {
   const tb = document.getElementById("wh-stock-tbody");
@@ -2446,13 +3114,26 @@ async function loadWarehouseStock() {
         <td><strong>${p.stock}</strong></td>
         <td>${fmt(p.purchase_price)}</td>
       </tr>`).join("") || '<tr><td colspan="4" style="text-align:center;color:var(--muted)">Нет остатков</td></tr>';
+    try {
+      const funds = await api("/api/reports/funds");
+      renderWhStockTotals({
+        value_usd: funds.totals?.stock_usd,
+        value_tjs: funds.totals?.stock_tjs,
+        units_count: (funds.warehouses || []).reduce((s, w) => s + (w.units_count || 0), 0),
+        qty_items: (funds.warehouses || []).reduce((s, w) => s + (w.qty_items || 0), 0),
+        currency_code: "USD",
+      });
+    } catch {
+      hideWhStockTotals();
+    }
+    applyWhDetailSearch();
     return;
   }
 
   const wh = warehouses.find((w) => w.id === selectedWarehouseId);
   const kind = warehouseKind(selectedWarehouseId);
   const curTag = wh?.currency?.code === "USD" ? " $" : " смн";
-  title.textContent = wh ? `Остатки: ${wh.name} (${wh.currency?.symbol || curTag.trim()})` : "Остатки склада";
+  title.textContent = wh ? `${wh.name} · ${wh.currency?.symbol || curTag.trim()}` : "Склад";
   tabs?.classList.toggle("hidden", !hasWh);
   const stockTab = document.getElementById("wh-tab-stock");
   if (stockTab) {
@@ -2469,7 +3150,8 @@ async function loadWarehouseStock() {
   tableWrap?.classList.remove("hidden");
 
   if (!selectedWarehouseId) {
-    tb.innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--muted)">Выберите склад</td></tr>';
+    tb.innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--muted)">Выберите склад</td></tr>';
+    hideWhStockTotals();
     return;
   }
 
@@ -2478,33 +3160,42 @@ async function loadWarehouseStock() {
 
   const data = await api(`/api/warehouses/${selectedWarehouseId}/devices`);
   whDevicesCache = data.items || [];
+  const colSpan = cols.length;
   tb.innerHTML = whDevicesCache.map((u) => {
-    const profitHint = u.sale_price > u.purchase_price ? whMoney(u.sale_price - u.purchase_price) : "—";
+    const arrival = u.arrival_date || u.created_at?.slice(0, 10) || "—";
+    const extra = +(u.customs_price || u.extra_cost || 0);
+    const comment = u.client_name || u.notes || "—";
     const sellBtn = `<button class="btn btn-primary btn-sm" onclick="openWhSellModal(${u.id})">Продать</button>`;
+    const extraBtn = `<button type="button" class="btn btn-ghost btn-sm" onclick="openUnitExtraModal(${u.id})" title="Изменить расходы">${extra ? whMoney(extra) : "＋ 0"}</button>`;
     if (kind === "used") {
       return `<tr>
+        <td>${esc(arrival)}</td>
         <td><strong>${esc(u.model)}</strong></td>
-        <td>${dash(u.color)}</td>
-        <td>${dash(u.memory)}</td>
         <td>${u.battery_capacity != null ? u.battery_capacity + "%" : "—"}</td>
         <td>${esc(u.imei || u.serial || "—")}</td>
+        <td>${dash(u.memory)}</td>
+        <td>${dash(u.color)}</td>
         <td>${whMoney(u.purchase_price)}</td>
-        <td>${esc(u.client_name || "—")}</td>
+        <td>${extraBtn}</td>
+        <td style="font-size:.8rem">${esc(comment)}</td>
         <td>${sellBtn}</td>
       </tr>`;
     }
     return `<tr>
-      <td>${esc(u.arrival_date || u.created_at?.slice(0, 10) || "—")}</td>
+      <td>${esc(arrival)}</td>
       <td><strong>${esc(u.model)}</strong></td>
-      <td>${dash(u.color)}</td>
-      <td>${dash(u.memory)}</td>
       <td>${esc(u.region || "—")}</td>
       <td>${esc(u.imei || "—")}</td>
+      <td>${dash(u.memory)}</td>
+      <td>${dash(u.color)}</td>
       <td>${whMoney(u.purchase_price)}</td>
+      <td>${extraBtn}</td>
       <td>${esc(u.supplier_name || "—")}</td>
       <td>${sellBtn}</td>
     </tr>`;
-  }).join("") || '<tr><td colspan="9" style="text-align:center;color:var(--muted)">Нет остатков</td></tr>';
+  }).join("") || `<tr><td colspan="${colSpan}" style="text-align:center;color:var(--muted)">Нет остатков</td></tr>`;
+  renderWhStockTotals(data.totals);
+  applyWhDetailSearch();
 }
 
 async function loadWhZReport() {
@@ -2518,23 +3209,36 @@ async function loadWhZReport() {
     el.dataset.inited = "1";
     el.innerHTML = `
       <div class="toolbar" style="margin-bottom:0.75rem;flex-wrap:wrap">
-        <label>Месяц<select id="wh-z-month" class="select sm-select">
-          ${[1,2,3,4,5,6,7,8,9,10,11,12].map((m)=>{const mn=['','Янв','Фев','Мар','Апр','Май','Июн','Июл','Авг','Сен','Окт','Ноя','Дек'];return `<option value="${m}"${m===5?' selected':''}>${mn[m]}</option>`;}).join('')}
+        <label>Период<select id="wh-z-period" class="select sm-select">
+          <option value="all" selected>Весь период (как Excel)</option>
+          <option value="custom">Месяц</option>
         </select></label>
-        <label>Год<input type="number" id="wh-z-year" class="input sm" value="${defaultYear}" min="2020" max="2035" style="width:5rem"></label>
+        <span id="wh-z-month-wrap" class="hidden">
+          <label>Месяц<select id="wh-z-month" class="select sm-select">
+            ${[1,2,3,4,5,6,7,8,9,10,11,12].map((m)=>{const mn=['','Янв','Фев','Мар','Апр','Май','Июн','Июл','Авг','Сен','Окт','Ноя','Дек'];return `<option value="${m}"${m===defaultMonth?' selected':''}>${mn[m]}</option>`;}).join('')}
+          </select></label>
+          <label>Год<input type="number" id="wh-z-year" class="input sm" value="${defaultYear}" min="2020" max="2035" style="width:5rem"></label>
+        </span>
         <button type="button" id="wh-z-refresh" class="btn btn-secondary btn-sm">Показать</button>
         <label class="import-file-label" style="margin-left:auto">
-          <span class="btn btn-ghost btn-sm">Импорт Excel (May)</span>
+          <span class="btn btn-ghost btn-sm">Импорт Excel</span>
           <input type="file" id="wh-z-import-file" accept=".xlsx" hidden>
         </label>
       </div>
       <div id="wh-z-content"></div>`;
     document.getElementById("wh-z-refresh")?.addEventListener("click", loadWhZReport);
+    document.getElementById("wh-z-period")?.addEventListener("change", () => {
+      document.getElementById("wh-z-month-wrap")?.classList.toggle("hidden", document.getElementById("wh-z-period")?.value !== "custom");
+    });
     document.getElementById("wh-z-import-file")?.addEventListener("change", importWhZExcel);
   }
+  const period = document.getElementById("wh-z-period")?.value || "all";
   const year = +document.getElementById("wh-z-year")?.value || defaultYear;
   const month = +document.getElementById("wh-z-month")?.value || defaultMonth;
-  const r = await api(`/api/warehouses/${selectedWarehouseId}/z-report?period=custom&year=${year}&month=${month}`);
+  const url = period === "custom"
+    ? `/api/warehouses/${selectedWarehouseId}/z-report?period=custom&year=${year}&month=${month}`
+    : `/api/warehouses/${selectedWarehouseId}/z-report?period=all`;
+  const r = await api(url);
   const isUsed = kind === "used";
   const whFmt = (n) => fmtCurrency(n, r.currency || warehouseCurrency(selectedWarehouseId));
   const curLabel = (r.currency || warehouseCurrency(selectedWarehouseId))?.code === "USD" ? "$" : "смн";
@@ -2592,6 +3296,13 @@ async function loadWhZReport() {
       <table class="data-table"><thead>${head}</thead>
       <tbody>${(r.stock_lines || []).map((l) => zRow(l, false)).join("") || `<tr><td colspan="${cols}">Нет остатков</td></tr>`}</tbody></table>
     </div>`;
+  try {
+    const tot = await api(`/api/warehouses/${selectedWarehouseId}/stock-value`);
+    renderWhStockTotals(tot);
+  } catch {
+    hideWhStockTotals();
+  }
+  applyWhDetailSearch();
 }
 
 async function importWhZExcel(e) {
@@ -2601,12 +3312,20 @@ async function importWhZExcel(e) {
     e.target.value = "";
     return;
   }
+  const affectCash = confirm(
+    "Загрузить суммы Excel НА КАССУ?\n\n"
+    + "ОК — да: продажи попадут в «Наличные смн / $ / карта»\n"
+    + "Отмена — нет: только склад и Z-отчёт"
+  );
   try {
     const fd = new FormData();
     fd.append("file", file);
     const headers = {};
     if (pin) headers["X-Pin"] = pin;
-    const res = await fetch("/api/import/z-register?replace=1", { method: "POST", headers, body: fd });
+    const res = await fetch(
+      `/api/import/z-register?replace=1&affect_cash=${affectCash ? "true" : "false"}`,
+      { method: "POST", headers, body: fd },
+    );
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
       throw new Error(err.detail || `Ошибка ${res.status}`);
@@ -2618,10 +3337,12 @@ async function importWhZExcel(e) {
       return line;
     }).join("; ");
     const warn = Object.values(r.sheets || {}).flatMap((v) => v.errors || []).slice(0, 5);
-    toast(warn.length ? `Импорт: ${summary}. ${warn.join("; ")}` : `Импорт: ${summary}`, warn.length ? "info" : "success");
+    const cashNote = r.affects_cash ? " · на кассу: да" : " · на кассу: нет";
+    toast(warn.length ? `Импорт: ${summary}${cashNote}. ${warn.join("; ")}` : `Импорт: ${summary}${cashNote}`, warn.length ? "info" : "success");
     e.target.value = "";
     loadWhZReport();
     if (whViewMode !== "zreport") loadWarehouseStock();
+    if (currentPage === "pos") loadPosCashRegister();
   } catch (err) { toast(err.message, "error"); }
 }
 
@@ -2704,12 +3425,32 @@ function updateInboundFields() {
   updateInboundFieldsForWarehouse();
 }
 
+function unitLandedCost(u) {
+  if (!u) return 0;
+  return (+u.purchase_price || 0) + (+u.customs_price || +u.extra_cost || 0);
+}
+
+window.openUnitExtraModal = (unitId) => {
+  const u = whDevicesCache.find((x) => x.id === unitId);
+  if (!u) return;
+  const form = document.getElementById("unit-extra-form");
+  if (!form) return;
+  form.dataset.unitId = String(unitId);
+  const meta = document.getElementById("unit-extra-meta");
+  if (meta) meta.textContent = `${u.model || "—"} · IMEI ${u.imei || "—"} · себест. ${whMoney(u.purchase_price)}`;
+  document.getElementById("unit-extra-amount").value = String(+(u.customs_price || u.extra_cost || 0));
+  document.getElementById("unit-extra-modal")?.showModal();
+};
+
 window.openWhSellModal = (unitId) => {
   sellUnitTarget = whDevicesCache.find((u) => u.id === unitId);
   if (!sellUnitTarget) return;
+  const extra = +(sellUnitTarget.customs_price || sellUnitTarget.extra_cost || 0);
   document.getElementById("wh-sell-meta").innerHTML = `
     <div class="metric-row"><span>${esc(sellUnitTarget.model)}</span><strong>${esc(sellUnitTarget.imei || "")}</strong></div>
-    <div class="metric-row"><span>Себестоимость</span><strong>${whMoney(sellUnitTarget.purchase_price)}</strong></div>`;
+    <div class="metric-row"><span>Себестоимость</span><strong>${whMoney(sellUnitTarget.purchase_price)}</strong></div>
+    ${extra ? `<div class="metric-row"><span>Расходы</span><strong>${whMoney(extra)}</strong></div>` : ""}
+    <div class="metric-row"><span>Всё вложено</span><strong>${whMoney(unitLandedCost(sellUnitTarget))}</strong></div>`;
   document.getElementById("wh-sell-price").value = sellUnitTarget.sale_price > 0 ? sellUnitTarget.sale_price : "";
   const paidEl = document.getElementById("wh-sell-paid");
   if (paidEl) paidEl.value = sellUnitTarget.sale_price > 0 ? sellUnitTarget.sale_price : "";
@@ -2725,7 +3466,7 @@ function updateWhSellProfit() {
   if (!sellUnitTarget) return;
   const price = +document.getElementById("wh-sell-price").value || 0;
   const paid = +document.getElementById("wh-sell-paid")?.value || price;
-  const profit = price - (sellUnitTarget.purchase_price || 0);
+  const profit = price - unitLandedCost(sellUnitTarget);
   const debtBlock = document.getElementById("wh-sell-debtor-fields");
   if (debtBlock) debtBlock.classList.toggle("hidden", price - paid <= 0.01);
   document.getElementById("wh-sell-profit").textContent = price > 0
@@ -2759,7 +3500,7 @@ async function submitWhSell(e) {
       }),
     });
     document.getElementById("wh-sell-modal").close();
-    toast(`Продано! Прибыль: ${whMoney(sale_price - sellUnitTarget.purchase_price)}`);
+    toast(`Продано! Прибыль: ${whMoney(sale_price - unitLandedCost(sellUnitTarget))}`);
     loadWarehouseStock();
     if (currentPage === "pos") loadPosCashRegister();
     if (currentPage === "products-consignment") loadConsProducts();
@@ -2788,10 +3529,12 @@ async function onInboundExistingSelect() {
   }
   inboundExistingProduct = await api(`/api/products/${id}`);
   document.getElementById("ib-existing-meta").innerHTML = `
-    <div class="metric-row"><span>Закупка</span><strong>${whMoney(inboundExistingProduct.purchase_price)}</strong></div>
+    <div class="metric-row"><span>Закупка (карточка)</span><strong>${whMoney(inboundExistingProduct.purchase_price)}</strong></div>
     <div class="metric-row"><span>Цена продажи</span><strong>${whMoney(inboundExistingProduct.sale_price)}</strong></div>
     <div class="metric-row"><span>Состояние</span><strong>${conditionLabel(inboundExistingProduct.condition)}</strong></div>
     <div class="metric-row"><span>Категория</span><strong>${catLabel(inboundExistingProduct.category)}</strong></div>`;
+  const pe = document.getElementById("ib-purchase-existing");
+  if (pe) pe.value = inboundExistingProduct.purchase_price || "";
   updateInboundFields();
 }
 
@@ -2810,6 +3553,10 @@ async function openInboundModal() {
   });
   document.getElementById("ib-purchase").value = "";
   document.getElementById("ib-purchase-used").value = "";
+  const extraUsed = document.getElementById("ib-extra-used");
+  if (extraUsed) extraUsed.value = "0";
+  const extraEx = document.getElementById("ib-extra-existing");
+  if (extraEx) extraEx.value = "0";
   document.getElementById("ib-battery").value = "";
   document.getElementById("ib-arrival").value = new Date().toISOString().slice(0, 10);
   document.getElementById("ib-ownership").value = kind === "used" ? "own" : "own";
@@ -2823,41 +3570,70 @@ async function submitInboundReceipt(e) {
   const kind = warehouseKind(selectedWarehouseId);
   const batteryRaw = document.getElementById("ib-battery").value;
   const battery = batteryRaw === "" ? null : +batteryRaw;
-  const name = kind === "used"
-    ? document.getElementById("ib-name-used").value.trim()
-    : document.getElementById("ib-name").value.trim();
-  if (!name) { toast("Укажите модель", "error"); return; }
   if (!document.getElementById("ib-imei").value.trim()) { toast("Укажите IMEI", "error"); return; }
   if (kind === "used" && battery == null) { toast("Укажите ёмкость батареи", "error"); return; }
-  const purchase = kind === "used"
-    ? +document.getElementById("ib-purchase-used").value
-    : +document.getElementById("ib-purchase").value;
-  const body = {
-    warehouse_id: selectedWarehouseId,
-    mode: "new",
-    imei: document.getElementById("ib-imei").value.trim(),
-    serial: document.getElementById("ib-serial").value.trim(),
-    battery_capacity: battery,
-    notes: document.getElementById("ib-notes").value.trim(),
-    client_name: kind === "used" ? document.getElementById("ib-client").value.trim() : "",
-    region: kind === "new" ? document.getElementById("ib-region").value.trim() : "",
-    arrival_date: document.getElementById("ib-arrival").value,
-    quantity: 1,
-    product: {
-      name,
-      category: "phone",
-      ownership_type: document.getElementById("ib-ownership").value,
-      supplier_name: document.getElementById("ib-supplier").value.trim(),
-      color: kind === "used" ? document.getElementById("ib-color-used").value.trim() : document.getElementById("ib-color").value.trim(),
-      memory: kind === "used" ? document.getElementById("ib-memory-used").value.trim() : document.getElementById("ib-memory").value.trim(),
-      condition: kind === "used" ? "used" : kind === "partnership" ? "partnership" : "new",
-      purchase_price: purchase,
-      sale_price: Math.max(purchase, 1),
-    },
-  };
-  if (body.product.ownership_type === "consignment" && !body.product.supplier_name) {
-    toast("Укажите поставщика", "error");
-    return;
+
+  let body;
+  if (inboundMode === "existing") {
+    const productId = +document.getElementById("ib-existing-product").value;
+    if (!productId) { toast("Выберите товар", "error"); return; }
+    const pe = document.getElementById("ib-purchase-existing");
+    const unitPurchase = pe && pe.value !== "" ? +pe.value : null;
+    const unitExtra = Math.max(0, +document.getElementById("ib-extra-existing")?.value || 0);
+    body = {
+      warehouse_id: selectedWarehouseId,
+      mode: "existing",
+      product_id: productId,
+      imei: document.getElementById("ib-imei").value.trim(),
+      serial: document.getElementById("ib-serial").value.trim(),
+      battery_capacity: battery,
+      notes: document.getElementById("ib-notes").value.trim(),
+      arrival_date: document.getElementById("ib-arrival").value,
+      quantity: 1,
+      unit_purchase_price: unitPurchase != null && unitPurchase > 0 ? unitPurchase : undefined,
+      unit_extra_cost: unitExtra,
+    };
+  } else {
+    const name = kind === "used"
+      ? document.getElementById("ib-name-used").value.trim()
+      : document.getElementById("ib-name").value.trim();
+    if (!name) { toast("Укажите модель", "error"); return; }
+    const purchase = kind === "used"
+      ? +document.getElementById("ib-purchase-used").value
+      : +document.getElementById("ib-purchase").value;
+    const unitExtra = kind === "used"
+      ? Math.max(0, +document.getElementById("ib-extra-used")?.value || 0)
+      : 0;
+    body = {
+      warehouse_id: selectedWarehouseId,
+      mode: "new",
+      imei: document.getElementById("ib-imei").value.trim(),
+      serial: document.getElementById("ib-serial").value.trim(),
+      battery_capacity: battery,
+      notes: document.getElementById("ib-notes").value.trim(),
+      client_name: kind === "used" ? document.getElementById("ib-client").value.trim() : "",
+      region: kind === "new" ? document.getElementById("ib-region").value.trim() : "",
+      arrival_date: document.getElementById("ib-arrival").value,
+      quantity: 1,
+      unit_purchase_price: purchase,
+      unit_extra_cost: unitExtra,
+      product: {
+        name,
+        category: "phone",
+        ownership_type: document.getElementById("ib-ownership").value,
+        supplier_name: document.getElementById("ib-supplier").value.trim(),
+        color: kind === "used" ? document.getElementById("ib-color-used").value.trim() : document.getElementById("ib-color").value.trim(),
+        memory: kind === "used" ? document.getElementById("ib-memory-used").value.trim() : document.getElementById("ib-memory").value.trim(),
+        condition: kind === "used" ? "used" : kind === "partnership" ? "partnership" : "new",
+        purchase_price: purchase,
+        sale_price: Math.max(purchase, 1),
+        customs_price: unitExtra,
+      },
+    };
+    if (body.product.ownership_type === "consignment" && !body.product.supplier_name) {
+      toast("Укажите поставщика", "error");
+      return;
+    }
   }
   try {
     await api("/api/stock/inbound-receipt", { method: "POST", body: JSON.stringify(body) });
@@ -3169,335 +3945,6 @@ async function loadTiHistory() {
     </tr>`).join("") || '<tr><td colspan="6" style="text-align:center;color:var(--muted)">Нет обменов</td></tr>';
 }
 
-/* ── Shifts ── */
-function bindShifts() {
-  document.getElementById("shift-close-form")?.addEventListener("submit", async (e) => {
-    e.preventDefault();
-    if (!openShift) return;
-    const actualPayments = [...document.querySelectorAll("#shift-actual-payments [data-method]")].map((inp) => ({
-      method_code: inp.dataset.method,
-      amount: +inp.value || 0,
-    }));
-    try {
-      const res = await api(`/api/shifts/${openShift.id}/close`, {
-        method: "POST",
-        body: JSON.stringify({
-          actual_cash: +document.getElementById("shift-actual-cash").value,
-          actual_payments: actualPayments,
-          notes: document.getElementById("shift-close-notes").value,
-        }),
-      });
-      let msg = `Смена закрыта. Разница нал.: ${fmt(res.cash_difference)}`;
-      if (res.payment_differences?.length) {
-        const diffs = res.payment_differences.filter((d) => Math.abs(d.difference) > 0.01);
-        if (diffs.length) msg += ` · ${diffs.map((d) => `${d.name}: ${fmt(d.difference)}`).join(", ")}`;
-      }
-      toast(msg);
-      await refreshSession();
-      loadShiftsPage();
-    } catch (err) { toast(err.message, "error"); }
-  });
-}
-
-function renderShiftPaymentTable(byPayment, title) {
-  if (!byPayment?.length) return `<p class="hint">${title}: нет продаж</p>`;
-  return `<p class="hint" style="margin-bottom:.5rem">${title}</p>
-    <table class="data-table" style="margin-bottom:.75rem"><thead><tr><th>Способ</th><th>Ожидается</th></tr></thead>
-    <tbody>${byPayment.map((p) => `<tr><td>${esc(p.name)}</td><td>${fmt(p.amount)}</td></tr>`).join("")}</tbody></table>`;
-}
-
-async function loadShiftsPage() {
-  await refreshSession();
-  const cur = document.getElementById("shift-current");
-  const closeCard = document.getElementById("shift-close-card");
-  const closeBtn = document.getElementById("shift-close-btn");
-
-  if (openShift) {
-    const data = await api("/api/shifts/current");
-    const s = data.summary;
-    const sym = storeConfig.currency?.symbol || "смн";
-    document.getElementById("shift-actual-cash-text").textContent = `Наличные в кассе (с разменом), ${sym}`;
-    cur.innerHTML = `
-      <div class="metric-row"><span>Смена</span><strong>#${openShift.id}</strong></div>
-      <div class="metric-row"><span>Кассир</span><strong>${esc(openShift.user_name)}</strong></div>
-      <div class="metric-row"><span>Открыта</span><strong>${openShift.opened_at}</strong></div>
-      <div class="metric-row"><span>Размен</span><strong>${fmt(openShift.opening_cash)}</strong></div>
-      <div class="metric-row"><span>Продаж</span><strong>${s.sales_count}</strong></div>
-      <div class="metric-row"><span>Выручка</span><strong>${fmt(s.total_revenue)}</strong></div>
-      <div class="metric-row"><span>Ожидается в кассе</span><strong>${fmt(+openShift.opening_cash + s.expected_cash)}</strong></div>
-      ${renderShiftPaymentTable(s.by_payment, "Оплаты по способам")}`;
-    document.getElementById("shift-summary").innerHTML =
-      `<p class="hint">Пересчитайте наличные в ящике и сверьте безнал по каждому способу.</p>`;
-    const nonCash = (s.by_payment || []).filter((p) => p.method_type !== "cash");
-    document.getElementById("shift-actual-payments").innerHTML = nonCash.length
-      ? `<p class="hint" style="margin:.5rem 0">Факт по безналу:</p>${nonCash.map((p) =>
-          `<label>${esc(p.name)} (ожид. ${fmt(p.amount)})<input type="number" class="input shift-actual-pay" data-method="${esc(p.method_code)}" min="0" step="0.01" value="${p.amount}"></label>`
-        ).join("")}`
-      : "";
-    document.getElementById("shift-actual-cash").value = String(+openShift.opening_cash + s.expected_cash);
-    closeCard.classList.remove("hidden");
-    closeBtn.disabled = false;
-  } else {
-    cur.innerHTML = `
-      <p style="color:var(--muted);margin-bottom:1rem">Смена не открыта. Укажите размен в кассе и откройте смену.</p>
-      <label>Размен, ${storeConfig.currency?.symbol || "смн"}<input type="number" id="shift-opening-cash" class="input" min="0" value="0"></label>
-      <button type="button" class="btn btn-primary" style="margin-top:.75rem" id="shift-open-btn">Открыть смену</button>`;
-    closeCard.classList.add("hidden");
-    document.getElementById("shift-open-btn").onclick = async () => {
-      try {
-        await api("/api/shifts/open", {
-          method: "POST",
-          body: JSON.stringify({ opening_cash: +document.getElementById("shift-opening-cash").value || 0 }),
-        });
-        toast("Смена открыта");
-        await refreshSession();
-        loadShiftsPage();
-      } catch (err) { toast(err.message, "error"); }
-    };
-  }
-
-  const histCard = document.querySelector("#page-shifts .card:last-child");
-  if (currentUser?.role === "owner") {
-    histCard?.classList.remove("hidden");
-    const history = await api("/api/shifts?limit=30");
-    document.getElementById("shifts-history-tbody").innerHTML = history.map((sh) => `
-      <tr>
-        <td>#${sh.id}</td>
-        <td>${esc(sh.user_name)}</td>
-        <td>${sh.opened_at}</td>
-        <td>${sh.closed_at || "—"}</td>
-        <td>${sh.sales_count ?? "—"}</td>
-        <td>${sh.expected_cash != null ? fmt(+sh.expected_cash + +sh.opening_cash) : "—"}</td>
-        <td>${sh.actual_cash != null && sh.expected_cash != null ? fmt(+sh.actual_cash - (+sh.opening_cash + +sh.expected_cash)) : "—"}</td>
-      </tr>`).join("") || '<tr><td colspan="7" style="text-align:center;color:var(--muted)">Нет истории</td></tr>';
-  } else {
-    histCard?.classList.add("hidden");
-  }
-}
-
-/* ── IMEI ── */
-function bindImei() {
-  document.getElementById("imei-form").onsubmit = async (e) => {
-    e.preventDefault();
-    try {
-      await api("/api/units", {
-        method: "POST",
-        body: JSON.stringify({
-          product_id: +document.getElementById("imei-product").value,
-          warehouse_id: +document.getElementById("imei-warehouse").value,
-          imei: document.getElementById("imei-value").value.trim(),
-          serial: document.getElementById("imei-serial").value.trim(),
-          notes: document.getElementById("imei-notes").value.trim(),
-        }),
-      });
-      toast("IMEI добавлен");
-      document.getElementById("imei-form").reset();
-      loadImeiPage();
-    } catch (err) { toast(err.message, "error"); }
-  };
-  document.getElementById("imei-search").addEventListener("input", debounce(loadImeiList, 300));
-  document.getElementById("imei-filter-wh").addEventListener("change", loadImeiList);
-}
-
-
-function bindImeiExtras() {
-  document.querySelectorAll("#imei-view-tabs .seg").forEach((b) => {
-    b.onclick = () => {
-      document.querySelectorAll("#imei-view-tabs .seg").forEach((x) => x.classList.remove("active"));
-      b.classList.add("active");
-      const v = b.dataset.imeiView;
-      document.getElementById("imei-panel-register").classList.toggle("hidden", v !== "register");
-      document.getElementById("imei-bulk-card")?.classList.toggle("hidden", v !== "register");
-      document.getElementById("imei-panel-pending-stock").classList.toggle("hidden", v !== "pending-stock");
-      document.getElementById("imei-panel-pending-sale").classList.toggle("hidden", v !== "pending-sale");
-      document.getElementById("imei-panel-import")?.classList.toggle("hidden", v !== "import");
-      if (v === "pending-stock") loadImeiPendingStock();
-      if (v === "pending-sale") loadImeiPendingSale();
-      if (v === "import") bindImeiImportOnce();
-    };
-  });
-  document.getElementById("bulk-units-form")?.addEventListener("submit", async (e) => {
-    e.preventDefault();
-    try {
-      const res = await api("/api/units/bulk", {
-        method: "POST",
-        body: JSON.stringify({
-          product_id: +document.getElementById("bulk-product").value,
-          warehouse_id: +document.getElementById("bulk-warehouse").value,
-          quantity: +document.getElementById("bulk-qty").value,
-          serial_prefix: document.getElementById("bulk-prefix").value.trim(),
-          mark_pending_customs: document.getElementById("bulk-pending-customs")?.checked ? 1 : 0,
-        }),
-      });
-      toast(`Создано ${res.created} устройств`);
-      loadImeiList();
-      loadImeiPendingStock();
-    } catch (err) { toast(err.message, "error"); }
-  });
-}
-
-async function loadImeiPendingStock() {
-  const wh = document.getElementById("imei-filter-wh")?.value || "";
-  let url = "/api/units/pending-imei";
-  if (wh) url += `?warehouse_id=${wh}`;
-  const rows = await api(url);
-  document.getElementById("imei-pending-stock-tbody").innerHTML = rows.map((u) => `
-    <tr><td><strong>${esc(u.serial || "—")}</strong></td><td>${esc(u.product_name)}</td><td>${dash(u.product_color)}</td>
-    <td>${esc(u.warehouse_name)}</td><td>${u.created_at}</td></tr>`).join("")
-    || '<tr><td colspan="5" style="text-align:center;color:var(--muted)">Все устройства с IMEI</td></tr>';
-}
-
-async function loadImeiPendingSale() {
-  const rows = await api("/api/reports/imei-pending");
-  document.getElementById("imei-pending-sale-tbody").innerHTML = rows.map((r) => `
-    <tr><td>#${r.sale_id}</td><td>${r.sale_date}</td><td>${esc(r.product_name)}</td><td>${esc(r.serial || "—")}</td>
-    <td><input class="input input-sm" id="complete-imei-${r.unit_id}" placeholder="IMEI" style="max-width:140px"></td>
-    <td><button class="btn btn-ghost btn-sm" onclick="completePendingImei(${r.unit_id})">Сохранить</button></td></tr>`).join("")
-    || '<tr><td colspan="6" style="text-align:center;color:var(--muted)">Нет ожидающих</td></tr>';
-}
-
-window.completePendingImei = async (unitId) => {
-  const inp = document.getElementById(`complete-imei-${unitId}`);
-  const imei = inp?.value?.trim();
-  if (!imei) { toast("Введите IMEI", "error"); return; }
-  try {
-    await api(`/api/units/${unitId}/complete-imei`, { method: "POST", body: JSON.stringify({ imei }) });
-    toast("IMEI сохранён");
-    loadImeiPendingSale();
-  } catch (e) { toast(e.message, "error"); }
-};
-
-async function loadImeiPage() {
-  if (!warehouses.length) await loadWarehouses();
-  fillWarehouseSelect(document.getElementById("imei-warehouse"), defaultWarehouseId());
-  const whSel = document.getElementById("imei-filter-wh");
-  whSel.innerHTML = '<option value="">Все склады</option>' +
-    warehouses.map((w) => `<option value="${w.id}">${esc(w.name)}</option>`).join("");
-  const phones = await api("/api/products?category=phone");
-  document.getElementById("imei-product").innerHTML = phones.map((p) =>
-    `<option value="${p.id}">${esc(p.name)}${p.track_units ? " ★" : ""}</option>`
-  ).join("");
-  fillWarehouseSelect(document.getElementById("bulk-warehouse"), defaultWarehouseId());
-  const bulkProd = document.getElementById("bulk-product");
-  if (bulkProd) {
-    const prods = await api("/api/products?category=phone");
-    bulkProd.innerHTML = prods.map((p) => `<option value="${p.id}">${esc(p.name)} ${p.color ? "· " + esc(p.color) : ""}</option>`).join("");
-  }
-  bindImeiExtras();
-  fillWarehouseSelect(document.getElementById("imei-import-wh"), defaultWarehouseId());
-  await loadImeiList();
-  focusScanInput("imei-search");
-}
-
-async function loadImeiList() {
-  const q = document.getElementById("imei-search").value.trim();
-  const wh = document.getElementById("imei-filter-wh").value;
-  let url = `/api/units?status=in_stock&q=${encodeURIComponent(q)}`;
-  if (wh) url += `&warehouse_id=${wh}`;
-  const units = await api(url);
-  const statusLabel = (u) => ({
-    in_stock: "На складе", sold: "Продан", reserved: "Резерв",
-  }[u.status] || u.status);
-  document.getElementById("imei-tbody").innerHTML = units.map((u) => `
-    <tr>
-      <td><strong>${dash(u.imei)}</strong> ${unitStatusBadge(u)}</td>
-      <td>${dash(u.serial)}</td>
-      <td>${esc(u.product_name)}</td>
-      <td>${dash(u.product_color)}</td>
-      <td>${esc(u.warehouse_name)}</td>
-      <td>${statusLabel(u)}</td>
-      <td class="imei-actions">
-        ${u.box_image_url ? `<a href="${esc(u.box_image_url)}" target="_blank" class="btn btn-ghost btn-sm">📷</a>` : ""}
-        <button class="btn btn-ghost btn-sm" onclick="printUnitLabel(${u.id})" title="Этикетка">🏷</button>
-        ${u.status === "in_stock" ? `<button class="btn btn-ghost btn-sm" onclick="openReserveModal(${u.id})">Резерв</button>` : ""}
-        ${u.customs_status === "pending" ? `<button class="btn btn-ghost btn-sm" onclick="setUnitCustoms(${u.id}, 'cleared')">✓ таможня</button>` : `<button class="btn btn-ghost btn-sm" onclick="setUnitCustoms(${u.id}, 'pending')">Таможня</button>`}
-        <label class="btn btn-ghost btn-sm" style="cursor:pointer">Фото<input type="file" accept="image/*" hidden onchange="uploadUnitPhoto(${u.id}, this)"></label>
-        <button class="btn btn-ghost btn-sm" onclick="deleteUnit(${u.id})">✕</button>
-      </td>
-    </tr>`).join("") || '<tr><td colspan="7" style="text-align:center;color:var(--muted)">Нет записей</td></tr>';
-}
-
-window.printUnitLabel = async (unitId) => {
-  try {
-    const d = await api(`/api/units/${unitId}/label`);
-    const qr = `https://api.qrserver.com/v1/create-qr-code/?size=140x140&data=${encodeURIComponent(d.qr_data)}`;
-    const w = window.open("", "_blank", "width=320,height=420");
-    if (!w) { toast("Разрешите всплывающие окна", "error"); return; }
-    w.document.write(`<!DOCTYPE html><html><head><title>Этикетка ${esc(d.serial)}</title>
-      <style>body{font-family:sans-serif;text-align:center;padding:12px} .s{font-size:11px;color:#666}
-      img{margin:8px 0} @media print{button{display:none}}</style></head><body>
-      <div><strong>TeleStore</strong></div>
-      <div>${esc(d.product_name)}</div>
-      <div class="s">${esc(d.model)} · ${esc(d.color)}</div>
-      <div style="font-size:1.1rem;margin:6px 0"><strong>${esc(d.serial || "—")}</strong></div>
-      ${d.imei ? `<div class="s">IMEI: ${esc(d.imei)}</div>` : ""}
-      <img src="${qr}" width="140" height="140" alt="QR">
-      <br><button onclick="window.print()">Печать</button></body></html>`);
-    w.document.close();
-  } catch (e) { toast(e.message, "error"); }
-};
-
-window.uploadUnitPhoto = async (unitId, input) => {
-  const file = input.files?.[0];
-  if (!file) return;
-  try {
-    const fd = new FormData();
-    fd.append("file", file);
-    const res = await fetch(`/api/units/${unitId}/photo`, {
-      method: "POST",
-      headers: { "X-Pin": pin },
-      body: fd,
-    });
-    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || "Ошибка загрузки");
-    toast("Фото сохранено");
-    loadImeiList();
-  } catch (e) { toast(e.message, "error"); }
-  input.value = "";
-};
-
-window.setUnitCustoms = async (unitId, status) => {
-  try {
-    await api(`/api/units/${unitId}/customs-status`, { method: "PATCH", body: JSON.stringify({ customs_status: status }) });
-    toast(status === "pending" ? "На растamожке" : "Таможня пройдена");
-    loadImeiList();
-  } catch (e) { toast(e.message, "error"); }
-};
-
-window.openReserveModal = async (unitId) => {
-  document.getElementById("reserve-unit-id").value = unitId;
-  const u = await api(`/api/units/${unitId}`);
-  document.getElementById("reserve-unit-info").textContent =
-    `${u.product_name} · ${u.serial || u.imei || "#" + u.id}`;
-  const until = new Date();
-  until.setDate(until.getDate() + 2);
-  document.getElementById("reserve-until").value = until.toISOString().slice(0, 16);
-  document.getElementById("reserve-modal").showModal();
-};
-
-let imeiImportBound = false;
-function bindImeiImportOnce() {
-  if (imeiImportBound) return;
-  imeiImportBound = true;
-  document.getElementById("imei-import-form")?.addEventListener("submit", async (e) => {
-    e.preventDefault();
-    const file = document.getElementById("imei-import-file").files?.[0];
-    if (!file) { toast("Выберите CSV", "error"); return; }
-    const wh = document.getElementById("imei-import-wh")?.value || "";
-    try {
-      const fd = new FormData();
-      fd.append("file", file);
-      let url = "/api/units/import-csv";
-      if (wh) url += `?warehouse_id=${wh}`;
-      const res = await fetch(url, { method: "POST", headers: { "X-Pin": pin }, body: fd });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || "Ошибка импорта");
-      toast(`Импорт: ${data.created} шт.${data.errors?.length ? `, ошибок: ${data.errors.length}` : ""}`);
-      if (data.errors?.length) console.warn(data.errors);
-      loadImeiList();
-    } catch (err) { toast(err.message, "error"); }
-  });
-}
-
 function bindReservations() {
   document.getElementById("reserve-form")?.addEventListener("submit", async (e) => {
     e.preventDefault();
@@ -3515,7 +3962,6 @@ function bindReservations() {
       document.getElementById("reserve-modal").close();
       toast("Резерв создан");
       loadReservationsPage();
-      loadImeiList();
     } catch (err) { toast(err.message, "error"); }
   });
   document.getElementById("reserve-cancel")?.addEventListener("click", () => document.getElementById("reserve-modal").close());
@@ -3542,16 +3988,6 @@ window.cancelReservation = async (id) => {
     await api(`/api/reservations/${id}`, { method: "DELETE" });
     toast("Резерв снят");
     loadReservationsPage();
-    loadImeiList();
-  } catch (e) { toast(e.message, "error"); }
-};
-
-window.deleteUnit = async (id) => {
-  if (!confirm("Удалить IMEI с учёта?")) return;
-  try {
-    await api(`/api/units/${id}`, { method: "DELETE" });
-    toast("Удалено");
-    loadImeiList();
   } catch (e) { toast(e.message, "error"); }
 };
 
@@ -3996,18 +4432,46 @@ function bindAccessories() {
     const payCur = accPayCurrency();
     const fxOn = !!document.getElementById("acc-fx-enable")?.checked && payCur !== saleCur;
     let total = accCartTotal();
+    let fillCur = saleCur;
     if (fxOn) {
-      const conv = convertMoney(total, saleCur, payCur);
-      if (conv == null) { toast("Нет курса валюты в настройках", "error"); return; }
+      const conv = accConvertSaleToPay(total);
+      if (conv == null) { toast("Укажите курс конвертации", "error"); return; }
       total = Math.round(conv * 100) / 100;
+      fillCur = payCur;
     }
     document.querySelectorAll(".acc-split-pay-input").forEach((inp) => {
       inp.value = inp.dataset.method === "cash" ? total : "";
+      const curSel = inp.closest(".split-pay-row")?.querySelector(".split-pay-currency");
+      if (curSel) curSel.value = fillCur;
     });
     updateAccSplitSummary();
   });
   document.getElementById("acc-split-payments")?.addEventListener("input", (e) => {
-    if (e.target.classList.contains("acc-split-pay-input")) updateAccSplitSummary();
+    if (e.target.classList.contains("acc-split-pay-input") || e.target.classList.contains("split-pay-currency")) {
+      updateAccSplitSummary();
+    }
+  });
+  document.getElementById("acc-split-payments")?.addEventListener("change", (e) => {
+    if (e.target.classList.contains("split-pay-currency")) updateAccSplitSummary();
+  });
+  document.getElementById("acc-fx-enable")?.addEventListener("change", () => {
+    const rateInp = document.getElementById("acc-fx-rate");
+    if (rateInp) rateInp.dataset.manual = "0";
+    syncAccFxRateFromSettings(true);
+    refreshAccFxUi();
+    renderAccSplitPayments();
+  });
+  document.getElementById("acc-fx-currency")?.addEventListener("change", () => {
+    const rateInp = document.getElementById("acc-fx-rate");
+    if (rateInp) rateInp.dataset.manual = "0";
+    syncAccFxRateFromSettings(true);
+    refreshAccFxUi();
+    renderAccSplitPayments();
+  });
+  document.getElementById("acc-fx-rate")?.addEventListener("input", () => {
+    const inp = document.getElementById("acc-fx-rate");
+    if (inp) inp.dataset.manual = "1";
+    refreshAccFxUi();
   });
   document.getElementById("acc-cash-refresh")?.addEventListener("click", loadAccCashRegister);
   document.getElementById("acc-report-refresh")?.addEventListener("click", loadAccReport);
@@ -4200,11 +4664,47 @@ function accPayCurrency() {
   return (document.getElementById("acc-fx-currency")?.value || accSaleCurrency()).toUpperCase();
 }
 
+function accFxRateSaleToPay() {
+  const inp = document.getElementById("acc-fx-rate");
+  if (inp && inp.value !== "" && +inp.value > 0) return +inp.value;
+  return convertMoney(1, accSaleCurrency(), accPayCurrency());
+}
+function accConvertSaleToPay(amount) {
+  const r = accFxRateSaleToPay();
+  if (r == null || r <= 0) return null;
+  return (+amount || 0) * r;
+}
+function accConvertToSale(amount, fromCur) {
+  const sale = accSaleCurrency();
+  const from = (fromCur || sale).toUpperCase();
+  if (!from || from === sale) return +amount || 0;
+  const pay = accPayCurrency();
+  if (from === pay) {
+    const r = accFxRateSaleToPay();
+    if (r == null || r <= 0) return null;
+    return (+amount || 0) / r;
+  }
+  return convertMoney(amount, from, sale);
+}
+function syncAccFxRateFromSettings(force = false) {
+  const inp = document.getElementById("acc-fx-rate");
+  if (!inp) return;
+  if (!force && inp.dataset.manual === "1") return;
+  const rate = convertMoney(1, accSaleCurrency(), accPayCurrency());
+  if (rate != null && rate > 0) {
+    inp.value = String(Math.round(rate * 10000) / 10000);
+    inp.dataset.manual = "0";
+  } else {
+    inp.value = "";
+  }
+}
+
 function refreshAccFxUi() {
   const enable = document.getElementById("acc-fx-enable");
   const fields = document.getElementById("acc-fx-fields");
   const sel = document.getElementById("acc-fx-currency");
   const hint = document.getElementById("acc-fx-rate-hint");
+  const caption = document.getElementById("acc-fx-rate-caption");
   const totalEl = document.getElementById("acc-fx-total");
   const totalLabel = document.getElementById("acc-fx-total-label");
   if (!enable || !fields || !sel) return;
@@ -4223,18 +4723,23 @@ function refreshAccFxUi() {
     return;
   }
   const payCur = sel.value;
-  const rate = convertMoney(1, saleCur, payCur);
+  if (caption) caption.textContent = `1 ${saleCur} = … ${payCur}`;
+  syncAccFxRateFromSettings(false);
+  const rate = accFxRateSaleToPay();
   if (hint) {
     if (rate == null) {
-      hint.textContent = `Нет курса в Настройках`;
+      hint.textContent = `Нет курса в настройках — введите курс вручную`;
       hint.style.color = "var(--danger)";
     } else {
-      hint.textContent = `1 ${saleCur} = ${rate.toFixed(4)} ${payCur}`;
+      const custom = document.getElementById("acc-fx-rate")?.dataset.manual === "1";
+      hint.textContent = custom
+        ? `Свой курс: 1 ${saleCur} = ${(+rate).toFixed(4)} ${payCur}`
+        : `Авто из настроек: 1 ${saleCur} = ${(+rate).toFixed(4)} ${payCur}`;
       hint.style.color = "";
     }
   }
   const dueWh = accCartTotal();
-  const duePay = convertMoney(dueWh, saleCur, payCur);
+  const duePay = accConvertSaleToPay(dueWh);
   if (totalLabel) totalLabel.textContent = `К оплате (${payCur})`;
   if (totalEl) totalEl.textContent = duePay == null ? "—" : fmtCurrency(duePay, currency_meta(payCur));
   updateAccSplitSummary();
@@ -4246,16 +4751,48 @@ function renderAccSplitPayments() {
   const methods = storeConfig.payment_methods?.length ? storeConfig.payment_methods : [
     { code: "cash", name: "Наличные" }, { code: "card", name: "Карта" },
   ];
-  box.innerHTML = methods.map((m) => `
-    <label class="split-pay-row">
+  const prev = {};
+  const prevCur = {};
+  box.querySelectorAll(".acc-split-pay-input").forEach((inp) => {
+    if (inp.value) prev[inp.dataset.method] = inp.value;
+    const curSel = inp.closest(".split-pay-row")?.querySelector(".split-pay-currency");
+    if (curSel) prevCur[inp.dataset.method] = curSel.value;
+  });
+  const saleCur = accSaleCurrency();
+  const payCur = accPayCurrency();
+  const fxOn = !!document.getElementById("acc-fx-enable")?.checked && payCur !== saleCur;
+  const curOpts = fxOn
+    ? [saleCur, payCur].filter((c, i, a) => a.indexOf(c) === i)
+    : [saleCur];
+  box.innerHTML = methods.map((m) => {
+    const defCur = prevCur[m.code] || (fxOn ? payCur : saleCur);
+    const curSelect = fxOn
+      ? `<select class="select sm split-pay-currency" data-method="${esc(m.code)}" title="Валюта оплаты">
+          ${curOpts.map((c) => `<option value="${c}" ${c === defCur ? "selected" : ""}>${currencyLabel(c)}</option>`).join("")}
+        </select>`
+      : "";
+    return `<label class="split-pay-row">
       <span>${esc(m.name)}</span>
-      <input type="number" class="input sm acc-split-pay-input" data-method="${esc(m.code)}" min="0" step="0.01" placeholder="0">
-    </label>`).join("");
+      <span class="split-pay-controls">
+        <input type="number" class="input sm acc-split-pay-input" data-method="${esc(m.code)}" min="0" step="0.01" value="${prev[m.code] || ""}" placeholder="0">
+        ${curSelect}
+      </span>
+    </label>`;
+  }).join("");
 }
 
 function collectAccPayments() {
+  const saleCur = accSaleCurrency();
   return [...document.querySelectorAll(".acc-split-pay-input")]
-    .map((inp) => ({ method_code: inp.dataset.method, amount: +inp.value || 0 }))
+    .map((inp) => {
+      const row = inp.closest(".split-pay-row");
+      const curSel = row?.querySelector(".split-pay-currency");
+      return {
+        method_code: inp.dataset.method,
+        amount: +inp.value || 0,
+        currency_code: (curSel?.value || saleCur).toUpperCase(),
+      };
+    })
     .filter((p) => p.amount > 0);
 }
 
@@ -4263,16 +4800,42 @@ function updateAccSplitSummary() {
   const saleCur = accSaleCurrency();
   const payCur = accPayCurrency();
   const fxOn = !!document.getElementById("acc-fx-enable")?.checked && payCur !== saleCur;
-  const totalWh = accCartTotal();
-  const total = fxOn ? (convertMoney(totalWh, saleCur, payCur) ?? totalWh) : totalWh;
-  const paid = collectAccPayments().reduce((s, p) => s + p.amount, 0);
-  const money = (n) => fxOn ? fmtCurrency(n, currency_meta(payCur)) : accMoney(n);
+  const totalSale = accCartTotal();
+  const payments = collectAccPayments();
+  let paidSale = 0;
+  let bad = false;
+  for (const p of payments) {
+    const conv = accConvertToSale(p.amount, p.currency_code || saleCur);
+    if (conv == null) { bad = true; break; }
+    paidSale += conv;
+  }
+  const moneySale = (n) => fmtCurrency(n, currency_meta(saleCur));
+  const paidLabel = document.getElementById("acc-split-paid-label");
   const paidEl = document.getElementById("acc-split-paid");
-  if (paidEl) paidEl.textContent = money(paid);
   const rem = document.getElementById("acc-split-remain-wrap");
+  if (bad) {
+    if (paidEl) paidEl.textContent = "—";
+    if (rem) {
+      rem.classList.remove("hidden");
+      const remEl = document.getElementById("acc-split-remain");
+      if (remEl) remEl.textContent = "—";
+    }
+    return;
+  }
+  if (paidLabel) {
+    paidLabel.innerHTML = fxOn
+      ? `Оплачено (${saleCur}): <strong id="acc-split-paid">${moneySale(paidSale)}</strong>`
+      : `Оплачено: <strong id="acc-split-paid">${moneySale(paidSale)}</strong>`;
+  } else if (paidEl) {
+    paidEl.textContent = moneySale(paidSale);
+  }
+  const remain = Math.max(0, totalSale - paidSale);
   if (rem) {
-    rem.classList.toggle("hidden", Math.abs(total - paid) < 0.01);
-    document.getElementById("acc-split-remain").textContent = money(Math.max(0, total - paid));
+    rem.innerHTML = fxOn
+      ? `Осталось (${saleCur}): <strong id="acc-split-remain">${moneySale(remain)}</strong>`
+      : `Осталось: <strong id="acc-split-remain">${moneySale(remain)}</strong>`;
+    rem.classList.toggle("hidden", Math.abs(totalSale - paidSale) < 0.01);
+    rem.style.color = totalSale - paidSale > 0.01 ? "var(--danger)" : "var(--success)";
   }
 }
 
@@ -4302,10 +4865,13 @@ function renderAccCart() {
       <div><div class="ci-name">${esc(c.product.name)}</div></div>
       <div class="ci-qty"><button type="button" onclick="accChangeQty(${idx},-1)">−</button>${c.quantity}<button type="button" onclick="accChangeQty(${idx},1)">+</button></div>
       <div class="ci-price-wrap">
-        <input type="number" class="input sm ci-price${custom ? " is-custom" : ""}" min="0.01" step="0.01"
-          value="${price}" title="Прайс ${accMoney(catalog)}"
-          onchange="setAccCartPrice(${idx}, this.value)" oninput="setAccCartPrice(${idx}, this.value, true)">
-        <button type="button" class="btn btn-ghost btn-sm ci-price-reset" title="По прайсу" onclick="resetAccCartPrice(${idx})">↺</button>
+        <span class="ci-price-label">Цена</span>
+        <div class="ci-price-row">
+          <input type="number" class="input sm ci-price${custom ? " is-custom" : ""}" min="0.01" step="0.01"
+            value="${price}" title="Прайс ${accMoney(catalog)}"
+            onchange="setAccCartPrice(${idx}, this.value)" oninput="setAccCartPrice(${idx}, this.value, true)">
+          <button type="button" class="btn btn-ghost btn-sm ci-price-reset" title="По прайсу" onclick="resetAccCartPrice(${idx})">↺</button>
+        </div>
       </div>
       <strong class="ci-line-sum">${accMoney(line)}</strong>
       <button class="btn btn-ghost btn-sm" onclick="accRemoveLine(${idx})">×</button>
@@ -4367,25 +4933,35 @@ async function accCheckout() {
   const payCur = accPayCurrency();
   const fxOn = !!document.getElementById("acc-fx-enable")?.checked && payCur !== saleCur;
   const paymentsRaw = collectAccPayments();
-  if (fxOn && convertMoney(1, payCur, saleCur) == null) {
-    toast("Нет курса валюты в настройках", "error");
-    return;
+  if (fxOn) {
+    const rate = accFxRateSaleToPay();
+    if (rate == null || rate <= 0) {
+      toast(`Укажите курс 1 ${saleCur} → ${payCur}`, "error");
+      return;
+    }
   }
-  const paidUi = paymentsRaw.reduce((s, p) => s + p.amount, 0);
-  const totalUi = fxOn ? convertMoney(total, saleCur, payCur) : total;
-  if (totalUi == null) { toast("Нет курса валюты в настройках", "error"); return; }
-  if (paidUi <= 0 && total > 0) { toast("Укажите оплату", "error"); return; }
+  let paidSale = 0;
+  for (const p of paymentsRaw) {
+    const conv = accConvertToSale(p.amount, p.currency_code || saleCur);
+    if (conv == null) {
+      toast("Не удалось пересчитать оплату по курсу", "error");
+      return;
+    }
+    paidSale += conv;
+  }
+  if (paidSale <= 0 && total > 0) { toast("Укажите оплату", "error"); return; }
   let debtor_name = "";
   let debtor_phone = "";
-  if (totalUi - paidUi > 0.01) {
-    const debtor = await promptDebtorModal(totalUi, paidUi, fxOn ? payCur : saleCur);
+  if (total - paidSale > 0.01) {
+    const debtor = await promptDebtorModal(total, paidSale, saleCur);
     if (!debtor) return;
     debtor_name = debtor.name;
     debtor_phone = debtor.phone;
-  } else if (Math.abs(totalUi - paidUi) > 0.01) {
+  } else if (Math.abs(total - paidSale) > 0.01) {
     toast("Сумма оплат не совпадает с итогом", "error");
     return;
   }
+  const fxRate = fxOn ? accFxRateSaleToPay() : null;
   try {
     await api("/api/sales", {
       method: "POST",
@@ -4400,11 +4976,14 @@ async function accCheckout() {
         debtor_name,
         debtor_phone,
         pay_currency: fxOn ? payCur : "",
+        fx_rate: fxRate || undefined,
       }),
     });
     accCart = [];
     const fx = document.getElementById("acc-fx-enable");
     if (fx) fx.checked = false;
+    const rateInp = document.getElementById("acc-fx-rate");
+    if (rateInp) rateInp.dataset.manual = "0";
     renderAccCart();
     await loadAccProducts();
     loadAccCashRegister();
@@ -4417,15 +4996,16 @@ async function loadAccCashRegister() {
   if (!kpi) return;
   try {
     const r = await api("/api/accessories/cash-register?period=day");
+    const bags = r.by_currency || [];
     kpi.innerHTML = `
-      <div class="kpi accent-blue"><div class="label">Приход</div><div class="value">${accMoney(r.total_inflows)}</div></div>
-      <div class="kpi accent-warn"><div class="label">Расход</div><div class="value">${accMoney(r.total_outflows)}</div></div>
-      <div class="kpi accent-green"><div class="label">Чистыми</div><div class="value">${accMoney(r.net_cash)}</div></div>
-      <div class="kpi"><div class="label">Прибыль</div><div class="value">${accMoney(r.profit)}</div></div>`;
+      <div class="kpi accent-blue"><div class="label">Приход</div><div class="value value-multi">${formatSideBags(bags, "inflow")}</div></div>
+      <div class="kpi accent-warn"><div class="label">Расход</div><div class="value value-multi">${formatSideBags(bags, "outflow")}</div></div>
+      <div class="kpi accent-green"><div class="label">Чистыми</div><div class="value value-multi">${formatSideBags(bags, "net")}</div></div>
+      <div class="kpi"><div class="label">Прибыль (продажа $)</div><div class="value">${accMoney(r.profit)}</div></div>`;
     const bal = document.getElementById("acc-balances");
     if (bal) {
       bal.innerHTML = (r.inflows || []).map((b) =>
-        `<div class="pos-balance-row"><span>${esc(b.name)}</span><strong>${accMoney(b.amount)}</strong></div>`
+        `<div class="pos-balance-row"><span>${esc(b.name)}</span><strong>${moneyLine(b.amount, b.currency_code || "USD")}</strong></div>`
       ).join("") || "";
     }
     const tb = document.getElementById("acc-expenses-tbody");
@@ -4496,16 +5076,16 @@ async function loadSuppliers() {
     <tr>
       <td><strong>${esc(s.supplier_name)}</strong></td>
       <td>${s.products_count}</td>
-      <td>${fmt(s.accrued_due)}</td>
-      <td>${fmt(s.paid)}</td>
-      <td class="${s.balance > 0 ? "stock-low" : ""}"><strong>${fmt(s.balance)}</strong></td>
+      <td class="value-multi">${creditorBagsHtml(s, "accrued_due")}</td>
+      <td class="value-multi">${creditorBagsHtml(s, "paid")}</td>
+      <td class="value-multi ${creditorOpen(s) ? "stock-low" : ""}"><strong>${creditorBagsHtml(s, "balance")}</strong></td>
     </tr>`).join("") || '<tr><td colspan="5" style="text-align:center;color:var(--muted)">Нет поставщиков</td></tr>';
 
   const sel = document.getElementById("pay-supplier");
-  sel.innerHTML = suppliers.map((s) => `<option value="${esc(s.supplier_name)}">${esc(s.supplier_name)} (долг ${fmt(s.balance)})</option>`).join("");
+  sel.innerHTML = suppliers.map((s) => `<option value="${esc(s.supplier_name)}">${esc(s.supplier_name)} (долг ${creditorBagsHtml(s, "balance").replace(/<[^>]+>/g, " ").trim()})</option>`).join("");
 
   document.getElementById("payments-list").innerHTML = payments.slice(0, 20).map((p) => `
-    <div class="pay-row"><span>${esc(p.supplier_name)} · ${p.created_at}</span><strong>−${fmt(p.amount)}</strong></div>
+    <div class="pay-row"><span>${esc(p.supplier_name)} · ${p.created_at}</span><strong>−${moneyLine(p.amount, p.currency_code || "TJS")}</strong></div>
   `).join("") || '<p style="color:var(--muted);font-size:.8rem">Нет выплат</p>';
 }
 
@@ -4525,34 +5105,91 @@ function renderSplitPayments() {
     { code: "ds", name: "ДС" }, { code: "alif", name: "Alif" }, { code: "eskhata", name: "Эсхата" },
   ];
   const prev = {};
-  box.querySelectorAll(".split-pay-input").forEach((inp) => { if (inp.value) prev[inp.dataset.method] = inp.value; });
-  box.innerHTML = methods.map((m) => `
-    <label class="split-pay-row">
+  const prevCur = {};
+  box.querySelectorAll(".split-pay-input").forEach((inp) => {
+    if (inp.value) prev[inp.dataset.method] = inp.value;
+    const curSel = inp.closest(".split-pay-row")?.querySelector(".split-pay-currency");
+    if (curSel) prevCur[inp.dataset.method] = curSel.value;
+  });
+  const saleCur = posSaleCurrency();
+  const payCur = posPayCurrency();
+  const fxOn = !!document.getElementById("pos-fx-enable")?.checked && payCur !== saleCur;
+  const curOpts = fxOn
+    ? [saleCur, payCur].filter((c, i, a) => a.indexOf(c) === i)
+    : [saleCur];
+  box.innerHTML = methods.map((m) => {
+    const defCur = prevCur[m.code] || (fxOn ? payCur : saleCur);
+    const curSelect = fxOn
+      ? `<select class="select sm split-pay-currency" data-method="${esc(m.code)}" title="Валюта оплаты">
+          ${curOpts.map((c) => `<option value="${c}" ${c === defCur ? "selected" : ""}>${currencyLabel(c)}</option>`).join("")}
+        </select>`
+      : "";
+    return `<label class="split-pay-row">
       <span>${esc(m.name)}</span>
-      <input type="number" class="input sm split-pay-input" data-method="${esc(m.code)}" min="0" step="0.01" value="${prev[m.code] || ""}" placeholder="0">
-    </label>`).join("");
+      <span class="split-pay-controls">
+        <input type="number" class="input sm split-pay-input" data-method="${esc(m.code)}" min="0" step="0.01" value="${prev[m.code] || ""}" placeholder="0">
+        ${curSelect}
+      </span>
+    </label>`;
+  }).join("");
 }
 
 function updateSplitSummary() {
   const saleCur = posSaleCurrency();
   const payCur = posPayCurrency();
   const fxOn = !!document.getElementById("pos-fx-enable")?.checked && payCur !== saleCur;
-  const totalWh = cartTotalDue();
-  const total = fxOn ? (convertMoney(totalWh, saleCur, payCur) ?? totalWh) : totalWh;
-  const paid = collectSplitPayments().reduce((s, p) => s + p.amount, 0);
-  const money = (n) => fxOn ? posPayMoney(n) : posMoney(n);
+  const totalSale = cartTotalDue();
+  const payments = collectSplitPayments();
+  let paidSale = 0;
+  let bad = false;
+  for (const p of payments) {
+    const conv = posConvertToSale(p.amount, p.currency_code || saleCur);
+    if (conv == null) { bad = true; break; }
+    paidSale += conv;
+  }
+  const moneySale = (n) => fmtCurrency(n, currency_meta(saleCur));
   const paidEl = document.getElementById("split-paid-total");
   const remEl = document.getElementById("split-remain-total");
   const remWrap = document.getElementById("split-remain-label");
-  if (paidEl) paidEl.textContent = money(paid);
-  if (remEl) remEl.textContent = money(Math.max(0, total - paid));
-  if (remWrap) remWrap.classList.toggle("hidden", Math.abs(total - paid) < 0.01);
-  if (remWrap) remWrap.style.color = total - paid > 0.01 ? "var(--danger)" : "var(--success)";
+  const paidLabel = document.getElementById("split-paid-label");
+  if (bad) {
+    if (paidEl) paidEl.textContent = "—";
+    if (remEl) remEl.textContent = "—";
+    if (remWrap) remWrap.classList.remove("hidden");
+    return;
+  }
+  if (paidLabel) {
+    paidLabel.innerHTML = fxOn
+      ? `Оплачено (${saleCur}): <strong id="split-paid-total">${moneySale(paidSale)}</strong>`
+      : `Оплачено: <strong id="split-paid-total">${moneySale(paidSale)}</strong>`;
+  } else if (paidEl) {
+    paidEl.textContent = moneySale(paidSale);
+  }
+  const remain = Math.max(0, totalSale - paidSale);
+  const remStrong = document.getElementById("split-remain-total");
+  if (remWrap) {
+    remWrap.innerHTML = fxOn
+      ? `Осталось (${saleCur}): <strong id="split-remain-total">${moneySale(remain)}</strong>`
+      : `Осталось: <strong id="split-remain-total">${moneySale(remain)}</strong>`;
+    remWrap.classList.toggle("hidden", Math.abs(totalSale - paidSale) < 0.01);
+    remWrap.style.color = totalSale - paidSale > 0.01 ? "var(--danger)" : "var(--success)";
+  } else if (remStrong) {
+    remStrong.textContent = moneySale(remain);
+  }
 }
 
 function collectSplitPayments() {
+  const saleCur = posSaleCurrency();
   return [...document.querySelectorAll(".split-pay-input")]
-    .map((inp) => ({ method_code: inp.dataset.method, amount: +inp.value || 0 }))
+    .map((inp) => {
+      const row = inp.closest(".split-pay-row");
+      const curSel = row?.querySelector(".split-pay-currency");
+      return {
+        method_code: inp.dataset.method,
+        amount: +inp.value || 0,
+        currency_code: (curSel?.value || saleCur).toUpperCase(),
+      };
+    })
     .filter((p) => p.amount > 0);
 }
 
@@ -4721,10 +5358,88 @@ async function saveExpenseAllocation(e) {
 }
 
 window.deleteExpense = async (id) => {
-  if (! confirm("Удалить расход?")) return;
-  try { await api(`/api/expenses/${id}`, { method: "DELETE" }); toast("Удалено"); loadSettingsPage(); }
-  catch (e) { toast(e.message, "error"); }
+  if (!confirm("Удалить расход?")) return;
+  try {
+    await api(`/api/expenses/${id}`, { method: "DELETE" });
+    toast("Расход откатан");
+    if (document.getElementById("expense-lines-modal")?.open) {
+      const title = document.getElementById("expense-lines-title")?.dataset || {};
+      if (title.cat) await openExpenseCategoryDetail(title.cat, title.dept || "main");
+      else document.getElementById("expense-lines-modal")?.close();
+    }
+    if (currentPage === "settings") loadSettingsPage();
+    if (currentPage === "reports" && reportType === "opiu") loadReport();
+  } catch (e) { toast(e.message, "error"); }
 };
+
+let expenseDetailCtx = { category: "", department: "main" };
+
+async function openExpenseCategoryDetail(category, department = "main") {
+  expenseDetailCtx = { category, department };
+  const period = document.getElementById("report-period")?.value || "month";
+  const from = document.getElementById("report-from")?.value || "";
+  const to = document.getElementById("report-to")?.value || "";
+  let url = `/api/expenses?period=${encodeURIComponent(period)}&category=${encodeURIComponent(category)}&department=${encodeURIComponent(department || "main")}`;
+  if (from) url += `&date_from=${encodeURIComponent(from)}`;
+  if (to) url += `&date_to=${encodeURIComponent(to)}`;
+  const rows = await api(url);
+  const total = rows.reduce((s, r) => s + (+r.amount || 0), 0);
+  const deptLabel = department === "accessories" ? "Аксессуары" : "Основной";
+  const titleEl = document.getElementById("expense-lines-title");
+  if (titleEl) {
+    titleEl.textContent = `Расход: ${category}`;
+    titleEl.dataset.cat = category;
+    titleEl.dataset.dept = department || "main";
+  }
+  const sub = document.getElementById("expense-lines-sub");
+  if (sub) {
+    sub.textContent = `${deptLabel} · ${rows.length} запис. · итого ${fmtCurrency(total, currency_meta("TJS"))}`;
+  }
+  const box = document.getElementById("expense-lines-content");
+  if (box) {
+    if (!rows.length) {
+      box.innerHTML = '<p class="hint">Нет записей за выбранный период</p>';
+    } else {
+      box.innerHTML = `<table class="data-table">
+        <thead><tr>
+          <th>Дата расхода</th><th>Сумма</th><th>Оплата</th><th>Кто ввёл</th><th>Когда введено</th><th>Комментарий</th><th></th>
+        </tr></thead>
+        <tbody>${rows.map((e) => `<tr>
+          <td>${esc(e.expense_date || "—")}</td>
+          <td><strong>${fmtCurrency(e.amount, currency_meta("TJS"))}</strong></td>
+          <td>${esc(e.payment_method_name || payLabel(e.payment_method_code) || e.payment_method_code || "—")}</td>
+          <td>${esc(e.created_by || "—")}</td>
+          <td>${esc((e.created_at || "").slice(0, 16) || "—")}</td>
+          <td>${esc(e.description || "—")}</td>
+          <td class="expense-line-actions">
+            <button type="button" class="btn btn-danger btn-sm" data-rollback-exp="${e.id}" title="Откатить расход">Откат</button>
+          </td>
+        </tr>`).join("")}</tbody>
+      </table>`;
+      box.querySelectorAll("[data-rollback-exp]").forEach((btn) => {
+        btn.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          rollbackExpense(+btn.dataset.rollbackExp);
+        });
+      });
+    }
+  }
+  document.getElementById("expense-lines-modal")?.showModal();
+}
+
+async function rollbackExpense(id) {
+  if (!confirm("Откатить этот расход? Запись будет удалена из отчётов.")) return;
+  try {
+    await api(`/api/expenses/${id}`, { method: "DELETE" });
+    toast("Расход откатан");
+    await openExpenseCategoryDetail(expenseDetailCtx.category, expenseDetailCtx.department);
+    if (currentPage === "reports") loadReport();
+    if (currentPage === "settings") loadSettingsPage();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+window.openExpenseCategoryDetail = openExpenseCategoryDetail;
+window.rollbackExpense = rollbackExpense;
 
 /* ── Reports ── */
 function bindReports() {
@@ -4749,8 +5464,10 @@ function bindReports() {
   document.getElementById("load-report").onclick = loadReport;
   document.getElementById("report-detail-btn").onclick = openReportDetail;
   document.getElementById("report-detail-close")?.addEventListener("click", () => document.getElementById("report-detail-modal").close());
+  document.getElementById("expense-lines-close")?.addEventListener("click", () => document.getElementById("expense-lines-modal")?.close());
   document.getElementById("report-detail-wh")?.addEventListener("change", openReportDetail);
   document.getElementById("report-period").onchange = loadReport;
+  document.getElementById("report-warehouse")?.addEventListener("change", loadReport);
   document.getElementById("print-report").onclick = () => {
     const w = window.open("", "_blank");
     w.document.write(`<html><head><title>Отчёт</title><style>body{font-family:Arial;padding:24px}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:6px}</style></head><body>${document.getElementById("report-content").innerHTML}${document.getElementById("report-combined").innerHTML}</body></html>`);
@@ -4777,18 +5494,70 @@ function renderExpensesByWarehouse(total, rows) {
   const whRows = (rows || []).filter((w) => w.amount > 0 || w.pct > 0);
   return `<div class="card"><div class="card-header"><h3>Расходы по складам</h3></div>
     <div class="card-body table-wrap"><table class="data-table">
-      <thead><tr><th>Склад</th><th>Доля</th><th>Расход</th></tr></thead>
+      <thead><tr><th>Склад</th><th>Доля итога</th><th>Общие (%)</th><th>Выплаты</th><th>Итого</th></tr></thead>
       <tbody>
-        <tr><td><strong>Общий расход</strong></td><td>100%</td><td><strong>${fmtCurrency(total, tjs)}</strong></td></tr>
+        <tr><td><strong>Общий расход</strong></td><td>100%</td><td></td><td></td><td><strong>${fmtCurrency(total, tjs)}</strong></td></tr>
         ${whRows.map((w) => `<tr>
           <td>${esc(w.warehouse_name)}</td>
-          <td>${w.pct}%</td>
+          <td>${w.pct ?? 0}%</td>
+          <td>${fmtCurrency(w.shared_amount || 0, tjs)}${w.pct_rule != null ? ` <small class="hint">(${w.pct_rule}%)</small>` : ""}</td>
+          <td>${fmtCurrency(w.direct_amount || 0, tjs)}</td>
           <td>${fmtCurrency(w.amount, tjs)}</td>
         </tr>`).join("")}
       </tbody>
     </table>
-    <p class="hint muted" style="margin-top:.65rem">Доли задаются в <strong>Настройки → Расходы по складам (%)</strong>.</p>
+    <p class="hint muted" style="margin-top:.65rem">% из настроек делит только общие расходы без склада. Выплаты с кассы ложатся на выбранный склад на 100%.</p>
   </div></div>`;
+}
+
+function renderFundsSnapshot(funds) {
+  if (!funds) return "";
+  const usd = currency_meta("USD");
+  const tjs = currency_meta("TJS");
+  const t = funds.totals || {};
+  const rateUsd = funds.exchange_rates?.USD;
+  const whRows = (funds.warehouses || []).map((w) => `
+    <tr>
+      <td><strong>${esc(w.warehouse_name)}</strong></td>
+      <td>${esc(w.currency_code || "—")}</td>
+      <td>${fmtCurrency(w.value_usd ?? 0, usd)}</td>
+      <td>${fmtCurrency(w.value_tjs ?? 0, tjs)}</td>
+      <td>${(w.units_count || 0) + (w.qty_items || 0)}</td>
+    </tr>`).join("");
+  const cashRows = (funds.cash_by_currency || []).map((c) => `
+    <tr>
+      <td><strong>${esc(c.name || c.code)}</strong></td>
+      <td>${fmtCurrency(c.cash ?? 0, c)}</td>
+      <td>${fmtCurrency(c.wallet ?? 0, c)}</td>
+      <td><strong>${fmtCurrency(c.total ?? 0, c)}</strong></td>
+    </tr>`).join("");
+  return `
+    <div class="card" style="margin-bottom:1rem">
+      <div class="card-header"><h3>Сейчас: склады и касса</h3>
+        <p class="hint" style="margin:0">На ${esc((funds.as_of || "").slice(0, 16))}${rateUsd ? ` · курс USD ${rateUsd}` : ""}</p>
+      </div>
+      <div class="card-body">
+        <div class="report-kpi" style="margin-bottom:1rem">
+          <div class="report-box"><div class="lbl">Товар на складах ($)</div><div class="val">${fmtCurrency(t.stock_usd ?? 0, usd)}</div></div>
+          <div class="report-box"><div class="lbl">Товар на складах (смн)</div><div class="val">${fmtCurrency(t.stock_tjs ?? 0, tjs)}</div></div>
+          <div class="report-box"><div class="lbl">Наличка $</div><div class="val">${fmtCurrency(t.cash_usd ?? 0, usd)}</div></div>
+          <div class="report-box"><div class="lbl">Наличка смн</div><div class="val">${fmtCurrency(t.cash_tjs ?? 0, tjs)}</div></div>
+          <div class="report-box"><div class="lbl">Кошелёк $</div><div class="val">${fmtCurrency(t.wallet_usd ?? 0, usd)}</div></div>
+          <div class="report-box"><div class="lbl">Кошелёк смн</div><div class="val">${fmtCurrency(t.wallet_tjs ?? 0, tjs)}</div></div>
+        </div>
+        <h4 class="sub-heading">По складам (себестоимость остатка)</h4>
+        <div class="table-wrap"><table class="data-table">
+          <thead><tr><th>Склад</th><th>Валюта</th><th>В долларах</th><th>В сомони</th><th>Шт.</th></tr></thead>
+          <tbody>${whRows || '<tr><td colspan="5">Нет складов</td></tr>'}</tbody>
+        </table></div>
+        <h4 class="sub-heading" style="margin-top:1rem">Касса: наличка и кошелёк</h4>
+        <div class="table-wrap"><table class="data-table">
+          <thead><tr><th>Валюта</th><th>Наличка</th><th>Кошелёк</th><th>Итого</th></tr></thead>
+          <tbody>${cashRows || '<tr><td colspan="4">Нет данных</td></tr>'}</tbody>
+        </table></div>
+        <p class="hint muted" style="margin-top:.65rem">Кошелёк — карта, ДС, Alif, Эсхата, перевод. Наличка — только cash. Учитываются продажи, погашения долгов, расходы и оплаты поставщикам.</p>
+      </div>
+    </div>`;
 }
 
 function renderReportBlock(r, title) {
@@ -4797,6 +5566,7 @@ function renderReportBlock(r, title) {
   const money = (n) => (primary && multiCur ? "—" : (primary ? fmtCurrency(n, primary) : fmt(n)));
   return `
     <div class="report-header"><h3>${title}</h3><p>${r.period_label}</p></div>
+    ${renderFundsSnapshot(r.funds)}
     ${multiCur ? renderCurrencyBreakdown(r.by_currency) : (r.by_currency?.length ? renderCurrencyBreakdown(r.by_currency) : "")}
     <div class="report-kpi">
       <div class="report-box"><div class="lbl">Выручка</div><div class="val">${money(r.gross_revenue)}</div></div>
@@ -4828,8 +5598,8 @@ function renderCompareCard(r, cls, title) {
     <div class="metric-row"><span>Прибыль</span><strong>${multi ? "см. валюты" : m(r.shop_profit)}</strong></div>
     <div class="metric-row"><span>Маржа</span><strong>${r.margin_pct}%</strong></div>
     <div class="metric-row"><span>Продаж</span><strong>${r.sales_count}</strong></div>
-    ${cls !== "own" ? `<div class="metric-row"><span>Поставщикам</span><strong>${fmt(r.supplier_due)}</strong></div>` : ""}
-    ${cls !== "cons" ? `<div class="metric-row"><span>Себестоимость</span><strong>${fmt(r.own_cogs)}</strong></div>` : ""}
+    ${cls !== "own" ? `<div class="metric-row"><span>Поставщикам</span><strong class="value-multi">${finFmt(r, "supplier_due")}</strong></div>` : ""}
+    ${cls !== "cons" ? `<div class="metric-row"><span>Себестоимость</span><strong class="value-multi">${finFmt(r, "own_cogs")}</strong></div>` : ""}
   </div>`;
 }
 
@@ -4837,8 +5607,22 @@ async function loadReport() {
   const period = document.getElementById("report-period").value;
   const from = document.getElementById("report-from").value;
   const to = document.getElementById("report-to").value;
+  const whSel = document.getElementById("report-warehouse");
+  if (whSel && whSel.options.length <= 1 && warehouses.length) {
+    const cur = whSel.value;
+    whSel.innerHTML = '<option value="">Все склады</option>' +
+      warehouses.map((w) => `<option value="${w.id}">${esc(w.name)}</option>`).join("");
+    whSel.value = cur || "";
+  }
+  const whId = whSel?.value || "";
   const combinedEl = document.getElementById("report-combined");
-  const q = (base) => { let u = `${base}?period=${period}`; if (from) u += `&date_from=${from}`; if (to) u += `&date_to=${to}`; return u; };
+  const q = (base) => {
+    let u = `${base}?period=${period}`;
+    if (from) u += `&date_from=${from}`;
+    if (to) u += `&date_to=${to}`;
+    if (whId) u += `&warehouse_id=${whId}`;
+    return u;
+  };
 
   if (reportType === "opiu") {
     const r = await api(q("/api/reports/opiu"));
@@ -4846,7 +5630,7 @@ async function loadReport() {
     const multi = r.multi_currency;
     const money = (n, cur) => (multi && !cur ? "—" : fmtCurrency(n, cur || currency_meta("TJS")));
     document.getElementById("report-content").innerHTML = `
-      <div class="report-header"><h3>ОПиУ</h3><p>${r.period_label || ""}</p></div>
+      <div class="report-header"><h3>ОПиУ${r.warehouse_name ? ` · ${esc(r.warehouse_name)}` : ""}</h3><p>${r.period_label || ""}</p></div>
       ${renderCurrencyBreakdown(r.by_currency)}
       <div class="report-kpi">
         <div class="report-box"><div class="lbl">Выручка</div><div class="val">${multi ? "см. валюты" : money(r.revenue, r.by_currency?.[0])}</div></div>
@@ -4854,47 +5638,74 @@ async function loadReport() {
         <div class="report-box"><div class="lbl">Расходы</div><div class="val">${money(r.operating_expenses, currency_meta("TJS"))}</div></div>
         <div class="report-box"><div class="lbl">Чистая прибыль</div><div class="val" style="color:var(--success)">${multi ? "см. валюты" : money(r.net_profit, r.by_currency?.[0])}</div></div>
       </div>
-      ${(r.expenses_by_category || []).length ? `<div class="card"><div class="card-header"><h3>Расходы по категориям</h3></div><div class="card-body table-wrap"><table class="data-table"><thead><tr><th>Категория</th><th>Отдел</th><th>Сумма</th></tr></thead><tbody>
-        ${r.expenses_by_category.map((e) => `<tr><td>${esc(e.category)}</td><td>${e.department === "accessories" ? "Аксессуары" : "Основной"}</td><td>${fmtCurrency(e.amount, currency_meta("TJS"))}</td></tr>`).join("")}
+      ${(r.expenses_by_category || []).length ? `<div class="card"><div class="card-header"><h3>Расходы по категориям</h3><p class="hint" style="margin:0">Нажмите строку, чтобы открыть записи и откатить</p></div><div class="card-body table-wrap"><table class="data-table"><thead><tr><th>Категория</th><th>Отдел</th><th>Сумма</th></tr></thead><tbody>
+        ${r.expenses_by_category.map((e) => `<tr class="row-clickable" data-exp-cat="${esc(e.category)}" data-exp-dept="${esc(e.department || "main")}">
+          <td>${esc(e.category)}</td>
+          <td>${e.department === "accessories" ? "Аксессуары" : "Основной"}</td>
+          <td>${fmtCurrency(e.amount, currency_meta("TJS"))}</td>
+        </tr>`).join("")}
       </tbody></table></div></div>` : ""}
       ${renderExpensesByWarehouse(r.operating_expenses, r.expenses_by_warehouse)}`;
+    document.querySelectorAll("#report-content tr.row-clickable[data-exp-cat]").forEach((tr) => {
+      tr.addEventListener("click", () => openExpenseCategoryDetail(tr.dataset.expCat, tr.dataset.expDept || "main"));
+    });
     return;
   }
   if (reportType === "dds") {
     const r = await api(q("/api/reports/dds"));
     combinedEl.classList.add("hidden");
+    const bags = r.by_currency || [];
     document.getElementById("report-content").innerHTML = `
-      <div class="report-header"><h3>ДДС</h3><p>${r.period_label || ""}</p></div>
+      <div class="report-header"><h3>ДДС${r.warehouse_name ? ` · ${esc(r.warehouse_name)}` : ""}</h3><p>${r.period_label || ""}</p></div>
       <div class="report-kpi">
-        <div class="report-box"><div class="lbl">Сальдо на начало</div><div class="val">${fmt(r.opening_balance)}</div></div>
-        <div class="report-box"><div class="lbl">Поступления</div><div class="val">${fmt(r.total_inflows)}</div></div>
-        <div class="report-box"><div class="lbl">Выплаты</div><div class="val">${fmt(r.total_outflows)}</div></div>
-        <div class="report-box"><div class="lbl">Сальдо на конец</div><div class="val" style="color:var(--success)">${fmt(r.closing_balance)}</div></div>
+        <div class="report-box"><div class="lbl">Поступления</div><div class="val value-multi">${formatSideBags(bags, "inflow")}</div></div>
+        <div class="report-box"><div class="lbl">Выплаты</div><div class="val value-multi">${formatSideBags(bags, "outflow")}</div></div>
+        <div class="report-box"><div class="lbl">Чистый поток</div><div class="val value-multi">${formatSideBags(bags, "net")}</div></div>
       </div>
-      <div class="report-kpi" style="margin-top:0.5rem">
-        <div class="report-box"><div class="lbl">Чистый поток</div><div class="val">${fmt(r.net_operating_cash)}</div></div>
-        ${r.receivable_collections > 0 ? `<div class="report-box"><div class="lbl">Погашение долгов</div><div class="val">${fmt(r.receivable_collections)}</div></div>` : ""}
-      </div>
-      <div class="card"><div class="card-body"><table class="data-table"><thead><tr><th>Способ</th><th>Сумма</th></tr></thead><tbody>${(r.operating_inflows||[]).map(p=>`<tr><td>${esc(p.name)}</td><td>${fmt(p.amount)}</td></tr>`).join("")}</tbody></table></div></div>`;
+      <p class="hint">Доллары и сомони считаются отдельно — без смешивания в одну сумму.</p>
+      <div class="card"><div class="card-body"><table class="data-table"><thead><tr><th>Валюта</th><th>Приход</th><th>Расход</th><th>Итого</th></tr></thead><tbody>
+        ${(bags.length ? bags : [{ code: "USD", inflow: 0, outflow: 0, net: 0 }, { code: "TJS", inflow: 0, outflow: 0, net: 0 }]).map((c) => `
+          <tr>
+            <td><strong>${esc(c.name || c.code)}</strong></td>
+            <td>${fmtCurrency(c.inflow || 0, currency_meta(c.code))}</td>
+            <td>${fmtCurrency(c.outflow || 0, currency_meta(c.code))}</td>
+            <td><strong>${fmtCurrency(c.net || 0, currency_meta(c.code))}</strong></td>
+          </tr>`).join("")}
+      </tbody></table></div></div>`;
     return;
   }
   if (reportType === "balance") {
-    const r = await api("/api/reports/balance");
+    const r = await api(whId ? `/api/reports/balance?warehouse_id=${whId}` : "/api/reports/balance");
     combinedEl.classList.add("hidden");
+    const bags = r.by_currency || [];
     document.getElementById("report-content").innerHTML = `
-      <div class="report-header"><h3>Баланс</h3></div>
-      <div class="metric-row"><span>Денежные средства</span><strong>${fmt(r.assets.cash)}</strong></div>
-      <div class="metric-row"><span>Дебиторка</span><strong>${fmt(r.assets.receivables || 0)}</strong></div>
-      <div class="metric-row"><span>Запасы</span><strong>${fmt(r.assets.inventory)}</strong></div>
-      <div class="metric-row"><span>Долг поставщикам</span><strong>${fmt(r.liabilities.supplier_payables)}</strong></div>
-      <div class="metric-row"><span>Капитал</span><strong>${fmt(r.equity)}</strong></div>`;
+      <div class="report-header"><h3>Баланс${r.warehouse_name ? ` · ${esc(r.warehouse_name)}` : ""}</h3></div>
+      <p class="hint">Доллары и сомони отдельно — без смешивания.</p>
+      <div class="report-kpi">
+        <div class="report-box"><div class="lbl">Деньги</div><div class="val value-multi">${formatSideBags(bags, "cash")}</div></div>
+        <div class="report-box"><div class="lbl">Дебиторка</div><div class="val value-multi">${formatSideBags(bags, "receivables")}</div></div>
+        <div class="report-box"><div class="lbl">Запасы</div><div class="val value-multi">${formatSideBags(bags, "inventory")}</div></div>
+        <div class="report-box"><div class="lbl">Поставщикам</div><div class="val value-multi">${formatSideBags(bags, "supplier_payables")}</div></div>
+        <div class="report-box"><div class="lbl">Капитал</div><div class="val value-multi">${formatSideBags(bags, "equity")}</div></div>
+      </div>
+      <div class="card"><div class="card-body"><table class="data-table"><thead><tr><th>Валюта</th><th>Деньги</th><th>Дебиторка</th><th>Запасы</th><th>Поставщикам</th><th>Капитал</th></tr></thead><tbody>
+        ${bags.map((c) => `
+          <tr>
+            <td><strong>${esc(c.name || c.code)}</strong></td>
+            <td>${moneyLine(c.cash, c.code)}</td>
+            <td>${moneyLine(c.receivables, c.code)}</td>
+            <td>${moneyLine(c.inventory, c.code)}</td>
+            <td>${moneyLine(c.supplier_payables, c.code)}</td>
+            <td><strong>${moneyLine(c.equity, c.code)}</strong></td>
+          </tr>`).join("")}
+      </tbody></table></div></div>`;
     return;
   }
   if (reportType === "customs") {
     const r = await api(q("/api/reports/customs"));
     combinedEl.classList.add("hidden");
     document.getElementById("report-content").innerHTML = `
-      <div class="report-header"><h3>Растаможка</h3><p>${r.period_label || ""}</p></div>
+      <div class="report-header"><h3>Растаможка${r.warehouse_name ? ` · ${esc(r.warehouse_name)}` : ""}</h3><p>${r.period_label || ""}</p></div>
       <div class="report-kpi">
         <div class="report-box"><div class="lbl">Сумма таможни</div><div class="val">${fmt(r.total_customs)}</div></div>
         <div class="report-box"><div class="lbl">Устройств</div><div class="val">${r.units_count}</div></div>
@@ -4908,15 +5719,15 @@ async function loadReport() {
     const r = await api(q("/api/reports/cashiers"));
     combinedEl.classList.add("hidden");
     document.getElementById("report-content").innerHTML = `
-      <div class="report-header"><h3>Отчёт по кассирам</h3><p>${r.period_label || ""}</p></div>
+      <div class="report-header"><h3>Отчёт по кассирам${r.warehouse_name ? ` · ${esc(r.warehouse_name)}` : ""}</h3><p>${r.period_label || ""}</p></div>
       <div class="card"><div class="card-body table-wrap"><table class="data-table">
         <thead><tr><th>Кассир</th><th>Продаж</th><th>Выручка</th><th>Прибыль</th><th>Оплаты</th></tr></thead>
         <tbody>${(r.cashiers || []).map((c) => `<tr>
-          <td><strong>${esc(c.cashier_name)}</strong></td>
+          <td><strong>${esc(c.cashier_name)}</strong> <span class="hint">${esc(c.currency_code || "")}</span></td>
           <td>${c.sales_count}</td>
-          <td>${fmt(c.revenue)}</td>
-          <td>${fmt(c.profit)}</td>
-          <td style="font-size:.85rem">${(c.by_payment || []).map((p) => `${esc(p.name)} ${fmt(p.amount)}`).join("<br>") || "—"}</td>
+          <td>${moneyLine(c.revenue, c.currency_code)}</td>
+          <td>${moneyLine(c.profit, c.currency_code)}</td>
+          <td style="font-size:.85rem">${(c.by_payment || []).map((p) => `${esc(p.name)} ${moneyLine(p.amount, p.currency_code || c.currency_code)}`).join("<br>") || "—"}</td>
         </tr>`).join("") || '<tr><td colspan="5" style="text-align:center;color:var(--muted)">Нет данных</td></tr>'}
         </tbody></table></div></div>`;
     return;
@@ -4926,6 +5737,7 @@ async function loadReport() {
     let url = `/api/reports/trade-ins?period=${period}`;
     if (from) url += `&date_from=${from}`;
     if (to) url += `&date_to=${to}`;
+    if (whId) url += `&warehouse_id=${whId}`;
     const r = await api(url);
     combinedEl.classList.add("hidden");
     document.getElementById("report-content").innerHTML = `
@@ -4960,9 +5772,12 @@ async function loadReport() {
   let url = `/api/reports/finance?scope=${reportScope}&period=${period}`;
   if (from) url += `&date_from=${from}`;
   if (to) url += `&date_to=${to}`;
+  if (whId) url += `&warehouse_id=${whId}`;
 
   if (reportScope === "all" && !from && !to) {
-    const combined = await api(`/api/reports/combined?period=${period}`);
+    let combUrl = `/api/reports/combined?period=${period}`;
+    if (whId) combUrl += `&warehouse_id=${whId}`;
+    const combined = await api(combUrl);
     document.getElementById("report-content").innerHTML = renderReportBlock(combined.all, "Общий финансовый отчёт");
     combinedEl.classList.remove("hidden");
     document.getElementById("compare-grid").innerHTML =
@@ -4986,10 +5801,12 @@ async function openReportDetail() {
     return;
   }
   const whSel = document.getElementById("report-detail-wh");
+  const mainWh = document.getElementById("report-warehouse")?.value || "";
   if (whSel && whSel.options.length <= 1) {
     whSel.innerHTML = '<option value="">Все склады</option>' +
       warehouses.map((w) => `<option value="${w.id}">${esc(w.name)}</option>`).join("");
   }
+  if (whSel && mainWh && !whSel.value) whSel.value = mainWh;
   const whId = whSel?.value || "";
   let url = `/api/reports/detail?kind=${kind}&period=${period}`;
   if (from) url += `&date_from=${from}`;
@@ -4999,15 +5816,15 @@ async function openReportDetail() {
   document.getElementById("report-detail-title").textContent = `Детализация · ${r.period_label}`;
   const whRows = (r.warehouses || []).map((w) => `<tr>
     <td><strong>${esc(w.warehouse_name)}</strong></td>
-    <td>${fmt(w.revenue)}</td>
-    <td>${fmt(w.inflows)}</td>
-    <td>${fmt(w.expenses_allocated)} <small class="muted">(${w.pct}%)</small></td>
-    <td><strong>${fmt(w.profit)}</strong></td>
+    <td class="value-multi">${formatSideBags(w.by_currency || [], "revenue")}</td>
+    <td class="value-multi">${formatSideBags(w.by_currency || [], "inflows")}</td>
+    <td>${moneyLine(w.expenses_allocated, "TJS")} <small class="muted">(${w.pct}%)</small></td>
+    <td class="value-multi"><strong>${formatSideBags(w.by_currency || [], "profit")}</strong></td>
   </tr>`).join("");
   document.getElementById("report-detail-content").innerHTML = `
     <div class="card" style="margin-bottom:1rem"><div class="card-header"><h3>По складам</h3></div>
       <div class="table-wrap card-body"><table class="data-table">
-        <thead><tr><th>Склад</th><th>Выручка</th><th>Приход</th><th>Расход (доля)</th><th>Прибыль</th></tr></thead>
+        <thead><tr><th>Склад</th><th>Выручка</th><th>Приход</th><th>Расход смн (доля)</th><th>Прибыль</th></tr></thead>
         <tbody>${whRows || '<tr><td colspan="5">Нет данных</td></tr>'}</tbody>
       </table></div>
     </div>
@@ -5015,20 +5832,32 @@ async function openReportDetail() {
       <div class="card"><div class="card-header"><h3>Приходы (продажи)</h3></div>
         <div class="table-wrap card-body" style="max-height:240px;overflow:auto"><table class="data-table">
           <thead><tr><th>Дата</th><th>Чек</th><th>Способ</th><th>Сумма</th><th>Склад</th></tr></thead>
-          <tbody>${(r.inflow_lines||[]).map((l)=>`<tr><td>${esc(l.created_at?.slice(0,16)||"")}</td><td>#${l.sale_id}</td><td>${esc(l.name||l.method_code)}</td><td>${fmt(l.amount)}</td><td>${esc(l.warehouse_name)}</td></tr>`).join("")||'<tr><td colspan="5">Нет данных</td></tr>'}
+          <tbody>${(r.inflow_lines||[]).map((l)=>`<tr><td>${esc(l.created_at?.slice(0,16)||"")}</td><td>#${l.sale_id}</td><td>${esc(l.name||l.method_code)}</td><td>${moneyLine(l.amount, l.currency_code)}</td><td>${esc(l.warehouse_name)}</td></tr>`).join("")||'<tr><td colspan="5">Нет данных</td></tr>'}
           </tbody></table></div>
       </div>
       <div class="card"><div class="card-header"><h3>Расходы</h3></div>
         <div class="table-wrap card-body" style="max-height:240px;overflow:auto"><table class="data-table">
-          <thead><tr><th>Дата</th><th>Категория</th><th>Сумма</th></tr></thead>
-          <tbody>${(r.expense_lines||[]).map((e)=>`<tr><td>${esc(e.expense_date)}</td><td>${esc(e.category)}</td><td>${fmt(e.amount)}</td></tr>`).join("")||'<tr><td colspan="3">Нет данных</td></tr>'}
+          <thead><tr><th>Дата</th><th>Категория</th><th>Кто</th><th>Сумма</th><th></th></tr></thead>
+          <tbody>${(r.expense_lines||[]).map((e)=>`<tr>
+            <td>${esc(e.expense_date)}</td>
+            <td>${esc(e.category)}</td>
+            <td>${esc(e.created_by || (e.description === "Excel импорт ОПиУ" ? "Excel импорт" : "—"))}</td>
+            <td>${moneyLine(e.amount, "TJS")}</td>
+            <td><button type="button" class="btn btn-danger btn-sm" data-rollback-exp="${e.id}">Откат</button></td>
+          </tr>`).join("")||'<tr><td colspan="5">Нет данных</td></tr>'}
           </tbody></table></div>
       </div>
     </div>
     ${(r.receivable_collections||[]).length ? `<div class="card" style="margin-top:1rem"><div class="card-header"><h3>Погашение долгов</h3></div>
       <div class="table-wrap card-body"><table class="data-table"><thead><tr><th>Дата</th><th>Клиент</th><th>Сумма</th></tr></thead><tbody>
-        ${r.receivable_collections.map((p)=>`<tr><td>${esc(p.created_at?.slice(0,16)||"")}</td><td>${esc(p.customer_name)}</td><td>${fmt(p.amount)}</td></tr>`).join("")}
+        ${r.receivable_collections.map((p)=>`<tr><td>${esc(p.created_at?.slice(0,16)||"")}</td><td>${esc(p.customer_name)}</td><td>${moneyLine(p.amount, p.currency_code || p.pay_currency_code)}</td></tr>`).join("")}
       </tbody></table></div></div>` : ""}`;
+  document.getElementById("report-detail-content")?.querySelectorAll("[data-rollback-exp]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      await rollbackExpense(+btn.dataset.rollbackExp);
+      openReportDetail();
+    });
+  });
   document.getElementById("report-detail-modal").showModal();
 }
 
@@ -5039,33 +5868,117 @@ function mutualFmt(n, code) {
   return fmtCurrency(n, currency_meta(code || "TJS"));
 }
 
+/** Sum amounts into { USD, TJS, ... } bags — never mix currencies as raw numbers. */
+function sumMoneyByCurrency(items, amountKey = "amount_due", currencyKey = "currency_code") {
+  const bags = {};
+  for (const it of items || []) {
+    const code = String(it[currencyKey] || "TJS").toUpperCase() || "TJS";
+    bags[code] = (bags[code] || 0) + (+it[amountKey] || 0);
+  }
+  return bags;
+}
+
+/** Always two lines: dollars and somoni (never mix as one number). */
+function formatCurrencyBags(bags) {
+  const usd = +(bags?.USD || 0);
+  const tjs = +(bags?.TJS || 0);
+  return `
+    <div class="bag-line bag-usd"><span class="bag-label">Доллары</span> <strong>${fmtCurrency(usd, currency_meta("USD"))}</strong></div>
+    <div class="bag-line bag-tjs"><span class="bag-label">Сомони</span> <strong>${fmtCurrency(tjs, currency_meta("TJS"))}</strong></div>`;
+}
+
+function defaultUsdToTjsRate() {
+  const r = getRate("USD");
+  return r != null && r > 0 ? r : null;
+}
+
+function debtorPayDebtCurrency() {
+  const row = mutualPayTarget || payDebtorTarget;
+  return String(row?.currency_code || "TJS").toUpperCase() || "TJS";
+}
+
+function updateDebtorPayFxUI() {
+  const debtCur = debtorPayDebtCurrency();
+  const payCur = (document.getElementById("debtor-pay-currency")?.value || debtCur).toUpperCase();
+  const rateWrap = document.getElementById("debtor-pay-rate-wrap");
+  const hint = document.getElementById("debtor-pay-convert-hint");
+  const amount = +document.getElementById("debtor-pay-amount")?.value || 0;
+  const needFx = payCur !== debtCur;
+  rateWrap?.classList.toggle("hidden", !needFx);
+  if (!hint) return;
+  if (!amount) {
+    hint.textContent = `Долг в ${currencyLabel(debtCur)}`;
+    return;
+  }
+  if (!needFx) {
+    hint.textContent = `К долгу спишется ${fmtCurrency(amount, currency_meta(debtCur))}`;
+    return;
+  }
+  const rate = +document.getElementById("debtor-pay-fx-rate")?.value || 0;
+  if (rate <= 0) {
+    hint.textContent = "Укажите курс: сколько сомони за 1 доллар";
+    return;
+  }
+  let reduction = 0;
+  if (debtCur === "USD" && payCur === "TJS") reduction = amount / rate;
+  else if (debtCur === "TJS" && payCur === "USD") reduction = amount * rate;
+  else {
+    hint.textContent = "Неподдерживаемая пара валют";
+    return;
+  }
+  hint.textContent =
+    `Принято ${fmtCurrency(amount, currency_meta(payCur))} · курс 1$ = ${rate} смн → к долгу −${fmtCurrency(reduction, currency_meta(debtCur))}`;
+}
+
+function resetMutualEntryForm() {
+  document.getElementById("mutual-entry-form")?.reset();
+  document.getElementById("mutual-edit-id").value = "";
+  document.getElementById("mutual-entry-title").textContent = "Новая запись — взаиморасчёт";
+  document.getElementById("mutual-entry-delete")?.classList.add("hidden");
+}
+
 function bindDebtors() {
   document.getElementById("debtors-filter")?.addEventListener("change", loadDebtorsPage);
   document.getElementById("debtors-refresh")?.addEventListener("click", loadDebtorsPage);
   document.getElementById("mutual-add-btn")?.addEventListener("click", () => {
-    document.getElementById("mutual-entry-form")?.reset();
+    resetMutualEntryForm();
     document.getElementById("mutual-entry-modal")?.showModal();
   });
   document.getElementById("mutual-entry-cancel")?.addEventListener("click", () => {
     document.getElementById("mutual-entry-modal")?.close();
   });
+  document.getElementById("mutual-entry-delete")?.addEventListener("click", async () => {
+    const id = +document.getElementById("mutual-edit-id").value;
+    if (!id) return;
+    if (!confirm("Удалить запись и все её оплаты? Это нельзя отменить.")) return;
+    try {
+      await api(`/api/mutual-entries/${id}`, { method: "DELETE" });
+      document.getElementById("mutual-entry-modal")?.close();
+      toast("Запись удалена");
+      loadDebtorsPage();
+    } catch (err) { toast(err.message, "error"); }
+  });
   document.getElementById("mutual-entry-form")?.addEventListener("submit", async (e) => {
     e.preventDefault();
+    const editId = +document.getElementById("mutual-edit-id").value || 0;
+    const payload = {
+      person_name: document.getElementById("mutual-name").value.trim(),
+      person_phone: document.getElementById("mutual-phone").value.trim(),
+      direction: document.getElementById("mutual-direction").value,
+      product_note: document.getElementById("mutual-product").value.trim(),
+      amount: +document.getElementById("mutual-amount").value,
+      currency_code: document.getElementById("mutual-currency").value,
+      notes: document.getElementById("mutual-notes").value.trim(),
+    };
     try {
-      await api("/api/mutual-entries", {
-        method: "POST",
-        body: JSON.stringify({
-          person_name: document.getElementById("mutual-name").value.trim(),
-          person_phone: document.getElementById("mutual-phone").value.trim(),
-          direction: document.getElementById("mutual-direction").value,
-          product_note: document.getElementById("mutual-product").value.trim(),
-          amount: +document.getElementById("mutual-amount").value,
-          currency_code: document.getElementById("mutual-currency").value,
-          notes: document.getElementById("mutual-notes").value.trim(),
-        }),
-      });
+      if (editId) {
+        await api(`/api/mutual-entries/${editId}`, { method: "PUT", body: JSON.stringify(payload) });
+        toast("Запись обновлена");
+      } else {
+        await api("/api/mutual-entries", { method: "POST", body: JSON.stringify(payload) });
+        toast("Запись добавлена");
+      }
       document.getElementById("mutual-entry-modal")?.close();
-      toast("Запись добавлена");
       loadDebtorsPage();
     } catch (err) { toast(err.message, "error"); }
   });
@@ -5074,14 +5987,27 @@ function bindDebtors() {
     payDebtorTarget = null;
     mutualPayTarget = null;
   });
+  ["debtor-pay-amount", "debtor-pay-currency", "debtor-pay-fx-rate"].forEach((id) => {
+    document.getElementById(id)?.addEventListener("input", updateDebtorPayFxUI);
+    document.getElementById(id)?.addEventListener("change", updateDebtorPayFxUI);
+  });
   document.getElementById("debtor-pay-form")?.addEventListener("submit", async (e) => {
     e.preventDefault();
     const amount = +document.getElementById("debtor-pay-amount").value;
+    const payCur = (document.getElementById("debtor-pay-currency").value || "TJS").toUpperCase();
+    const debtCur = debtorPayDebtCurrency();
+    const fxRaw = +document.getElementById("debtor-pay-fx-rate").value;
     const body = {
       amount,
       payment_method_code: document.getElementById("debtor-pay-method").value,
       notes: document.getElementById("debtor-pay-notes").value,
+      currency_code: payCur,
+      fx_rate: payCur !== debtCur ? fxRaw : null,
     };
+    if (payCur !== debtCur && !(fxRaw > 0)) {
+      toast("Укажите курс: сколько сомони за 1 доллар", "error");
+      return;
+    }
     try {
       if (mutualPayTarget) {
         await api(`/api/mutual-entries/${mutualPayTarget.id}/pay`, { method: "POST", body: JSON.stringify(body) });
@@ -5107,13 +6033,25 @@ async function loadDebtorHistory(kind, id, title) {
     ? `/api/mutual-entries/${id}/payments`
     : `/api/receivables/${id}/payments`;
   const items = await api(path).catch(() => []);
-  tb.innerHTML = items.map((p) => `
+  tb.innerHTML = items.map((p) => {
+    const payCur = (p.pay_currency_code || "").toUpperCase();
+    const payAmt = p.pay_amount != null ? +p.pay_amount : +p.amount;
+    const reduction = +p.amount;
+    const payPart = payCur
+      ? fmtCurrency(payAmt, currency_meta(payCur))
+      : fmt(payAmt);
+    const ratePart = p.fx_rate ? `, курс 1$=${p.fx_rate}` : "";
+    const reducePart = payCur && Math.abs(payAmt - reduction) > 0.005
+      ? `<br><span class="hint">к долгу −${fmt(reduction)}${ratePart}</span>`
+      : (ratePart ? `<br><span class="hint">${ratePart.slice(2)}</span>` : "");
+    return `
     <tr>
       <td>${esc(p.created_at?.slice(0, 16) || "")}</td>
-      <td>${fmt(p.amount)}</td>
+      <td>${payPart}${reducePart}</td>
       <td>${esc(payLabel(p.payment_method_code))}</td>
       <td>${esc(p.notes || "—")}</td>
-    </tr>`).join("") || '<tr><td colspan="4" style="text-align:center;color:var(--muted)">Оплат пока нет</td></tr>';
+    </tr>`;
+  }).join("") || '<tr><td colspan="4" style="text-align:center;color:var(--muted)">Оплат пока нет</td></tr>';
 }
 
 async function loadDebtorsPage() {
@@ -5130,31 +6068,49 @@ async function loadDebtorsPage() {
     api("/api/creditors").catch(() => ({ creditors: [], total_balance: 0 })),
   ]);
   creditorsCache = creditorsData.creditors || [];
-  const recvOpen = receivables.filter((d) => d.status === "open").reduce((s, d) => s + d.amount_due, 0);
-  const mutualOweUs = mutual.filter((m) => m.direction === "owe_us" && m.status === "open").reduce((s, m) => s + m.amount_due, 0);
-  const mutualWeOwe = mutual.filter((m) => m.direction === "we_owe" && m.status === "open").reduce((s, m) => s + m.amount_due, 0);
+  const clientsOwe = [
+    ...receivables.filter((d) => d.status === "open").map((d) => ({
+      amount_due: d.amount_due,
+      currency_code: d.currency_code || "TJS",
+    })),
+    ...mutual.filter((m) => m.direction === "owe_us" && m.status === "open").map((m) => ({
+      amount_due: m.amount_due,
+      currency_code: m.currency_code || "TJS",
+    })),
+  ];
+  const weOwe = mutual
+    .filter((m) => m.direction === "we_owe" && m.status === "open")
+    .map((m) => ({ amount_due: m.amount_due, currency_code: m.currency_code || "TJS" }));
   const summaryEl = document.getElementById("debtors-summary");
   if (summaryEl) {
+    const suppliersBag = { USD: 0, TJS: 0 };
+    for (const b of creditorsData.by_currency || []) {
+      suppliersBag[b.code] = (suppliersBag[b.code] || 0) + (+b.balance || 0);
+    }
     summaryEl.innerHTML = `
-      <div class="kpi accent-green"><div class="label">Клиенты должны</div><div class="value">${fmt(recvOpen + mutualOweUs)}</div></div>
-      <div class="kpi accent-warn"><div class="label">Мы должны людям</div><div class="value">${fmt(mutualWeOwe)}</div></div>
-      <div class="kpi accent-blue"><div class="label">Поставщикам</div><div class="value">${fmt(creditorsData.total_balance || 0)}</div></div>`;
+      <div class="kpi accent-green"><div class="label">Клиенты должны</div><div class="value value-multi">${formatCurrencyBags(sumMoneyByCurrency(clientsOwe))}</div></div>
+      <div class="kpi accent-warn"><div class="label">Мы должны людям</div><div class="value value-multi">${formatCurrencyBags(sumMoneyByCurrency(weOwe))}</div></div>
+      <div class="kpi accent-blue"><div class="label">Поставщикам</div><div class="value value-multi">${formatCurrencyBags(suppliersBag)}</div></div>`;
   }
-  const supplierRows = (status === "closed" ? [] : creditorsCache.filter((c) => c.balance > 0.01)).map((c) => ({
-    kind: "supplier",
-    id: c.supplier_name,
-    name: c.supplier_name,
-    phone: "—",
-    product: `Реализация · ${c.sales_count || 0} продаж`,
-    warehouse: "Поставщик",
-    total: c.accrued_due,
-    paid: c.paid,
-    due: c.balance,
-    status: c.balance > 0.01 ? "open" : "closed",
-    date: "",
-    currency: "TJS",
-    direction: "we_owe",
-  }));
+  const supplierRows = (status === "closed" ? [] : creditorsCache.filter((c) => (c.by_currency || []).some((b) => +b.balance > 0.01))).flatMap((c) => {
+    const bags = (c.by_currency || []).filter((b) => +b.balance > 0.01);
+    return bags.map((b) => ({
+      kind: "supplier",
+      id: `${c.supplier_name}::${b.code}`,
+      name: c.supplier_name,
+      phone: "—",
+      product: `Реализация · ${c.sales_count || 0} продаж`,
+      warehouse: "Поставщик",
+      total: b.accrued_due,
+      paid: b.paid,
+      due: b.balance,
+      status: "open",
+      date: "",
+      currency: b.code || "TJS",
+      direction: "we_owe",
+      supplier_name: c.supplier_name,
+    }));
+  });
   const rows = [
     ...receivables.map((d) => ({
       kind: "sale",
@@ -5168,7 +6124,7 @@ async function loadDebtorsPage() {
       due: d.amount_due,
       status: d.status,
       date: d.created_at,
-      currency: "TJS",
+      currency: d.currency_code || "TJS",
       direction: "owe_us",
     })),
     ...mutual.map((m) => ({
@@ -5194,13 +6150,16 @@ async function loadDebtorsPage() {
       : d.kind === "supplier"
       ? `<span class="tag">Поставщик</span>`
       : `<span class="tag">${d.direction === "we_owe" ? "Мы должны" : "Займ"}</span>`;
-    const money = (n) => d.kind === "mutual" ? mutualFmt(n, d.currency) : fmt(n);
+    const money = (n) => mutualFmt(n, d.currency || "TJS");
+    const idArg = typeof d.id === "number" ? d.id : `'${String(d.id).replace(/'/g, "\\'")}'`;
+    const supplierName = d.supplier_name || d.name;
     const actions = d.kind === "supplier"
-      ? `<button type="button" class="btn btn-ghost btn-sm" onclick='openCreditorSalesModal(${JSON.stringify(d.name)})'>Продажи</button>
-         ${d.status === "open" ? `<button class="btn btn-primary btn-sm" onclick='openCreditorPayModal(${JSON.stringify(d.name)})'>Выплатить</button>` : `<span class="tag">Закрыт</span>`}`
-      : `<button type="button" class="btn btn-ghost btn-sm" onclick="showDebtHistory('${d.kind}', ${typeof d.id === "number" ? d.id : `'${String(d.id).replace(/'/g, "\\'")}'`})">История</button>
+      ? `<button type="button" class="btn btn-ghost btn-sm" onclick='openCreditorSalesModal(${JSON.stringify(supplierName)})'>Продажи</button>
+         ${d.status === "open" ? `<button class="btn btn-primary btn-sm" onclick='openCreditorPayModal(${JSON.stringify(supplierName)})'>Выплатить</button>` : `<span class="tag">Закрыт</span>`}`
+      : `<button type="button" class="btn btn-ghost btn-sm" onclick="showDebtHistory('${d.kind}', ${idArg})">История</button>
+         ${d.kind === "mutual" ? `<button type="button" class="btn btn-secondary btn-sm" onclick="openMutualEditModal(${d.id})">Редактировать</button>` : ""}
          ${d.status === "open"
-           ? `<button class="btn btn-primary btn-sm" onclick="openDebtorPayModal('${d.kind}', ${typeof d.id === "number" ? d.id : `'${String(d.id).replace(/'/g, "\\'")}'`})">Оплата</button>`
+           ? `<button class="btn btn-primary btn-sm" onclick="openDebtorPayModal('${d.kind}', ${idArg})">Оплата</button>`
            : `<span class="tag">Закрыт</span>`}`;
     return `
     <tr>
@@ -5221,6 +6180,23 @@ window.showDebtHistory = (kind, id) => {
   loadDebtorHistory(kind, id, kind === "mutual" ? "История оплат (займ)" : "История оплат (продажа)");
 };
 
+window.openMutualEditModal = async (id) => {
+  const items = await api("/api/mutual-entries").catch(() => []);
+  const row = items.find((d) => d.id === id);
+  if (!row) { toast("Запись не найдена", "error"); return; }
+  document.getElementById("mutual-edit-id").value = String(row.id);
+  document.getElementById("mutual-entry-title").textContent = "Редактировать запись";
+  document.getElementById("mutual-name").value = row.person_name || "";
+  document.getElementById("mutual-phone").value = row.person_phone || "";
+  document.getElementById("mutual-direction").value = row.direction || "owe_us";
+  document.getElementById("mutual-product").value = row.product_note || "";
+  document.getElementById("mutual-amount").value = row.amount;
+  document.getElementById("mutual-currency").value = (row.currency_code || "TJS").toUpperCase();
+  document.getElementById("mutual-notes").value = row.notes || "";
+  document.getElementById("mutual-entry-delete")?.classList.remove("hidden");
+  document.getElementById("mutual-entry-modal")?.showModal();
+};
+
 window.openDebtorPayModal = async (kind, id) => {
   payDebtorTarget = null;
   mutualPayTarget = null;
@@ -5234,13 +6210,20 @@ window.openDebtorPayModal = async (kind, id) => {
     payDebtorTarget = full;
   }
   if (!full) return;
-  const dueLabel = kind === "mutual" ? mutualFmt(full.amount_due, full.currency_code) : fmt(full.amount_due);
+  const debtCur = String(full.currency_code || "TJS").toUpperCase() || "TJS";
+  const dueLabel = mutualFmt(full.amount_due, debtCur);
   const who = full.customer_name || full.person_name;
   document.getElementById("debtor-pay-meta").innerHTML = `
-    <div class="metric-row"><span>${esc(who)}</span><strong>Долг ${dueLabel}</strong></div>`;
+    <div class="metric-row"><span>${esc(who)}</span><strong>Долг ${dueLabel}</strong></div>
+    <p class="hint">Валюта долга: ${currencyLabel(debtCur)}. Если платят в другой валюте — укажите курс.</p>`;
   document.getElementById("debtor-pay-amount").value = full.amount_due;
+  document.getElementById("debtor-pay-currency").value = debtCur;
+  const rateEl = document.getElementById("debtor-pay-fx-rate");
+  const defRate = defaultUsdToTjsRate();
+  if (rateEl) rateEl.value = defRate != null ? defRate : "";
   document.getElementById("debtor-pay-notes").value = "";
   fillPaySelect(document.getElementById("debtor-pay-method"));
+  updateDebtorPayFxUI();
   document.getElementById("debtor-pay-modal").showModal();
 };
 
@@ -5280,6 +6263,16 @@ function bindCreditors() {
   });
 }
 
+function creditorOpen(c) {
+  return (c?.by_currency || []).some((b) => +b.balance > 0.01);
+}
+function creditorDefaultPayAmount(c) {
+  const bags = c?.by_currency || [];
+  const tjs = bags.find((b) => b.code === "TJS");
+  if (tjs && +tjs.balance > 0) return +tjs.balance;
+  return +(bags.find((b) => +b.balance > 0)?.balance || 0);
+}
+
 async function loadCreditorsPage() {
   const data = await api("/api/creditors");
   creditorsCache = data.creditors || [];
@@ -5287,31 +6280,32 @@ async function loadCreditorsPage() {
   const filtered = q
     ? creditorsCache.filter((c) => c.supplier_name.toLowerCase().includes(q))
     : creditorsCache;
-  const openCount = creditorsCache.filter((c) => c.balance > 0.01).length;
-  document.getElementById("creditors-total-balance").textContent = fmt(data.total_balance || 0);
+  const openCount = creditorsCache.filter(creditorOpen).length;
+  const totalEl = document.getElementById("creditors-total-balance");
+  if (totalEl) totalEl.innerHTML = formatSideBags(data.by_currency || [], "balance");
   document.getElementById("creditors-open-count").textContent = openCount;
   document.getElementById("creditors-tbody").innerHTML = filtered.map((c) => `
     <tr>
       <td><strong>${esc(c.supplier_name)}</strong></td>
-      <td>${fmt(c.accrued_due)}</td>
-      <td>${fmt(c.paid)}</td>
-      <td class="${c.balance > 0 ? "stock-low" : ""}"><strong>${fmt(c.balance)}</strong></td>
+      <td class="value-multi">${creditorBagsHtml(c, "accrued_due")}</td>
+      <td class="value-multi">${creditorBagsHtml(c, "paid")}</td>
+      <td class="value-multi ${creditorOpen(c) ? "stock-low" : ""}"><strong>${creditorBagsHtml(c, "balance")}</strong></td>
       <td>${c.sales_count || 0}</td>
       <td>
         <button class="btn btn-ghost btn-sm" onclick="openCreditorSalesModal(${JSON.stringify(c.supplier_name)})">Продажи</button>
-        ${c.balance > 0 ? `<button class="btn btn-primary btn-sm" onclick="openCreditorPayModal(${JSON.stringify(c.supplier_name)})">Выплатить</button>` : ""}
+        ${creditorOpen(c) ? `<button class="btn btn-primary btn-sm" onclick="openCreditorPayModal(${JSON.stringify(c.supplier_name)})">Выплатить</button>` : ""}
       </td>
     </tr>`).join("") || '<tr><td colspan="6" style="text-align:center;color:var(--muted)">Нет поставщиков</td></tr>';
   document.getElementById("creditors-payments-list").innerHTML = (data.recent_payments || []).slice(0, 15).map((p) => `
-    <div class="pay-row"><span>${esc(p.supplier_name)} · ${p.created_at?.slice(0, 10) || ""}</span><strong>−${fmt(p.amount)}</strong></div>
+    <div class="pay-row"><span>${esc(p.supplier_name)} · ${p.created_at?.slice(0, 10) || ""}</span><strong>−${moneyLine(p.amount, p.currency_code)}</strong></div>
   `).join("") || '<p style="color:var(--muted);font-size:.8rem">Нет выплат</p>';
 }
 
 window.openCreditorPayModal = (name) => {
-  payCreditorTarget = creditorsCache.find((c) => c.supplier_name === name) || { supplier_name: name, balance: 0 };
+  payCreditorTarget = creditorsCache.find((c) => c.supplier_name === name) || { supplier_name: name, by_currency: [] };
   document.getElementById("creditor-pay-meta").innerHTML = `
-    <div class="metric-row"><span>${esc(payCreditorTarget.supplier_name)}</span><strong>Долг ${fmt(payCreditorTarget.balance || 0)}</strong></div>`;
-  document.getElementById("creditor-pay-amount").value = Math.max(0, payCreditorTarget.balance || 0);
+    <div class="metric-row"><span>${esc(payCreditorTarget.supplier_name)}</span><strong class="value-multi">Долг ${creditorBagsHtml(payCreditorTarget, "balance")}</strong></div>`;
+  document.getElementById("creditor-pay-amount").value = Math.max(0, creditorDefaultPayAmount(payCreditorTarget));
   document.getElementById("creditor-pay-notes").value = "";
   fillPaySelect(document.getElementById("creditor-pay-method"));
   document.getElementById("creditor-pay-modal").showModal();
@@ -5326,8 +6320,8 @@ window.openCreditorSalesModal = async (name) => {
       <td>#${r.sale_id}</td>
       <td>${esc(r.product_name)}</td>
       <td>${esc(r.warehouse_name || "—")}</td>
-      <td>${fmt(r.subtotal)}</td>
-      <td><strong>${fmt(r.supplier_due)}</strong></td>
+      <td>${moneyLine(r.subtotal, r.currency_code)}</td>
+      <td><strong>${moneyLine(r.supplier_due, r.currency_code)}</strong></td>
       <td><button class="btn btn-ghost btn-sm" onclick="document.getElementById('creditor-sales-modal').close();showSale(${r.sale_id})">Детали</button></td>
     </tr>`).join("") || '<tr><td colspan="7" style="text-align:center;color:var(--muted)">Нет продаж</td></tr>';
   document.getElementById("creditor-sales-modal").showModal();
@@ -5361,16 +6355,28 @@ async function loadAnalytics() {
     <div class="kpi accent-blue"><div class="label">Выручка</div><div class="value">${finFmt(finBlock(summary), "gross_revenue")}</div><div class="sub">${summary.sales_count} продаж</div></div>
     <div class="kpi accent-green"><div class="label">Прибыль</div><div class="value">${finFmt(finBlock(summary), "shop_profit")}</div><div class="sub">маржа ${summary.margin_pct}%</div></div>
     <div class="kpi accent-warn"><div class="label">Расходы</div><div class="value">${fmtCurrency(summary.expenses || 0, currency_meta("TJS"))}</div><div class="sub">${(summary.expenses_by_category || []).length} категорий</div></div>
-    ${analyticsScope !== "own" ? `<div class="kpi accent-cons"><div class="label">Поставщикам</div><div class="value">${summary.multi_currency ? "—" : fmt(summary.supplier_due)}</div></div>` : ""}
-    ${analyticsScope !== "consignment" ? `<div class="kpi"><div class="label">Себестоимость</div><div class="value">${finFmt(finBlock(summary), "own_cogs")}</div></div>` : ""}
-    <div class="kpi"><div class="label">На складе</div><div class="value">${summary.products_count}</div><div class="sub">${(summary.stock_by_currency || []).map((s) => fmtCurrency(s.value, s)).join(" · ") || fmt(summary.stock_value)} закупка</div></div>
+    ${analyticsScope !== "own" ? `<div class="kpi accent-cons"><div class="label">Поставщикам</div><div class="value value-multi">${finFmt(finBlock(summary), "supplier_due")}</div></div>` : ""}
+    ${analyticsScope !== "consignment" ? `<div class="kpi"><div class="label">Себестоимость</div><div class="value value-multi">${finFmt(finBlock(summary), "own_cogs")}</div></div>` : ""}
+    <div class="kpi"><div class="label">На складе</div><div class="value">${summary.products_count}</div><div class="sub">${(summary.stock_by_currency || []).map((s) => fmtCurrency(s.value, s)).join(" · ") || "—"} закупка</div></div>
     <div class="kpi accent-warn"><div class="label">Мало остатков</div><div class="value">${summary.low_stock_count}</div></div>
   `;
 
-  const maxR = Math.max(...daily.map((d) => d.revenue), 1);
-  document.getElementById("daily-chart").innerHTML = daily.map((d) => {
-    const h = Math.round((d.revenue / maxR) * 150);
-    return `<div class="bar-col" title="${d.day}: ${fmt(d.revenue)}"><div class="bar" style="height:${h}px"></div><span class="bl">${d.day.slice(5)}</span></div>`;
+  // Aggregate daily by day for bar height (separate currencies in tooltip)
+  const byDay = {};
+  for (const d of daily) {
+    const day = d.day;
+    byDay[day] ||= { day, sales: 0, bags: {} };
+    byDay[day].sales += +d.sales || 0;
+    const code = (d.currency_code || "TJS").toUpperCase();
+    byDay[day].bags[code] = (byDay[day].bags[code] || 0) + (+d.revenue || 0);
+  }
+  const dayRows = Object.values(byDay);
+  const maxR = Math.max(...dayRows.map((d) => Object.values(d.bags).reduce((a, b) => a + b, 0)), 1);
+  document.getElementById("daily-chart").innerHTML = dayRows.map((d) => {
+    const sum = Object.values(d.bags).reduce((a, b) => a + b, 0);
+    const h = Math.round((sum / maxR) * 150);
+    const tip = Object.entries(d.bags).map(([c, v]) => `${c}: ${moneyLine(v, c)}`).join(" · ");
+    return `<div class="bar-col" title="${d.day}: ${tip}"><div class="bar" style="height:${h}px"></div><span class="bl">${d.day.slice(5)}</span></div>`;
   }).join("") || '<div class="empty-state">Нет данных за выбранный период</div>';
 
   document.getElementById("top-products").innerHTML = top.length
@@ -5382,46 +6388,173 @@ async function loadAnalytics() {
       api(`/api/analytics/summary?period=${period}&scope=own`),
       api(`/api/analytics/summary?period=${period}&scope=consignment`),
     ]);
-    const total = ownS.revenue + consS.revenue || 1;
     document.getElementById("scope-split").innerHTML = `
-      <div class="split-row"><span class="tag tag-own">Свои</span> ${finFmt(finBlock(ownS), "gross_revenue")} (${pct(ownS.revenue, total)}%)</div>
-      <div class="split-bar"><div class="split-bar-fill"><div style="width:${pct(ownS.revenue, total)}%;background:var(--own)"></div></div></div>
-      <div class="split-row"><span class="tag tag-cons">Реализация</span> ${fmt(consS.revenue)} (${pct(consS.revenue, total)}%)</div>
-      <div class="split-bar"><div class="split-bar-fill"><div style="width:${pct(consS.revenue, total)}%;background:var(--consignment)"></div></div></div>
+      <div class="split-row"><span class="tag tag-own">Свои</span> <span class="value-multi">${finFmt(finBlock(ownS), "gross_revenue")}</span></div>
+      <div class="split-row"><span class="tag tag-cons">Реализация</span> <span class="value-multi">${finFmt(finBlock(consS), "gross_revenue")}</span></div>
       <div class="split-metrics">
-        <div class="metric-row"><span>Прибыль (свои)</span><strong>${fmt(ownS.profit)}</strong></div>
-        <div class="metric-row"><span>Комиссия (реализация)</span><strong>${fmt(consS.profit)}</strong></div>
+        <div class="metric-row"><span>Прибыль (свои)</span><strong class="value-multi">${finFmt(finBlock(ownS), "shop_profit")}</strong></div>
+        <div class="metric-row"><span>Комиссия (реализация)</span><strong class="value-multi">${finFmt(finBlock(consS), "shop_profit")}</strong></div>
       </div>`;
   } else {
     document.getElementById("scope-split").innerHTML = `<p class="scope-split-filter">Фильтр: ${scopeLabel(analyticsScope)}</p>
-      <div class="metric-row"><span>Прибыль</span><strong>${fmt(summary.profit)}</strong></div>`;
+      <div class="metric-row"><span>Прибыль</span><strong class="value-multi">${finFmt(finBlock(summary), "shop_profit")}</strong></div>`;
   }
 }
 
 /* ── Stocktake ── */
 let stocktakeData = null;
 
+function hideStScanResults() {
+  document.getElementById("st-scan-results")?.classList.add("hidden");
+}
+
+function stMatchText(hay, q, digits) {
+  const t = String(hay || "").toLowerCase();
+  if (!q) return true;
+  if (t.includes(q)) return true;
+  if (digits.length >= 3) {
+    const td = t.replace(/\D/g, "");
+    if (td.includes(digits)) return true;
+  }
+  return false;
+}
+
+function stScannedUnitIds() {
+  return new Set((stocktakeData?.lines || []).filter((l) => l.unit_id).map((l) => l.unit_id));
+}
+
+function stCountedByProduct() {
+  const map = {};
+  for (const l of stocktakeData?.lines || []) {
+    if (l.unit_id) continue;
+    map[l.product_id] = (map[l.product_id] || 0) + (+l.quantity || 0);
+  }
+  return map;
+}
+
+function stSuggestItems(qRaw) {
+  const q = (qRaw || "").trim().toLowerCase();
+  const digits = q.replace(/\D/g, "");
+  if (!q || !stocktakeData?.session) return [];
+  const scanned = stScannedUnitIds();
+  const counted = stCountedByProduct();
+  const items = [];
+  for (const u of stocktakeData.expected?.units || []) {
+    if (scanned.has(u.id)) continue;
+    const blob = [u.product_name, u.model, u.color, u.imei, u.serial, u.barcode].join(" ");
+    if (!stMatchText(blob, q, digits)) continue;
+    items.push({
+      kind: "unit",
+      unit_id: u.id,
+      label: u.product_name || "Устройство",
+      meta: [u.imei || u.serial || `#${u.id}`, u.color, u.serial && u.imei ? u.serial : ""].filter(Boolean).join(" · "),
+    });
+  }
+  for (const p of stocktakeData.expected?.products || []) {
+    if (+p.track_units) continue;
+    const left = (+p.qty || 0) - (counted[p.id] || 0);
+    if (left <= 0) continue;
+    const blob = [p.name, p.model, p.color, p.barcode].join(" ");
+    if (!stMatchText(blob, q, digits)) continue;
+    items.push({
+      kind: "product",
+      product_id: p.id,
+      label: p.name,
+      meta: [p.color, p.barcode, `осталось ${left}`].filter(Boolean).join(" · "),
+    });
+  }
+  return items.slice(0, 12);
+}
+
+function renderStScanResults(q) {
+  const box = document.getElementById("st-scan-results");
+  if (!box) return;
+  const items = stSuggestItems(q);
+  if (!(q || "").trim()) {
+    box.classList.add("hidden");
+    return;
+  }
+  if (!items.length) {
+    box.innerHTML = `<div class="pos-search-empty">Ничего не найдено среди ожидаемых</div>`;
+    box.classList.remove("hidden");
+    return;
+  }
+  box.innerHTML = items.map((it, idx) => `
+    <button type="button" class="pos-search-item" data-idx="${idx}">
+      <span class="psi-name">${esc(it.label)}</span>
+      <span class="psi-meta">${esc(it.meta)}</span>
+    </button>`).join("");
+  box.querySelectorAll(".pos-search-item").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const it = items[+btn.dataset.idx];
+      if (!it) return;
+      hideStScanResults();
+      if (it.kind === "unit") stSubmitScan({ unit_id: it.unit_id });
+      else stSubmitScan({ product_id: it.product_id });
+    });
+  });
+  box.classList.remove("hidden");
+}
+
+async function stSubmitScan(payload) {
+  if (!stocktakeData?.session) return;
+  const input = document.getElementById("st-scan-input");
+  try {
+    stocktakeData = await api(`/api/stocktake/${stocktakeData.session.id}/scan`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    if (input) {
+      input.value = "";
+      input.focus();
+    }
+    hideStScanResults();
+    scanBeep(true);
+    const last = stocktakeData.lines[0];
+    document.getElementById("st-last-scan").textContent = last
+      ? `+ ${last.product_name}${last.imei ? ` · ${last.imei}` : ""}${last.serial ? ` · ${last.serial}` : ""}`
+      : "";
+    renderStocktakeSessionPanel();
+    renderStocktake();
+    toast("Добавлено");
+  } catch (err) {
+    scanBeep(false);
+    toast(err.message, "error");
+  }
+}
+
 function bindStocktake() {
   document.getElementById("st-scan-form")?.addEventListener("submit", async (e) => {
     e.preventDefault();
     const input = document.getElementById("st-scan-input");
-    const q = input.value.trim();
+    const q = input?.value.trim();
     if (!q || !stocktakeData?.session) return;
-    try {
-      stocktakeData = await api(`/api/stocktake/${stocktakeData.session.id}/scan`, {
-        method: "POST",
-        body: JSON.stringify({ q }),
-      });
-      input.value = "";
-      input.focus();
-      scanBeep(true);
-      const last = stocktakeData.lines[0];
-      document.getElementById("st-last-scan").textContent = last
-        ? `+ ${last.product_name}${last.imei ? ` · ${last.imei}` : ""}${last.serial ? ` · ${last.serial}` : ""}`
-        : "";
-      renderStocktake();
-      toast("Добавлено");
-    } catch (err) { scanBeep(false); toast(err.message, "error"); }
+    const suggestions = stSuggestItems(q);
+    if (suggestions.length === 1) {
+      const it = suggestions[0];
+      if (it.kind === "unit") return stSubmitScan({ unit_id: it.unit_id });
+      return stSubmitScan({ product_id: it.product_id });
+    }
+    if (suggestions.length > 1) {
+      renderStScanResults(q);
+      toast("Выберите вариант из списка", "error");
+      return;
+    }
+    await stSubmitScan({ q });
+  });
+  document.getElementById("st-scan-input")?.addEventListener("input", debounce((e) => {
+    renderStScanResults(e.target.value);
+  }, 120));
+  document.getElementById("st-scan-input")?.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") hideStScanResults();
+    if (e.key === "ArrowDown") {
+      const first = document.querySelector("#st-scan-results .pos-search-item");
+      if (first) { e.preventDefault(); first.focus(); }
+    }
+  });
+  document.addEventListener("click", (e) => {
+    const wrap = document.querySelector(".st-scan-wrap");
+    if (wrap && !wrap.contains(e.target)) hideStScanResults();
   });
 }
 
@@ -5477,7 +6610,7 @@ function renderStocktakeSessionPanel() {
       <div class="metric-row"><span>Начата</span><strong>${s.started_at}</strong></div>
       <div class="metric-row"><span>Отсканировано</span><strong>${stocktakeData.counted_total} / ${stocktakeData.expected_total}</strong></div>
       <button type="button" class="btn btn-primary" style="margin-top:.75rem" id="st-complete-btn">Завершить и применить</button>
-      <p class="hint" style="margin-top:.5rem">Для аксессуаров расхождения скорректируют остаток. Телефоны — отчёт по IMEI.</p>`;
+      <p class="hint" style="margin-top:.5rem">Каждый телефон — отдельный IMEI. Аксессуары корректируют остаток при завершении.</p>`;
     document.getElementById("st-complete-btn").onclick = completeStocktake;
     return;
   }
@@ -5525,47 +6658,62 @@ function renderStocktake() {
   if (!expTb) return;
   if (!stocktakeData?.session) {
     expTb.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--muted)">Начните инвентаризацию</td></tr>';
-    linesTb.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--muted)">—</td></tr>';
+    if (linesTb) linesTb.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--muted)">—</td></tr>';
     if (varBody) varBody.innerHTML = "";
     return;
   }
-  const unitsByProduct = {};
-  (stocktakeData.expected?.units || []).forEach((u) => {
-    unitsByProduct[u.product_id] = unitsByProduct[u.product_id] || [];
-    unitsByProduct[u.product_id].push(u);
-  });
-  const scannedIds = new Set((stocktakeData.lines || []).filter((l) => l.unit_id).map((l) => l.unit_id));
-  expTb.innerHTML = (stocktakeData.expected?.products || []).map((p) => {
-    const units = unitsByProduct[p.id] || [];
-    const devs = units.length
-      ? units.map((u) => {
-          const ok = scannedIds.has(u.id);
-          return `<span class="unit-chip ${ok ? "unit-ok" : "unit-miss"}">${esc(u.imei || u.serial || "#" + u.id)}</span>`;
-        }).join("")
-      : `<button type="button" class="btn btn-ghost btn-sm" onclick="stCountProduct(${p.id})">+1</button>`;
-    return `<tr>
+  const scanned = stScannedUnitIds();
+  const counted = stCountedByProduct();
+  const rows = [];
+  // Phones: one row per IMEI still expected
+  for (const u of stocktakeData.expected?.units || []) {
+    if (scanned.has(u.id)) continue;
+    const code = u.imei || u.serial || `#${u.id}`;
+    rows.push(`<tr>
+      <td>${esc(u.product_name)}</td>
+      <td>${dash(u.color)}</td>
+      <td><strong>${esc(code)}</strong>${u.serial && u.imei ? ` <span class="muted">/ ${esc(u.serial)}</span>` : ""}</td>
+      <td><button type="button" class="btn btn-ghost btn-sm" onclick="stScanUnit(${u.id})">✓</button></td>
+    </tr>`);
+  }
+  // Accessories: remaining qty only
+  for (const p of stocktakeData.expected?.products || []) {
+    if (+p.track_units) continue;
+    const left = (+p.qty || 0) - (counted[p.id] || 0);
+    if (left <= 0) continue;
+    rows.push(`<tr>
       <td>${esc(p.name)}</td>
       <td>${dash(p.color)}</td>
-      <td><strong>${p.qty}</strong></td>
-      <td><div class="units-list">${devs}</div></td>
-    </tr>`;
-  }).join("") || '<tr><td colspan="4">Пусто</td></tr>';
-  linesTb.innerHTML = (stocktakeData.lines || []).map((l) => `
-    <tr>
-      <td>${esc(l.product_name)}</td>
-      <td>${dash(l.imei)}${l.serial ? ` / ${esc(l.serial)}` : ""}</td>
-      <td>${dash(l.color)}</td>
-      <td><button type="button" class="btn btn-ghost btn-sm" onclick="stUndoLine(${l.id})">✕</button></td>
-    </tr>`).join("") || '<tr><td colspan="4" style="color:var(--muted)">Пока ничего</td></tr>';
+      <td>осталось <strong>${left}</strong>${p.barcode ? ` · ${esc(p.barcode)}` : ""}</td>
+      <td><button type="button" class="btn btn-ghost btn-sm" onclick="stCountProduct(${p.id})">+1</button></td>
+    </tr>`);
+  }
+  expTb.innerHTML = rows.join("") || '<tr><td colspan="4" style="text-align:center;color:var(--success)">Всё отсканировано</td></tr>';
+
+  if (linesTb) {
+    linesTb.innerHTML = (stocktakeData.lines || []).map((l) => `
+      <tr>
+        <td>${esc(l.product_name)}</td>
+        <td>${l.unit_id ? dash(l.imei || l.serial) : "×1"}</td>
+        <td>${dash(l.color)}</td>
+        <td><button type="button" class="btn btn-ghost btn-sm" onclick="stUndoLine(${l.id})">✕</button></td>
+      </tr>`).join("") || '<tr><td colspan="4" style="color:var(--muted)">Пока ничего</td></tr>';
+  }
   const vars = stocktakeData.variances || [];
   const missing = stocktakeData.missing_units || [];
   if (varBody) {
     varBody.innerHTML = vars.length || missing.length
       ? `${vars.map((v) => `<div class="metric-row"><span>${esc(v.product_name)}${v.color ? ` (${esc(v.color)})` : ""}</span><strong>${v.counted} / ${v.expected} (${v.difference >= 0 ? "+" : ""}${v.difference})</strong></div>`).join("")}
-         ${missing.length ? `<p class="hint" style="margin-top:.75rem">Не отсканировано IMEI: ${missing.length}</p><div class="units-list">${missing.slice(0, 30).map((u) => `<span class="unit-chip unit-miss">${esc(u.imei || u.serial)}</span>`).join("")}${missing.length > 30 ? "…" : ""}</div>` : ""}`
+         ${missing.length ? `<p class="hint" style="margin-top:.75rem">Не отсканировано IMEI: ${missing.length}</p>
+           <div class="table-wrap"><table class="data-table"><thead><tr><th>Товар</th><th>Цвет</th><th>IMEI</th></tr></thead><tbody>
+           ${missing.slice(0, 50).map((u) => `<tr><td>${esc(u.product_name)}</td><td>${dash(u.color)}</td><td>${esc(u.imei || u.serial || "#" + u.id)}</td></tr>`).join("")}
+           </tbody></table></div>${missing.length > 50 ? "<p class=\"hint\">…</p>" : ""}`
+           : ""}`
       : '<p style="color:var(--success)">Расхождений нет</p>';
   }
 }
+
+window.stScanUnit = (unitId) => stSubmitScan({ unit_id: unitId });
 
 window.stCountProduct = async (productId) => {
   if (!stocktakeData?.session) return;
@@ -5573,6 +6721,7 @@ window.stCountProduct = async (productId) => {
     stocktakeData = await api(`/api/stocktake/${stocktakeData.session.id}/count`, {
       method: "POST", body: JSON.stringify({ product_id: productId, quantity: 1 }),
     });
+    renderStocktakeSessionPanel();
     renderStocktake();
     toast("+1");
   } catch (e) { toast(e.message, "error"); }
@@ -5582,6 +6731,7 @@ window.stUndoLine = async (lineId) => {
   if (!stocktakeData?.session) return;
   try {
     stocktakeData = await api(`/api/stocktake/${stocktakeData.session.id}/lines/${lineId}`, { method: "DELETE" });
+    renderStocktakeSessionPanel();
     renderStocktake();
   } catch (e) { toast(e.message, "error"); }
 };
