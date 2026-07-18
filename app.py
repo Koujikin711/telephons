@@ -350,6 +350,7 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     _add_column(conn, "sales", "user_name", "TEXT DEFAULT ''")
     _add_column(conn, "shifts", "expected_payments_json", "TEXT DEFAULT ''")
     _add_column(conn, "shifts", "actual_payments_json", "TEXT DEFAULT ''")
+    _add_column(conn, "shifts", "opening_wallets_json", "TEXT DEFAULT ''")
     if _table_exists(conn, "shifts"):
         conn.execute(
             """
@@ -5363,8 +5364,15 @@ class UserUpdate(BaseModel):
     is_active: int | None = Field(default=None, ge=0, le=1)
 
 
+class ShiftOpeningWallet(BaseModel):
+    method_code: str = Field(min_length=1)
+    currency_code: str = Field(default="TJS", min_length=3, max_length=3)
+    amount: float = Field(ge=0, default=0)
+
+
 class ShiftOpenIn(BaseModel):
     opening_cash: float = Field(ge=0, default=0)
+    opening_wallets: list[ShiftOpeningWallet] = Field(default_factory=list)
 
 
 class ShiftPaymentActual(BaseModel):
@@ -5538,7 +5546,7 @@ async def web_manifest():
 async def health():
     return {
         "status": "ok",
-        "build": "cash-till-currency-v1",
+        "build": "shift-open-wallets-v1",
         "db": str(DB_PATH),
         "db_exists": DB_PATH.exists(),
     }
@@ -6532,15 +6540,65 @@ async def open_shift(body: ShiftOpenIn, x_pin: str | None = Header(default=None,
     with db() as conn:
         if get_open_shift(conn):
             raise HTTPException(status_code=400, detail="Смена уже открыта")
+        wallets: list[dict[str, Any]] = []
+        opening_cash = float(body.opening_cash or 0)
+        for w in body.opening_wallets:
+            code = (w.method_code or "").strip()
+            cur = (w.currency_code or "TJS").strip().upper() or "TJS"
+            amt = round(float(w.amount or 0), 2)
+            if not code or amt < 0:
+                continue
+            pm = get_payment_method(conn, code)
+            if not pm:
+                raise HTTPException(status_code=400, detail=f"Кошелёк «{code}» не найден")
+            wallets.append({
+                "method_code": code,
+                "method_name": pm["name"],
+                "method_type": pm["method_type"],
+                "currency_code": cur,
+                "amount": amt,
+            })
+        if wallets:
+            # Нал смн — для совместимости со старым closing_cash
+            opening_cash = round(
+                sum(
+                    float(x["amount"])
+                    for x in wallets
+                    if (x.get("method_type") or "") == "cash"
+                    and (x.get("currency_code") or "") == "TJS"
+                ),
+                2,
+            )
+        elif opening_cash > 0:
+            cash_code = cash_wallet_code_for_currency(conn, "TJS") or "cash"
+            pm = get_payment_method(conn, cash_code)
+            wallets = [{
+                "method_code": cash_code,
+                "method_name": pm["name"] if pm else "Наличные",
+                "method_type": "cash",
+                "currency_code": "TJS",
+                "amount": opening_cash,
+            }]
         cur = conn.execute(
             """
-            INSERT INTO shifts (user_id, user_name, opened_at, opening_cash, status)
-            VALUES (?, ?, ?, ?, 'open')
+            INSERT INTO shifts (user_id, user_name, opened_at, opening_cash, status, opening_wallets_json)
+            VALUES (?, ?, ?, ?, 'open', ?)
             """,
-            (user.get("id") or None, user.get("name", ""), utc_now(), body.opening_cash),
+            (
+                user.get("id") or None,
+                user.get("name", ""),
+                utc_now(),
+                opening_cash,
+                json.dumps(wallets, ensure_ascii=False),
+            ),
         )
         row = conn.execute("SELECT * FROM shifts WHERE id = ?", (cur.lastrowid,)).fetchone()
-    return row_to_dict(row)
+    data = row_to_dict(row) or {}
+    try:
+        data["opening_wallets"] = json.loads(data.get("opening_wallets_json") or "[]")
+    except json.JSONDecodeError:
+        data["opening_wallets"] = []
+    return data
 
 
 @app.post("/api/shifts/{shift_id}/close")
