@@ -1284,43 +1284,16 @@ function bindPos() {
     });
   });
   document.getElementById("shift-open-form")?.addEventListener("submit", submitShiftOpen);
-  document.getElementById("pos-shift-close")?.addEventListener("click", async () => {
-    try {
-      const cur = await api("/api/shifts/current");
-      if (!cur.shift?.id) { toast("Нет открытой смены", "error"); return; }
-      const sum = cur.summary || {};
-      const box = document.getElementById("shift-close-summary");
-      if (box) {
-        box.textContent = `Продаж: ${sum.sales_count || 0} · ожидалось наличных: ${fmt(sum.expected_cash || 0)}`;
-      }
-      document.getElementById("shift-close-cash").value = String(sum.expected_cash || 0);
-      document.getElementById("shift-close-notes").value = "";
-      document.getElementById("shift-close-form").dataset.shiftId = String(cur.shift.id);
-      document.getElementById("shift-close-modal")?.showModal();
-    } catch (err) { toast(err.message, "error"); }
-  });
+  document.getElementById("pos-shift-close")?.addEventListener("click", openShiftCloseModal);
   document.getElementById("shift-close-cancel")?.addEventListener("click", () => {
     document.getElementById("shift-close-modal")?.close();
   });
-  document.getElementById("shift-close-form")?.addEventListener("submit", async (e) => {
-    e.preventDefault();
-    const id = +document.getElementById("shift-close-form").dataset.shiftId;
-    if (!id) return;
-    try {
-      const r = await api(`/api/shifts/${id}/close`, {
-        method: "POST",
-        body: JSON.stringify({
-          actual_cash: Math.max(0, +document.getElementById("shift-close-cash").value || 0),
-          actual_card: 0,
-          notes: document.getElementById("shift-close-notes").value.trim(),
-        }),
-      });
-      document.getElementById("shift-close-modal")?.close();
-      const diff = r.cash_difference != null ? ` · разница ${fmt(r.cash_difference)}` : "";
-      toast(`Смена закрыта${diff}`);
-      loadPosCashRegister();
-    } catch (err) { toast(err.message, "error"); }
+  document.getElementById("shift-close-fill-expected")?.addEventListener("click", () => {
+    document.querySelectorAll("#shift-close-wallets input[data-close-amt]").forEach((inp) => {
+      inp.value = String(Math.max(0, +inp.dataset.expected || 0));
+    });
   });
+  document.getElementById("shift-close-form")?.addEventListener("submit", submitShiftClose);
   document.getElementById("unit-extra-cancel")?.addEventListener("click", () => {
     document.getElementById("unit-extra-modal")?.close();
   });
@@ -1608,6 +1581,132 @@ async function submitShiftOpen(e) {
     });
     document.getElementById("shift-open-modal")?.close();
     toast(opening_wallets.length ? "Смена открыта со стартовыми суммами" : "Смена открыта");
+    loadPosCashRegister();
+  } catch (err) {
+    toast(err.message, "error");
+  }
+}
+
+function renderShiftWalletRows(containerId, rows, { inputAttr = "data-open-amt", showExpected = false } = {}) {
+  const box = document.getElementById(containerId);
+  if (!box) return;
+  const byMethod = new Map();
+  for (const r of rows || []) {
+    const code = r.method_code || r.code;
+    if (!byMethod.has(code)) {
+      byMethod.set(code, {
+        code,
+        name: r.method_name || r.name || code,
+        method_type: r.method_type || "",
+        currencies: [],
+      });
+    }
+    byMethod.get(code).currencies.push(r);
+  }
+  const list = [...byMethod.values()];
+  box.innerHTML = list.map((m) => {
+    const typeHint = (m.method_type || "") === "cash" ? "наличные" : "безнал";
+    const fields = m.currencies.map((c) => {
+      const cur = (c.currency_code || c.code || "TJS").toUpperCase();
+      const label = cur === "USD" ? "$" : "смн";
+      const expected = Math.max(0, +(c.expected ?? c.amount ?? c.net ?? 0) || 0);
+      const prefill = showExpected ? expected : Math.max(0, +(c.amount ?? c.net ?? expected) || 0);
+      const hint = showExpected
+        ? `<small class="hint">ожид. ${fmtCurrency(expected, currency_meta(cur))}</small>`
+        : "";
+      return `<label class="shift-open-amt">
+        <span>${label}</span>
+        <input type="number" class="input" min="0" step="0.01" value="${prefill}"
+          ${inputAttr} data-method="${esc(m.code)}" data-currency="${cur}" data-expected="${expected}">
+        ${hint}
+      </label>`;
+    }).join("");
+    return `<div class="shift-open-row" data-method="${esc(m.code)}">
+      <div class="shift-open-name">
+        <strong>${esc(m.name)}</strong>
+        <small class="hint">${esc(typeHint)}</small>
+      </div>
+      <div class="shift-open-fields">${fields}</div>
+    </div>`;
+  }).join("") || '<p class="muted">Нет кошельков</p>';
+}
+
+async function openShiftCloseModal() {
+  const modal = document.getElementById("shift-close-modal");
+  const box = document.getElementById("shift-close-wallets");
+  if (!modal || !box) return;
+  box.innerHTML = '<p class="muted">Загрузка…</p>';
+  modal.showModal();
+  try {
+    const cur = await api("/api/shifts/current");
+    if (!cur.shift?.id) {
+      modal.close();
+      toast("Нет открытой смены", "error");
+      return;
+    }
+    const sum = cur.summary || {};
+    const summary = document.getElementById("shift-close-summary");
+    if (summary) {
+      summary.textContent = `Продаж: ${sum.sales_count || 0} · выручка смены: ${fmt(sum.total_revenue || 0)}`;
+    }
+    document.getElementById("shift-close-notes").value = "";
+    document.getElementById("shift-close-form").dataset.shiftId = String(cur.shift.id);
+    let rows = cur.expected_wallets || [];
+    if (!rows.length) {
+      // fallback: active methods with zeros
+      rows = (storeConfig.payment_methods || []).flatMap((m) => {
+        const bound = (m.currency_code || "").toUpperCase();
+        const curs = bound === "USD" || bound === "TJS" ? [bound] : ["TJS", "USD"];
+        return curs.map((currency_code) => ({
+          method_code: m.code,
+          method_name: m.name,
+          method_type: m.method_type,
+          currency_code,
+          expected: 0,
+        }));
+      });
+    }
+    renderShiftWalletRows("shift-close-wallets", rows, {
+      inputAttr: "data-close-amt",
+      showExpected: true,
+    });
+  } catch (err) {
+    box.innerHTML = `<p class="muted">${esc(err.message)}</p>`;
+  }
+}
+
+async function submitShiftClose(e) {
+  e.preventDefault();
+  const id = +document.getElementById("shift-close-form")?.dataset.shiftId;
+  if (!id) return;
+  const actual_wallets = [];
+  document.querySelectorAll("#shift-close-wallets input[data-close-amt]").forEach((inp) => {
+    actual_wallets.push({
+      method_code: inp.dataset.method,
+      currency_code: inp.dataset.currency || "TJS",
+      amount: Math.max(0, +inp.value || 0),
+    });
+  });
+  try {
+    const r = await api(`/api/shifts/${id}/close`, {
+      method: "POST",
+      body: JSON.stringify({
+        actual_wallets,
+        actual_cash: 0,
+        actual_card: 0,
+        notes: document.getElementById("shift-close-notes").value.trim(),
+      }),
+    });
+    document.getElementById("shift-close-modal")?.close();
+    const diffs = (r.wallet_differences || []).filter((d) => Math.abs(+d.difference || 0) >= 0.01);
+    if (diffs.length) {
+      const tip = diffs.slice(0, 3).map((d) =>
+        `${d.method_name || d.method_code} ${d.currency_code}: ${fmtCurrency(+d.difference, currency_meta(d.currency_code))}`
+      ).join(" · ");
+      toast(`Смена закрыта · расхождения: ${tip}${diffs.length > 3 ? "…" : ""}`, "info");
+    } else {
+      toast("Смена закрыта");
+    }
     loadPosCashRegister();
   } catch (err) {
     toast(err.message, "error");

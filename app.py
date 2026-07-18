@@ -5378,12 +5378,14 @@ class ShiftOpenIn(BaseModel):
 class ShiftPaymentActual(BaseModel):
     method_code: str
     amount: float = Field(ge=0)
+    currency_code: str = Field(default="TJS", min_length=3, max_length=3)
 
 
 class ShiftCloseIn(BaseModel):
-    actual_cash: float = Field(ge=0)
+    actual_cash: float = Field(ge=0, default=0)
     actual_card: float = Field(ge=0, default=0)
     actual_payments: list[ShiftPaymentActual] = Field(default_factory=list)
+    actual_wallets: list[ShiftOpeningWallet] = Field(default_factory=list)
     notes: str = ""
 
 
@@ -5546,7 +5548,7 @@ async def web_manifest():
 async def health():
     return {
         "status": "ok",
-        "build": "shift-open-wallets-v1",
+        "build": "shift-close-wallets-v1",
         "db": str(DB_PATH),
         "db_exists": DB_PATH.exists(),
     }
@@ -6523,15 +6525,103 @@ async def update_user(user_id: int, body: UserUpdate, x_pin: str | None = Header
 # --- Shifts ---
 
 
+def _parse_shift_wallets(raw: str | None) -> list[dict[str, Any]]:
+    try:
+        data = json.loads(raw or "[]")
+    except json.JSONDecodeError:
+        data = []
+    return data if isinstance(data, list) else []
+
+
+def shift_expected_wallets(conn: sqlite3.Connection, shift: sqlite3.Row) -> list[dict[str, Any]]:
+    """Ожидаемые остатки на конец смены: старт + движение за смену по кошелькам/валютам."""
+    opening = _parse_shift_wallets(shift["opening_wallets_json"] if "opening_wallets_json" in shift.keys() else "")
+    bags: dict[tuple[str, str], dict[str, Any]] = {}
+    for w in opening:
+        code = (w.get("method_code") or "").strip()
+        cur = (w.get("currency_code") or "TJS").strip().upper() or "TJS"
+        if not code:
+            continue
+        key = (code, cur)
+        bags[key] = {
+            "method_code": code,
+            "method_name": w.get("method_name") or code,
+            "method_type": w.get("method_type") or "",
+            "currency_code": cur,
+            "opening": float(w.get("amount") or 0),
+            "movement": 0.0,
+            "expected": float(w.get("amount") or 0),
+        }
+    opened_at = (shift["opened_at"] or "")[:19]
+    day = utc_now()[:10]
+    period = _period_cash_by_currency(
+        conn, "all", date_from=opened_at or day, date_to=day,
+    )
+    for bal in period.get("balances") or []:
+        code = bal.get("code") or ""
+        mtype = bal.get("method_type") or ""
+        name = bal.get("name") or code
+        for row in bal.get("by_currency") or []:
+            cur = (row.get("code") or "TJS").strip().upper() or "TJS"
+            net = float(row.get("net") or 0)
+            key = (code, cur)
+            if key not in bags:
+                bags[key] = {
+                    "method_code": code,
+                    "method_name": name,
+                    "method_type": mtype,
+                    "currency_code": cur,
+                    "opening": 0.0,
+                    "movement": 0.0,
+                    "expected": 0.0,
+                }
+            bags[key]["movement"] = round(net, 2)
+            bags[key]["expected"] = round(float(bags[key]["opening"]) + net, 2)
+            if not bags[key].get("method_type"):
+                bags[key]["method_type"] = mtype
+            if not bags[key].get("method_name"):
+                bags[key]["method_name"] = name
+    # Ensure all active methods appear (even zeros)
+    for pm in list_payment_methods(conn, active_only=True):
+        bound = payment_method_currency(pm)
+        currencies = [bound] if bound in ("USD", "TJS") else ["TJS", "USD"]
+        for cur in currencies:
+            key = (pm["code"], cur)
+            if key not in bags:
+                bags[key] = {
+                    "method_code": pm["code"],
+                    "method_name": pm["name"],
+                    "method_type": pm["method_type"],
+                    "currency_code": cur,
+                    "opening": 0.0,
+                    "movement": 0.0,
+                    "expected": 0.0,
+                }
+    order = {m["code"]: i for i, m in enumerate(list_payment_methods(conn, active_only=True))}
+    return sorted(
+        bags.values(),
+        key=lambda x: (order.get(x["method_code"], 999), 0 if x["currency_code"] == "TJS" else 1),
+    )
+
+
 @app.get("/api/shifts/current")
 async def current_shift(x_pin: str | None = Header(default=None, alias="X-Pin")):
     check_pin(x_pin)
     with db() as conn:
         shift = get_open_shift(conn)
         if not shift:
-            return {"shift": None, "summary": None}
+            return {"shift": None, "summary": None, "expected_wallets": [], "opening_wallets": []}
         summary = shift_sales_totals(conn, shift["id"])
-        return {"shift": row_to_dict(shift), "summary": summary}
+        data = row_to_dict(shift) or {}
+        opening = _parse_shift_wallets(data.get("opening_wallets_json"))
+        data["opening_wallets"] = opening
+        expected = shift_expected_wallets(conn, shift)
+        return {
+            "shift": data,
+            "summary": summary,
+            "opening_wallets": opening,
+            "expected_wallets": expected,
+        }
 
 
 @app.post("/api/shifts/open")
@@ -6612,25 +6702,100 @@ async def close_shift(shift_id: int, body: ShiftCloseIn, x_pin: str | None = Hea
             raise HTTPException(status_code=404, detail="Открытая смена не найдена")
         totals = shift_sales_totals(conn, shift_id)
         expected_cash_in_drawer = float(shift["opening_cash"]) + totals["expected_cash"]
-        actual_by_method = {p.method_code: p.amount for p in body.actual_payments}
-        actual_non_cash = sum(
-            actual_by_method.get(p["method_code"], 0.0)
-            for p in totals["by_payment"]
-            if p["method_type"] != "cash"
-        )
-        actual_card = actual_non_cash if body.actual_payments else body.actual_card
-        payment_diffs = []
-        for p in totals["by_payment"]:
-            if p["method_type"] == "cash":
+        expected_wallets = shift_expected_wallets(conn, shift)
+
+        actual_wallets: list[dict[str, Any]] = []
+        for w in body.actual_wallets:
+            code = (w.method_code or "").strip()
+            cur = (w.currency_code or "TJS").strip().upper() or "TJS"
+            amt = round(float(w.amount or 0), 2)
+            if not code:
                 continue
-            actual = actual_by_method.get(p["method_code"], 0.0)
-            payment_diffs.append({
-                "method_code": p["method_code"],
-                "name": p["name"],
-                "expected": p["amount"],
-                "actual": actual,
-                "difference": actual - p["amount"],
+            pm = get_payment_method(conn, code)
+            if not pm:
+                raise HTTPException(status_code=400, detail=f"Кошелёк «{code}» не найден")
+            actual_wallets.append({
+                "method_code": code,
+                "method_name": pm["name"],
+                "method_type": pm["method_type"],
+                "currency_code": cur,
+                "amount": amt,
             })
+        if not actual_wallets and body.actual_payments:
+            for p in body.actual_payments:
+                pm = get_payment_method(conn, p.method_code)
+                actual_wallets.append({
+                    "method_code": p.method_code,
+                    "method_name": pm["name"] if pm else p.method_code,
+                    "method_type": pm["method_type"] if pm else "card",
+                    "currency_code": (p.currency_code or "TJS").upper(),
+                    "amount": float(p.amount or 0),
+                })
+
+        if actual_wallets:
+            actual_cash = round(
+                sum(
+                    float(x["amount"])
+                    for x in actual_wallets
+                    if (x.get("method_type") or "") == "cash"
+                    and (x.get("currency_code") or "") == "TJS"
+                ),
+                2,
+            )
+            actual_card = round(
+                sum(
+                    float(x["amount"])
+                    for x in actual_wallets
+                    if (x.get("method_type") or "") != "cash"
+                ),
+                2,
+            )
+        else:
+            actual_cash = float(body.actual_cash or 0)
+            actual_card = float(body.actual_card or 0)
+            if actual_cash > 0:
+                cash_code = cash_wallet_code_for_currency(conn, "TJS") or "cash"
+                pm = get_payment_method(conn, cash_code)
+                actual_wallets = [{
+                    "method_code": cash_code,
+                    "method_name": pm["name"] if pm else "Наличные",
+                    "method_type": "cash",
+                    "currency_code": "TJS",
+                    "amount": actual_cash,
+                }]
+
+        exp_map = {
+            (e["method_code"], e["currency_code"]): e
+            for e in expected_wallets
+        }
+        wallet_diffs = []
+        for aw in actual_wallets:
+            key = (aw["method_code"], aw["currency_code"])
+            exp = exp_map.get(key) or {}
+            expected_amt = float(exp.get("expected") or 0)
+            wallet_diffs.append({
+                **aw,
+                "expected": expected_amt,
+                "difference": round(float(aw["amount"]) - expected_amt, 2),
+            })
+        # Missing expected wallets with no actual entered
+        seen = {(d["method_code"], d["currency_code"]) for d in wallet_diffs}
+        for exp in expected_wallets:
+            key = (exp["method_code"], exp["currency_code"])
+            if key in seen:
+                continue
+            if abs(float(exp.get("expected") or 0)) < 0.001:
+                continue
+            wallet_diffs.append({
+                "method_code": exp["method_code"],
+                "method_name": exp["method_name"],
+                "method_type": exp["method_type"],
+                "currency_code": exp["currency_code"],
+                "amount": 0.0,
+                "expected": float(exp["expected"]),
+                "difference": round(0.0 - float(exp["expected"]), 2),
+            })
+
         conn.execute(
             """
             UPDATE shifts SET
@@ -6642,20 +6807,26 @@ async def close_shift(shift_id: int, body: ShiftCloseIn, x_pin: str | None = Hea
             WHERE id = ?
             """,
             (
-                utc_now(), totals["expected_cash"], totals["expected_card"],
-                body.actual_cash, actual_card, totals["sales_count"],
+                utc_now(),
+                totals["expected_cash"],
+                totals["expected_card"],
+                actual_cash,
+                actual_card,
+                totals["sales_count"],
                 body.notes,
-                json.dumps(totals["by_payment"], ensure_ascii=False),
-                json.dumps([p.model_dump() for p in body.actual_payments], ensure_ascii=False) if body.actual_payments else "",
+                json.dumps(expected_wallets, ensure_ascii=False),
+                json.dumps(actual_wallets, ensure_ascii=False),
                 shift_id,
             ),
         )
         row = conn.execute("SELECT * FROM shifts WHERE id = ?", (shift_id,)).fetchone()
-    result = row_to_dict(row)
+    result = row_to_dict(row) or {}
     result["expected_cash_in_drawer"] = expected_cash_in_drawer
-    result["cash_difference"] = body.actual_cash - expected_cash_in_drawer
+    result["cash_difference"] = actual_cash - expected_cash_in_drawer
     result["card_difference"] = actual_card - totals["expected_card"]
-    result["payment_differences"] = payment_diffs
+    result["wallet_differences"] = wallet_diffs
+    result["expected_wallets"] = expected_wallets
+    result["actual_wallets"] = actual_wallets
     result["by_payment"] = totals["by_payment"]
     return result
 

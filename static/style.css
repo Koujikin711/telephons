@@ -893,11 +893,16 @@ body {
 }
 .shift-open-amt {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 0.35rem;
   margin: 0;
   font-size: 0.85rem;
   color: var(--muted);
+}
+.shift-open-amt .hint {
+  flex: 1 1 100%;
+  font-size: 0.72rem;
 }
 .shift-open-amt .input {
   width: 7.5rem;

@@ -10,7 +10,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/style.css?v=52">
+  <link rel="stylesheet" href="/static/style.css?v=53">
   <style>
     /* Critical POS layout — survives stale CSS cache */
     .pos-desk { display: flex; flex-direction: column; gap: 1rem; width: 100%; }
@@ -1215,18 +1215,18 @@
     </form>
   </dialog>
 
-  <dialog id="shift-close-modal" class="modal">
+  <dialog id="shift-close-modal" class="modal modal-lg">
     <form id="shift-close-form" method="dialog">
       <h3>Закрыть смену</h3>
       <p id="shift-close-summary" class="hint muted"></p>
-      <label>Факт наличных в кассе
-        <input type="number" id="shift-close-cash" class="input" min="0" step="0.01" required>
-      </label>
+      <p class="hint muted">Укажите факт по кошелькам и валютам. «Ожид.» — старт смены + движение за смену.</p>
+      <div id="shift-close-wallets" class="shift-open-wallets"></div>
       <label>Комментарий
         <input id="shift-close-notes" class="input" placeholder="Необязательно">
       </label>
       <div class="modal-actions">
         <button type="button" class="btn btn-ghost" id="shift-close-cancel">Отмена</button>
+        <button type="button" class="btn btn-ghost" id="shift-close-fill-expected">Как ожидалось</button>
         <button type="submit" class="btn btn-primary">Закрыть смену</button>
       </div>
     </form>
@@ -1453,7 +1453,7 @@
   </dialog>
 
   <div id="toast" class="toast"></div>
-  <script src="/static/app.js?v=78"></script>
+  <script src="/static/app.js?v=79"></script>
   <script>
     if ("serviceWorker" in navigator) {
       navigator.serviceWorker.register("/sw.js").then((reg) => {
