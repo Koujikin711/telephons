@@ -660,8 +660,8 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     )
     _seed_finance_defaults(conn)
     _backfill_sale_payments(conn)
-    # Z-import phone sales → касса (смн / $), once
-    if _table_exists(conn, "sales") and get_setting(conn, "z_sales_in_cash_v1", "") != "1":
+    # Z-import phone sales → касса (смн / $). Re-run if re-import cleared the flag.
+    if _table_exists(conn, "sales") and get_setting(conn, "z_sales_in_cash_v2", "") != "1":
         conn.execute(
             """
             UPDATE sales SET affects_cash = 1
@@ -672,6 +672,7 @@ def migrate_db(conn: sqlite3.Connection) -> None:
               )
             """
         )
+        set_setting(conn, "z_sales_in_cash_v2", "1")
         set_setting(conn, "z_sales_in_cash_v1", "1")
 
     conn.executescript(
@@ -2014,7 +2015,7 @@ def _import_z_register_rows(
     warehouse_id: int,
     *,
     sheet_kind: str = "used",
-    affect_cash: bool = False,
+    affect_cash: bool = True,
 ) -> dict[str, Any]:
     created_units = sold = skipped = 0
     errors: list[str] = []
@@ -8026,7 +8027,7 @@ async def import_z_register_file(
     file: UploadFile = File(...),
     sheet: str = Query(default=""),
     replace: bool = Query(default=False),
-    affect_cash: bool = Query(default=False),
+    affect_cash: bool = Query(default=True),
     x_pin: str | None = Header(default=None, alias="X-Pin"),
 ):
     check_pin(x_pin, min_role="warehouse")
@@ -9593,8 +9594,8 @@ async def create_sale(body: SaleIn, x_pin: str | None = Header(default=None, ali
             INSERT INTO sales
             (total, discount, payment_method, status, notes, created_at,
              warehouse_id, cash_amount, card_amount, trade_in_value, shift_id, user_id, user_name,
-             amount_paid, amount_due, currency_code)
-            VALUES (?, ?, ?, 'completed', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
+             amount_paid, amount_due, currency_code, affects_cash)
+            VALUES (?, ?, ?, 'completed', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, 1)
             """,
             (total, body.discount, payment_method, sale_notes, now,
              warehouse_id, cash_amount, card_amount, shift_id,
