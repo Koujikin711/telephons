@@ -2026,6 +2026,10 @@ def _import_z_register_rows(
         else "new"
     )
     currency_code = get_warehouse_currency(conn, warehouse_id)["code"]
+    try:
+        bu_wh = resolve_bu_warehouse_id(conn)
+    except HTTPException:
+        bu_wh = warehouse_id
 
     def record_sale(
         *,
@@ -2040,8 +2044,10 @@ def _import_z_register_rows(
         sale_price: float,
         sale_date: str,
         profit: float | None,
+        sale_warehouse_id: int | None = None,
     ) -> None:
         nonlocal sold
+        wh = int(sale_warehouse_id) if sale_warehouse_id is not None else warehouse_id
         shop_profit = profit if profit is not None else (sale_price - purchase - extra)
         total = float(sale_price)
         cur_s = conn.execute(
@@ -2052,7 +2058,7 @@ def _import_z_register_rows(
              amount_paid, amount_due, currency_code, affects_cash)
             VALUES (?, 0, 'cash', 'completed', ?, ?, ?, ?, 0, 0, NULL, NULL, 'Z-импорт', ?, 0, ?, ?)
             """,
-            (total, row["comments"] or "Z-импорт Excel", sale_date, warehouse_id, total, total, currency_code, cash_flag),
+            (total, row["comments"] or "Z-импорт Excel", sale_date, wh, total, total, currency_code, cash_flag),
         )
         sale_id = int(cur_s.lastrowid)
         insert_sale_payments(conn, sale_id, [{
@@ -2080,7 +2086,7 @@ def _import_z_register_rows(
             (sale_item_id, unit_id, imei, serial, extra),
         )
         mark_unit_sold_full(conn, unit_id, sale_id, imei, 0, extra)
-        adjust_warehouse_stock(conn, warehouse_id, product_id, -1, "sale", reference_id=sale_id)
+        adjust_warehouse_stock(conn, wh, product_id, -1, "sale", reference_id=sale_id)
         sold += 1
 
     for row in rows:
@@ -2101,6 +2107,7 @@ def _import_z_register_rows(
         color = row["color"]
         serial = imei if imei else f"Z{row['row_num']}-{warehouse_id}"
         reuse_unit: sqlite3.Row | None = None
+        sale_wh_for_row = warehouse_id
 
         if imei:
             in_stock = conn.execute(
@@ -2142,9 +2149,12 @@ def _import_z_register_rows(
                 ).fetchone()
                 if existing_any and not has_sale:
                     # Return / re-accept: same IMEI was sold, Excel shows it back in stock.
+                    # Правило: IMEI уже был в истории → телефон Б/У (склад Б/У, condition used).
                     unit_id = int(existing_any["id"])
                     old_wh = int(existing_any["warehouse_id"] or warehouse_id)
                     old_status = (existing_any["status"] or "").strip()
+                    target_wh = bu_wh
+                    ret_condition = "used"
                     # Ensure product card matches current Excel attrs (color/memory may change).
                     existing_prod = conn.execute(
                         """
@@ -2156,13 +2166,13 @@ def _import_z_register_rows(
                           AND condition = ?
                         LIMIT 1
                         """,
-                        (name, name, memory, color, condition),
+                        (name, name, memory, color, ret_condition),
                     ).fetchone()
                     if existing_prod:
                         product_id = int(existing_prod["id"])
                         conn.execute(
                             "UPDATE products SET purchase_price = ?, condition = ? WHERE id = ?",
-                            (purchase, condition, product_id),
+                            (purchase, ret_condition, product_id),
                         )
                     else:
                         cur = conn.execute(
@@ -2175,12 +2185,12 @@ def _import_z_register_rows(
                             VALUES (?, 'phone', 'own', '', '', '', '', ?, ?, 0, 0, ?,
                                     ?, ?, '', ?, '', 0, 0, '', ?, 1, '')
                             """,
-                            (name, purchase, round(purchase * 1.15, 2), utc_now(), name, color, memory, condition),
+                            (name, purchase, round(purchase * 1.15, 2), utc_now(), name, color, memory, ret_condition),
                         )
                         product_id = int(cur.lastrowid)
                     unit_notes = (row["comments"] or "").strip()
                     unit_notes = (
-                        f"Z-импорт возврат: {unit_notes}" if unit_notes else "Z-импорт возврат Excel"
+                        f"Z-импорт возврат → Б/У: {unit_notes}" if unit_notes else "Z-импорт возврат → Б/У (IMEI в истории)"
                     )
                     conn.execute(
                         """
@@ -2193,7 +2203,7 @@ def _import_z_register_rows(
                         """,
                         (
                             product_id,
-                            warehouse_id,
+                            target_wh,
                             purchase,
                             extra,
                             row["battery"],
@@ -2208,13 +2218,13 @@ def _import_z_register_rows(
                     if old_status != "in_stock":
                         adjust_warehouse_stock(
                             conn,
-                            warehouse_id,
+                            target_wh,
                             product_id,
                             1,
                             "inbound",
-                            notes=f"Z-импорт возврат IMEI {imei}: {name}",
+                            notes=f"Z-импорт возврат IMEI {imei} → Б/У: {name}",
                         )
-                        if old_wh != warehouse_id or int(existing_any["product_id"]) != product_id:
+                        if old_wh != target_wh or int(existing_any["product_id"]) != product_id:
                             sync_product_stock(conn, int(existing_any["product_id"]))
                         sync_product_stock(conn, product_id)
                     created_units += 1
@@ -2237,8 +2247,13 @@ def _import_z_register_rows(
                     if already:
                         skipped += 1
                         continue
+                    # Правило: IMEI уже был в истории → продаём как Б/У (склад Б/У, condition used).
                     unit_id = int(existing_any["id"])
+                    old_wh = int(existing_any["warehouse_id"] or warehouse_id)
                     old_status = (existing_any["status"] or "").strip()
+                    target_wh = bu_wh
+                    sale_wh_for_row = bu_wh
+                    ret_condition = "used"
                     existing_prod = conn.execute(
                         """
                         SELECT id FROM products
@@ -2249,13 +2264,13 @@ def _import_z_register_rows(
                           AND condition = ?
                         LIMIT 1
                         """,
-                        (name, name, memory, color, condition),
+                        (name, name, memory, color, ret_condition),
                     ).fetchone()
                     if existing_prod:
                         product_id = int(existing_prod["id"])
                         conn.execute(
                             "UPDATE products SET purchase_price = ?, sale_price = COALESCE(?, sale_price), condition = ? WHERE id = ?",
-                            (purchase, sale_price, condition, product_id),
+                            (purchase, sale_price, ret_condition, product_id),
                         )
                     else:
                         cur = conn.execute(
@@ -2276,15 +2291,15 @@ def _import_z_register_rows(
                                 name,
                                 color,
                                 memory,
-                                condition,
+                                ret_condition,
                             ),
                         )
                         product_id = int(cur.lastrowid)
                     unit_notes = (row["comments"] or "").strip()
                     unit_notes = (
-                        f"Z-импорт возврат+продажа: {unit_notes}"
+                        f"Z-импорт возврат+продажа → Б/У: {unit_notes}"
                         if unit_notes
-                        else "Z-импорт возврат+продажа Excel"
+                        else "Z-импорт возврат+продажа → Б/У (IMEI в истории)"
                     )
                     conn.execute(
                         """
@@ -2297,7 +2312,7 @@ def _import_z_register_rows(
                         """,
                         (
                             product_id,
-                            warehouse_id,
+                            target_wh,
                             purchase,
                             extra,
                             row["battery"],
@@ -2312,12 +2327,14 @@ def _import_z_register_rows(
                     if old_status != "in_stock":
                         adjust_warehouse_stock(
                             conn,
-                            warehouse_id,
+                            target_wh,
                             product_id,
                             1,
                             "inbound",
-                            notes=f"Z-импорт возврат перед повторной продажей IMEI {imei}",
+                            notes=f"Z-импорт возврат IMEI {imei} → Б/У перед повторной продажей",
                         )
+                        if old_wh != target_wh or int(existing_any["product_id"]) != product_id:
+                            sync_product_stock(conn, int(existing_any["product_id"]))
                         sync_product_stock(conn, product_id)
                     reuse_unit = conn.execute(
                         "SELECT id, product_id FROM product_units WHERE id = ?",
@@ -2426,6 +2443,7 @@ def _import_z_register_rows(
                 sale_price=float(sale_price),
                 sale_date=sale_date,
                 profit=profit,
+                sale_warehouse_id=sale_wh_for_row,
             )
 
     return {
@@ -4175,6 +4193,57 @@ def find_or_create_used_product_for_return(
     return int(cur.lastrowid)
 
 
+def imei_seen_in_history(conn: sqlite3.Connection, imei: str) -> bool:
+    """IMEI уже встречался в системе (принимали/продавали раньше) → устройство Б/У.
+
+    Если этот IMEI хоть раз был в product_units или в чеках (sale_item_units),
+    значит телефон уже проходил через магазин — при повторном приёме он Б/У.
+    """
+    imei = (imei or "").strip()
+    if not imei or imei.lower() in ("id", "none", "n/a"):
+        return False
+    row = conn.execute(
+        "SELECT 1 FROM product_units WHERE TRIM(imei) = ? AND TRIM(imei) != '' LIMIT 1",
+        (imei,),
+    ).fetchone()
+    if row:
+        return True
+    if _table_exists(conn, "sale_item_units"):
+        row = conn.execute(
+            "SELECT 1 FROM sale_item_units WHERE TRIM(imei) = ? AND TRIM(imei) != '' LIMIT 1",
+            (imei,),
+        ).fetchone()
+    return bool(row)
+
+
+def route_used_imei_on_receipt(
+    conn: sqlite3.Connection,
+    *,
+    product: sqlite3.Row,
+    imei: str,
+    default_warehouse_id: int,
+    purchase_price: float | None = None,
+) -> tuple[int, int, bool]:
+    """Маршрутизация при приёме единицы с IMEI.
+
+    Правило: если IMEI уже есть в истории — телефон Б/У. Возвращаем склад Б/У и
+    карточку used (валюту/цену не конвертируем — Б/У мультивалютный).
+    Возвращает (warehouse_id, product_id, is_used_override).
+    """
+    if not imei_seen_in_history(conn, imei):
+        return int(default_warehouse_id), int(product["id"]), False
+    try:
+        bu_wh = resolve_bu_warehouse_id(conn)
+    except HTTPException:
+        return int(default_warehouse_id), int(product["id"]), False
+    price = float(
+        purchase_price if purchase_price and purchase_price > 0
+        else (product["purchase_price"] or 0)
+    )
+    used_pid = find_or_create_used_product_for_return(conn, product, price)
+    return int(bu_wh), int(used_pid), True
+
+
 def restore_units_for_sale(
     conn: sqlite3.Connection,
     sale_id: int,
@@ -5549,7 +5618,7 @@ async def web_manifest():
 async def health():
     return {
         "status": "ok",
-        "build": "shift-close-wallets-v1",
+        "build": "imei-history-to-bu-v1",
         "db": str(DB_PATH),
         "db_exists": DB_PATH.exists(),
     }
@@ -7312,6 +7381,16 @@ async def create_unit(body: UnitIn, x_pin: str | None = Header(default=None, ali
             ).fetchone()
             if dup:
                 raise HTTPException(status_code=400, detail="IMEI уже в системе")
+        # Правило: если IMEI уже был в истории — телефон Б/У (склад Б/У, карточка used).
+        target_pid = body.product_id
+        unit_note = body.notes
+        if imei:
+            wh, target_pid, is_used = route_used_imei_on_receipt(
+                conn, product=product, imei=imei,
+                default_warehouse_id=wh, purchase_price=body.purchase_price,
+            )
+            if is_used:
+                unit_note = (f"{body.notes}; " if body.notes else "") + "IMEI в истории → Б/У"
         cur = conn.execute(
             """
             INSERT INTO product_units
@@ -7320,16 +7399,16 @@ async def create_unit(body: UnitIn, x_pin: str | None = Header(default=None, ali
             VALUES (?, ?, ?, ?, 'in_stock', ?, ?, ?, ?, ?, ?)
             """,
             (
-                body.product_id, wh, imei, serial, body.notes, utc_now(), cs, customs_cleared, customs_price,
+                target_pid, wh, imei, serial, unit_note, utc_now(), cs, customs_cleared, customs_price,
                 float(body.purchase_price) if body.purchase_price is not None and body.purchase_price > 0
                 else float(product["purchase_price"] or 0),
             ),
         )
         adjust_warehouse_stock(
-            conn, wh, body.product_id, 1, "inbound",
+            conn, wh, target_pid, 1, "inbound",
             notes=f"IMEI: {imei or serial}",
         )
-        conn.execute("UPDATE products SET track_units = 1 WHERE id = ?", (body.product_id,))
+        conn.execute("UPDATE products SET track_units = 1 WHERE id = ?", (target_pid,))
         row = conn.execute(
             """
             SELECT u.*, p.name AS product_name, w.name AS warehouse_name
@@ -8687,6 +8766,17 @@ async def stock_inbound_receipt(body: InboundReceiptIn, x_pin: str | None = Head
             unit_extra = float(body.unit_extra_cost or 0)
             if unit_extra <= 0 and body.mode == "new" and body.product:
                 unit_extra = float(body.product.customs_price or 0)
+            # Правило: если IMEI уже был в истории — телефон Б/У (склад Б/У, карточка used).
+            unit_note = body.notes or "Приход на склад"
+            if imei:
+                wh_id, product_id, is_used = route_used_imei_on_receipt(
+                    conn, product=product, imei=imei,
+                    default_warehouse_id=wh_id, purchase_price=unit_cost,
+                )
+                if is_used:
+                    cs = "none"
+                    unit_note = f"{unit_note}; IMEI в истории → Б/У"
+                    product = conn.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
             cur_u = conn.execute(
                 """
                 INSERT INTO product_units
@@ -8697,7 +8787,7 @@ async def stock_inbound_receipt(body: InboundReceiptIn, x_pin: str | None = Head
                 """,
                 (
                     product_id, wh_id, imei, serial,
-                    body.notes or "Приход на склад", utc_now(), cs,
+                    unit_note, utc_now(), cs,
                     int(product["customs_cleared"] or 0), unit_extra, body.battery_capacity,
                     body.client_name.strip(), body.region.strip(),
                     body.arrival_date.strip() or utc_now()[:10],
@@ -9952,16 +10042,30 @@ async def create_trade_in(body: TradeInIn, x_pin: str | None = Header(default=No
         )
         received_product_id = recv_cur.lastrowid
 
-        if body.received_imei.strip() or body.received_serial.strip():
+        # Правило: если IMEI принятого телефона уже был в истории — он Б/У (склад Б/У, карточка used).
+        recv_imei = body.received_imei.strip()
+        recv_note = "Trade-in"
+        if recv_imei:
+            recv_product_row = conn.execute(
+                "SELECT * FROM products WHERE id = ?", (received_product_id,)
+            ).fetchone()
+            received_wh, received_product_id, is_used = route_used_imei_on_receipt(
+                conn, product=recv_product_row, imei=recv_imei,
+                default_warehouse_id=received_wh, purchase_price=body.received_purchase_price,
+            )
+            if is_used:
+                recv_note = "Trade-in; IMEI в истории → Б/У"
+
+        if recv_imei or body.received_serial.strip():
             conn.execute(
                 """
                 INSERT INTO product_units
                 (product_id, warehouse_id, imei, serial, status, notes, created_at, purchase_price)
-                VALUES (?, ?, ?, ?, 'in_stock', 'Trade-in', ?, ?)
+                VALUES (?, ?, ?, ?, 'in_stock', ?, ?, ?)
                 """,
                 (
                     received_product_id, received_wh,
-                    body.received_imei.strip(), body.received_serial.strip(), now,
+                    recv_imei, body.received_serial.strip(), recv_note, now,
                     float(body.received_purchase_price or 0),
                 ),
             )
