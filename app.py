@@ -4876,7 +4876,7 @@ def _period_cash_by_currency(
                    payment_method_code AS method_code,
                    SUM(amount) AS amt
             FROM cash_inflows
-            WHERE source_type = 'counterparty' {c_clause}
+            WHERE source_type IN ('counterparty', 'shift_close', 'shift_opening') {c_clause}
             GROUP BY 1, 2
         """
         for r in conn.execute(c_sql, list(c_params)).fetchall():
@@ -5072,7 +5072,7 @@ def funds_snapshot(conn: sqlite3.Connection) -> dict[str, Any]:
                    payment_method_code,
                    SUM(amount) AS amt
             FROM cash_inflows
-            WHERE source_type = 'counterparty'
+            WHERE source_type IN ('counterparty', 'shift_close', 'shift_opening')
             GROUP BY 1, 2
             """
         ).fetchall():
@@ -5573,7 +5573,7 @@ async def web_manifest():
 async def health():
     return {
         "status": "ok",
-        "build": "z-sheet-sales-match-v2",
+        "build": "shift-close-cash-v1",
         "db": str(DB_PATH),
         "db_exists": DB_PATH.exists(),
     }
@@ -6629,6 +6629,130 @@ def shift_expected_wallets(conn: sqlite3.Connection, shift: sqlite3.Row) -> list
     )
 
 
+def balances_from_shift_expected(
+    conn: sqlite3.Connection,
+    expected: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Формат кошельков кассы: старт смены + движение = то, что должно быть в ящике."""
+    grouped: dict[str, dict[str, Any]] = {}
+    for row in expected:
+        code = (row.get("method_code") or "").strip()
+        if not code:
+            continue
+        cur = (row.get("currency_code") or "TJS").strip().upper() or "TJS"
+        opening = float(row.get("opening") or 0)
+        movement = float(row.get("movement") or 0)
+        expected_amt = float(row.get("expected") or (opening + movement))
+        bag = grouped.get(code)
+        if not bag:
+            pm = get_payment_method(conn, code)
+            bag = {
+                "code": code,
+                "name": row.get("method_name") or (pm["name"] if pm else code),
+                "method_type": row.get("method_type") or (pm["method_type"] if pm else ""),
+                "currency_code": payment_method_currency(pm) if pm else (row.get("currency_code") or ""),
+                "by_currency": [],
+                "inflow": None,
+                "outflow": None,
+                "net": None,
+            }
+            grouped[code] = bag
+        bag["by_currency"].append({
+            **currency_meta(cur),
+            "inflow": round(opening + max(movement, 0.0), 2),
+            "outflow": round(abs(min(movement, 0.0)), 2),
+            "net": round(expected_amt, 2),
+            "opening": round(opening, 2),
+            "movement": round(movement, 2),
+        })
+    order = {m["code"]: i for i, m in enumerate(list_payment_methods(conn, active_only=True))}
+    result = list(grouped.values())
+    for bag in result:
+        bag["by_currency"].sort(key=lambda r: (0 if r.get("code") == "TJS" else 1, r.get("code") or ""))
+    return sorted(result, key=lambda b: order.get(b["code"], 999))
+
+
+def apply_shift_close_to_cash(
+    conn: sqlite3.Connection,
+    *,
+    shift_id: int,
+    targets: list[dict[str, Any]],
+    user_name: str = "",
+) -> list[dict[str, Any]]:
+    """При закрытии смены: подогнать остатки кассы под фактический пересчёт.
+
+    В ledger (продажи/приходы/расходы) нет стартовых сумм открытия смены.
+    Здесь пишем разницу actual − текущий остаток кошелька как cash_inflows
+    source_type=shift_close (сумма может быть отрицательной при недостаче).
+    Идемпотентно по маркеру shift_close:{id} в notes.
+    """
+    if not _table_exists(conn, "cash_inflows"):
+        return []
+    marker = f"shift_close:{int(shift_id)}"
+    already = conn.execute(
+        "SELECT 1 FROM cash_inflows WHERE notes LIKE ? LIMIT 1",
+        (f"%{marker}%",),
+    ).fetchone()
+    if already:
+        return []
+
+    ledger: dict[tuple[str, str], float] = {}
+    for b in (_period_cash_by_currency(conn, "all").get("balances") or []):
+        code = (b.get("code") or "").strip()
+        for row in b.get("by_currency") or []:
+            cur = str(row.get("code") or "TJS").upper()
+            ledger[(code, cur)] = float(row.get("net") or 0)
+
+    base = get_setting(conn, "base_currency", "TJS").upper()
+    now = utc_now()
+    posted: list[dict[str, Any]] = []
+    for aw in targets:
+        code = (aw.get("method_code") or "").strip()
+        cur = (aw.get("currency_code") or "TJS").strip().upper() or "TJS"
+        if not code:
+            continue
+        actual = round(float(aw.get("amount") or 0), 2)
+        current = round(float(ledger.get((code, cur), 0.0)), 2)
+        delta = round(actual - current, 2)
+        if abs(delta) < 0.01:
+            continue
+        amount_base = delta if cur == base else (convert_amount(conn, delta, cur, base, at=now) or delta)
+        amount_base = round(float(amount_base), 2)
+        name = aw.get("method_name") or code
+        note = (
+            f"{marker} · пересчёт смены #{shift_id}: "
+            f"{name} {cur} факт {actual:g} − учёт {current:g} = {delta:+g}"
+        )
+        cur_ins = conn.execute(
+            """
+            INSERT INTO cash_inflows
+            (amount, currency_code, amount_base, payment_method_code, source_type,
+             counterparty_name, receivable_id, mutual_entry_id, notes, created_at, created_by)
+            VALUES (?, ?, ?, ?, 'shift_close', ?, NULL, NULL, ?, ?, ?)
+            """,
+            (
+                delta,
+                cur,
+                amount_base,
+                code,
+                f"Смена #{shift_id}",
+                note,
+                now,
+                (user_name or "").strip() or "Смена",
+            ),
+        )
+        posted.append({
+            "id": int(cur_ins.lastrowid),
+            "method_code": code,
+            "currency_code": cur,
+            "amount": delta,
+            "actual": actual,
+            "ledger_before": current,
+        })
+        ledger[(code, cur)] = actual
+    return posted
+
+
 @app.get("/api/shifts/current")
 async def current_shift(x_pin: str | None = Header(default=None, alias="X-Pin")):
     check_pin(x_pin)
@@ -6821,6 +6945,26 @@ async def close_shift(shift_id: int, body: ShiftCloseIn, x_pin: str | None = Hea
                 "difference": round(0.0 - float(exp["expected"]), 2),
             })
 
+        # Цель пересчёта: факт с формы, иначе ожидаемое (старт + движение)
+        reconcile_targets = actual_wallets or [
+            {
+                "method_code": e["method_code"],
+                "method_name": e["method_name"],
+                "method_type": e["method_type"],
+                "currency_code": e["currency_code"],
+                "amount": float(e.get("expected") or 0),
+            }
+            for e in expected_wallets
+            if abs(float(e.get("expected") or 0)) >= 0.01
+            or abs(float(e.get("opening") or 0)) >= 0.01
+        ]
+        cash_posts = apply_shift_close_to_cash(
+            conn,
+            shift_id=shift_id,
+            targets=reconcile_targets,
+            user_name=(shift["user_name"] or "") if "user_name" in shift.keys() else "",
+        )
+
         conn.execute(
             """
             UPDATE shifts SET
@@ -6852,6 +6996,7 @@ async def close_shift(shift_id: int, body: ShiftCloseIn, x_pin: str | None = Hea
     result["wallet_differences"] = wallet_diffs
     result["expected_wallets"] = expected_wallets
     result["actual_wallets"] = actual_wallets
+    result["cash_ledger_posts"] = cash_posts
     result["by_payment"] = totals["by_payment"]
     return result
 
@@ -8233,7 +8378,16 @@ async def pos_cash_register(
         ).fetchall()
 
         by_cur = cash["by_currency"]
-        till = till_summary_from_balances(wallets["balances"])
+        wallets_all = wallets["balances"]
+        balances_source = "all_time"
+        balances_label = "Сейчас в кошельках (весь период)"
+        drawer_balances = wallets_all
+        if shift_row:
+            expected = shift_expected_wallets(conn, shift_row)
+            drawer_balances = balances_from_shift_expected(conn, expected)
+            balances_source = "shift"
+            balances_label = "Сейчас в кассе (старт смены + движение)"
+        till = till_summary_from_balances(drawer_balances)
         till_period = till_summary_from_balances(cash["balances"])
     return {
         "period": period_key,
@@ -8256,9 +8410,12 @@ async def pos_cash_register(
         "expenses": [row_to_dict(r) for r in exp_rows],
         # Period movement per wallet (shift/today)
         "balances_period": cash["balances"],
-        # All-time money currently in wallets (does not reset next day)
-        "balances": wallets["balances"],
-        "wallets_all_time": wallets["balances"],
+        # Drawer now: with open shift = opening + movement; else all-time ops
+        "balances": drawer_balances,
+        "balances_source": balances_source,
+        "balances_label": balances_label,
+        # All-time money from sales/inflows/expenses (без стартовых сумм смены)
+        "wallets_all_time": wallets_all,
         "till": till,
         "till_period": till_period,
         "cash_inflows": recent_inflows,
@@ -8424,7 +8581,7 @@ async def pos_cash_register_detail(
                     SELECT created_at AS at, amount, amount_base, currency_code,
                            payment_method_code, counterparty_name, source_type, notes
                     FROM cash_inflows
-                    WHERE source_type = 'counterparty' {in_clause}
+                    WHERE source_type IN ('counterparty', 'shift_close', 'shift_opening') {in_clause}
                 """
                 man_params = list(in_params)
                 if kind == "wallet" and method:
@@ -8433,10 +8590,20 @@ async def pos_cash_register_detail(
                 man_sql += " ORDER BY created_at DESC LIMIT 200"
                 for r in conn.execute(man_sql, man_params).fetchall():
                     pm = get_payment_method(conn, r["payment_method_code"] or "cash")
+                    src = (r["source_type"] or "counterparty")
+                    src_label = (
+                        "Пересчёт смены" if src == "shift_close"
+                        else "Старт смены" if src == "shift_opening"
+                        else "Приход (контрагент)"
+                    )
+                    amt = float(r["amount"] or 0)
                     add_line(
-                        at=r["at"], side="+", source="Приход (контрагент)",
+                        at=r["at"],
+                        side="+" if amt >= 0 else "−",
+                        source=src_label,
                         who=r["counterparty_name"] or "—",
-                        amount=r["amount"], currency=r["currency_code"] or "TJS",
+                        amount=abs(amt),
+                        currency=r["currency_code"] or "TJS",
                         note=r["notes"] or "",
                         method_name=pm["name"] if pm else (r["payment_method_code"] or ""),
                     )

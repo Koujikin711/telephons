@@ -1705,7 +1705,10 @@ async function submitShiftClose(e) {
       ).join(" · ");
       toast(`Смена закрыта · расхождения: ${tip}${diffs.length > 3 ? "…" : ""}`, "info");
     } else {
-      toast("Смена закрыта");
+      const posts = r.cash_ledger_posts || [];
+      toast(posts.length
+        ? `Смена закрыта · в остатки кассы записано ${posts.length} корр.`
+        : "Смена закрыта");
     }
     loadPosCashRegister();
   } catch (err) {
@@ -1762,16 +1765,29 @@ async function loadPosCashRegister() {
     kpi.querySelectorAll("[data-cash-kind]").forEach((el) => {
       el.addEventListener("click", () => openPosCashDetail(el.dataset.cashKind));
     });
+    const balHeading = document.getElementById("pos-balances-heading");
+    if (balHeading) {
+      balHeading.textContent = r.balances_label
+        || (r.shift ? "Сейчас в кассе (старт смены + движение)" : "Сейчас в кошельках (весь период)");
+    }
     const balBox = document.getElementById("pos-balances");
     if (balBox) {
-      const wallets = r.wallets_all_time || r.balances || [];
+      // При открытой смене balances уже = старт + движение; иначе весь период.
+      const wallets = r.balances || r.wallets_all_time || [];
       balBox.innerHTML = wallets.map((b) => {
         const bound = inferWalletCurrency(b);
         const mainCls = bound ? "wallet-amt" : "value value-multi";
+        const openParts = (b.by_currency || [])
+          .filter((c) => +c.opening > 0.0001)
+          .map((c) => `старт ${fmtCurrency(+c.opening, c)}`);
+        const openHint = openParts.length
+          ? `<small class="hint">${esc(openParts.join(" · "))}</small>`
+          : "";
         return `
-        <button type="button" class="pos-balance-row pos-balance-btn" data-method="${esc(b.code)}" title="Остаток за всё время — нажмите для деталей">
+        <button type="button" class="pos-balance-row pos-balance-btn" data-method="${esc(b.code)}" title="Остаток в кассе — нажмите для деталей">
           <span>${esc(b.name)}${bound ? ` <small class="hint">(${bound === "USD" ? "$" : "смн"})</small>` : ""}</span>
           <strong class="${mainCls}">${formatWalletField(b, "net")}</strong>
+          ${openHint}
           <small>всего: +${formatWalletField(b, "inflow")} / −${formatWalletField(b, "outflow")}</small>
         </button>`;
       }).join("") || '<p class="muted">Нет данных</p>';
