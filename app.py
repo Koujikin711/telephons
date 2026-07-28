@@ -2026,10 +2026,133 @@ def _import_z_register_rows(
         else "new"
     )
     currency_code = get_warehouse_currency(conn, warehouse_id)["code"]
-    try:
-        bu_wh = resolve_bu_warehouse_id(conn)
-    except HTTPException:
-        bu_wh = warehouse_id
+
+    def resolve_sheet_product(
+        *,
+        name: str,
+        memory: str,
+        color: str,
+        purchase: float,
+        sale_price: float | None,
+    ) -> int:
+        """Карточка товара строго под лист Excel (used / new / partnership)."""
+        existing_prod = conn.execute(
+            """
+            SELECT id FROM products
+            WHERE category = 'phone' AND LOWER(TRIM(name)) = LOWER(TRIM(?))
+              AND LOWER(TRIM(COALESCE(model, ''))) = LOWER(TRIM(?))
+              AND LOWER(TRIM(COALESCE(memory, ''))) = LOWER(TRIM(?))
+              AND LOWER(TRIM(COALESCE(color, ''))) = LOWER(TRIM(?))
+              AND condition = ?
+            LIMIT 1
+            """,
+            (name, name, memory, color, expected_condition),
+        ).fetchone()
+        if existing_prod:
+            product_id = int(existing_prod["id"])
+            conn.execute(
+                """
+                UPDATE products
+                SET purchase_price = ?, sale_price = COALESCE(?, sale_price), condition = ?
+                WHERE id = ?
+                """,
+                (purchase, sale_price, expected_condition, product_id),
+            )
+            return product_id
+        sp = sale_price if sale_price and sale_price > 0 else round(purchase * 1.15, 2)
+        cur = conn.execute(
+            """
+            INSERT INTO products
+            (name, category, ownership_type, supplier_name, brand, sku, barcode,
+             purchase_price, sale_price, stock, min_stock, created_at,
+             model, color, size, memory, ram, customs_cleared, customs_price, specs_extra,
+             condition, track_units, image_url)
+            VALUES (?, 'phone', 'own', '', '', '', '', ?, ?, 0, 0, ?,
+                    ?, ?, '', ?, '', 0, 0, '', ?, 1, '')
+            """,
+            (name, purchase, sp, utc_now(), name, color, memory, expected_condition),
+        )
+        return int(cur.lastrowid)
+
+    def bind_unit_to_sheet(
+        unit_id: int,
+        *,
+        product_id: int,
+        purchase: float,
+        extra: float,
+        row: dict[str, Any],
+        imei: str,
+        notes: str,
+    ) -> None:
+        """Единица всегда на складе текущего листа; себестоимость — из строки Excel."""
+        old = conn.execute(
+            "SELECT product_id, warehouse_id, status FROM product_units WHERE id = ?",
+            (unit_id,),
+        ).fetchone()
+        old_wh = int(old["warehouse_id"] or warehouse_id) if old else warehouse_id
+        old_product = int(old["product_id"]) if old else product_id
+        old_status = (old["status"] or "").strip() if old else ""
+        conn.execute(
+            """
+            UPDATE product_units
+            SET status = 'in_stock', sale_id = NULL, product_id = ?, warehouse_id = ?,
+                purchase_price = ?, customs_price = ?, battery_capacity = ?,
+                client_name = ?, region = ?, arrival_date = ?, notes = ?,
+                serial = COALESCE(NULLIF(serial, ''), ?)
+            WHERE id = ?
+            """,
+            (
+                product_id,
+                warehouse_id,
+                purchase,
+                extra,
+                row["battery"],
+                row["comments"] or "",
+                row["region"] or "",
+                (row["arrival_date"] or "")[:10],
+                notes,
+                imei,
+                unit_id,
+            ),
+        )
+        if old_status == "in_stock" and old_wh != warehouse_id:
+            # Перенос между складами: −1 со старого (если есть), +1 на лист Excel.
+            try:
+                adjust_warehouse_stock(
+                    conn,
+                    old_wh,
+                    old_product,
+                    -1,
+                    "transfer",
+                    notes=f"Z-импорт перенос IMEI {imei} → склад листа",
+                )
+            except HTTPException:
+                pass
+            adjust_warehouse_stock(
+                conn,
+                warehouse_id,
+                product_id,
+                1,
+                "transfer",
+                notes=f"Z-импорт перенос IMEI {imei} на склад листа",
+            )
+            sync_product_stock(conn, old_product)
+            sync_product_stock(conn, product_id)
+        elif old_status != "in_stock":
+            adjust_warehouse_stock(
+                conn,
+                warehouse_id,
+                product_id,
+                1,
+                "inbound",
+                notes=f"Z-импорт на склад листа IMEI {imei}: {row['name']}",
+            )
+            if old and (old_wh != warehouse_id or old_product != product_id):
+                sync_product_stock(conn, old_product)
+            sync_product_stock(conn, product_id)
+        elif old_product != product_id:
+            sync_product_stock(conn, old_product)
+            sync_product_stock(conn, product_id)
 
     def record_sale(
         *,
@@ -2044,10 +2167,8 @@ def _import_z_register_rows(
         sale_price: float,
         sale_date: str,
         profit: float | None,
-        sale_warehouse_id: int | None = None,
     ) -> None:
         nonlocal sold
-        wh = int(sale_warehouse_id) if sale_warehouse_id is not None else warehouse_id
         shop_profit = profit if profit is not None else (sale_price - purchase - extra)
         total = float(sale_price)
         cur_s = conn.execute(
@@ -2058,7 +2179,7 @@ def _import_z_register_rows(
              amount_paid, amount_due, currency_code, affects_cash)
             VALUES (?, 0, 'cash', 'completed', ?, ?, ?, ?, 0, 0, NULL, NULL, 'Z-импорт', ?, 0, ?, ?)
             """,
-            (total, row["comments"] or "Z-импорт Excel", sale_date, wh, total, total, currency_code, cash_flag),
+            (total, row["comments"] or "Z-импорт Excel", sale_date, warehouse_id, total, total, currency_code, cash_flag),
         )
         sale_id = int(cur_s.lastrowid)
         insert_sale_payments(conn, sale_id, [{
@@ -2086,7 +2207,7 @@ def _import_z_register_rows(
             (sale_item_id, unit_id, imei, serial, extra),
         )
         mark_unit_sold_full(conn, unit_id, sale_id, imei, 0, extra)
-        adjust_warehouse_stock(conn, wh, product_id, -1, "sale", reference_id=sale_id)
+        adjust_warehouse_stock(conn, warehouse_id, product_id, -1, "sale", reference_id=sale_id)
         sold += 1
 
     for row in rows:
@@ -2107,34 +2228,40 @@ def _import_z_register_rows(
         color = row["color"]
         serial = imei if imei else f"Z{row['row_num']}-{warehouse_id}"
         reuse_unit: sqlite3.Row | None = None
-        sale_wh_for_row = warehouse_id
 
         if imei:
             in_stock = conn.execute(
                 """
-                SELECT id, product_id FROM product_units
+                SELECT id, product_id, warehouse_id FROM product_units
                 WHERE imei = ? AND imei != '' AND status = 'in_stock' LIMIT 1
                 """,
                 (imei,),
             ).fetchone()
             if in_stock:
+                product_id = resolve_sheet_product(
+                    name=name,
+                    memory=memory,
+                    color=color,
+                    purchase=purchase,
+                    sale_price=sale_price,
+                )
+                unit_notes = (row["comments"] or "").strip()
+                unit_notes = f"Z-импорт: {unit_notes}" if unit_notes else "Z-импорт Excel"
+                bind_unit_to_sheet(
+                    int(in_stock["id"]),
+                    product_id=product_id,
+                    purchase=purchase,
+                    extra=extra,
+                    row=row,
+                    imei=imei,
+                    notes=unit_notes,
+                )
                 if has_sale:
-                    reuse_unit = in_stock
+                    reuse_unit = conn.execute(
+                        "SELECT id, product_id FROM product_units WHERE id = ?",
+                        (int(in_stock["id"]),),
+                    ).fetchone()
                 else:
-                    # Keep existing unit; refresh per-IMEI cost from Excel
-                    conn.execute(
-                        """
-                        UPDATE product_units
-                        SET purchase_price = ?, customs_price = ?
-                        WHERE id = ?
-                        """,
-                        (purchase, extra, int(in_stock["id"])),
-                    )
-                    if purchase > 0:
-                        conn.execute(
-                            "UPDATE products SET purchase_price = ? WHERE id = ?",
-                            (purchase, int(in_stock["product_id"])),
-                        )
                     skipped += 1
                     continue
             else:
@@ -2149,88 +2276,33 @@ def _import_z_register_rows(
                 ).fetchone()
                 if existing_any and not has_sale:
                     # Return / re-accept: same IMEI was sold, Excel shows it back in stock.
-                    # Правило: IMEI уже был в истории → телефон Б/У (склад Б/У, condition used).
+                    # Склад и condition — строго по листу Excel (партнёрство остаётся партнёрством).
                     unit_id = int(existing_any["id"])
-                    old_wh = int(existing_any["warehouse_id"] or warehouse_id)
-                    old_status = (existing_any["status"] or "").strip()
-                    target_wh = bu_wh
-                    ret_condition = "used"
-                    # Ensure product card matches current Excel attrs (color/memory may change).
-                    existing_prod = conn.execute(
-                        """
-                        SELECT id FROM products
-                        WHERE category = 'phone' AND LOWER(TRIM(name)) = LOWER(TRIM(?))
-                          AND LOWER(TRIM(COALESCE(model, ''))) = LOWER(TRIM(?))
-                          AND LOWER(TRIM(COALESCE(memory, ''))) = LOWER(TRIM(?))
-                          AND LOWER(TRIM(COALESCE(color, ''))) = LOWER(TRIM(?))
-                          AND condition = ?
-                        LIMIT 1
-                        """,
-                        (name, name, memory, color, ret_condition),
-                    ).fetchone()
-                    if existing_prod:
-                        product_id = int(existing_prod["id"])
-                        conn.execute(
-                            "UPDATE products SET purchase_price = ?, condition = ? WHERE id = ?",
-                            (purchase, ret_condition, product_id),
-                        )
-                    else:
-                        cur = conn.execute(
-                            """
-                            INSERT INTO products
-                            (name, category, ownership_type, supplier_name, brand, sku, barcode,
-                             purchase_price, sale_price, stock, min_stock, created_at,
-                             model, color, size, memory, ram, customs_cleared, customs_price, specs_extra,
-                             condition, track_units, image_url)
-                            VALUES (?, 'phone', 'own', '', '', '', '', ?, ?, 0, 0, ?,
-                                    ?, ?, '', ?, '', 0, 0, '', ?, 1, '')
-                            """,
-                            (name, purchase, round(purchase * 1.15, 2), utc_now(), name, color, memory, ret_condition),
-                        )
-                        product_id = int(cur.lastrowid)
+                    product_id = resolve_sheet_product(
+                        name=name,
+                        memory=memory,
+                        color=color,
+                        purchase=purchase,
+                        sale_price=None,
+                    )
                     unit_notes = (row["comments"] or "").strip()
                     unit_notes = (
-                        f"Z-импорт возврат → Б/У: {unit_notes}" if unit_notes else "Z-импорт возврат → Б/У (IMEI в истории)"
+                        f"Z-импорт возврат: {unit_notes}" if unit_notes else "Z-импорт возврат Excel"
                     )
-                    conn.execute(
-                        """
-                        UPDATE product_units
-                        SET status = 'in_stock', sale_id = NULL, product_id = ?, warehouse_id = ?,
-                            purchase_price = ?, customs_price = ?, battery_capacity = ?,
-                            client_name = ?, region = ?, arrival_date = ?, notes = ?,
-                            serial = COALESCE(NULLIF(serial, ''), ?)
-                        WHERE id = ?
-                        """,
-                        (
-                            product_id,
-                            target_wh,
-                            purchase,
-                            extra,
-                            row["battery"],
-                            row["comments"] or "",
-                            row["region"] or "",
-                            (row["arrival_date"] or "")[:10],
-                            unit_notes,
-                            imei,
-                            unit_id,
-                        ),
+                    bind_unit_to_sheet(
+                        unit_id,
+                        product_id=product_id,
+                        purchase=purchase,
+                        extra=extra,
+                        row=row,
+                        imei=imei,
+                        notes=unit_notes,
                     )
-                    if old_status != "in_stock":
-                        adjust_warehouse_stock(
-                            conn,
-                            target_wh,
-                            product_id,
-                            1,
-                            "inbound",
-                            notes=f"Z-импорт возврат IMEI {imei} → Б/У: {name}",
-                        )
-                        if old_wh != target_wh or int(existing_any["product_id"]) != product_id:
-                            sync_product_stock(conn, int(existing_any["product_id"]))
-                        sync_product_stock(conn, product_id)
                     created_units += 1
                     continue
                 if existing_any and has_sale:
                     # Same IMEI sold again in Excel = return + resale (or duplicate of same sale).
+                    # Склад продажи = лист Excel, без принудительного Б/У.
                     already = conn.execute(
                         """
                         SELECT s.id
@@ -2238,104 +2310,39 @@ def _import_z_register_rows(
                         JOIN sale_items si ON si.sale_id = s.id
                         JOIN sale_item_units siu ON siu.sale_item_id = si.id
                         WHERE siu.imei = ?
+                          AND s.warehouse_id = ?
                           AND substr(s.created_at, 1, 10) = ?
                           AND ABS(COALESCE(s.total, 0) - ?) < 0.02
                         LIMIT 1
                         """,
-                        (imei, str(sale_date)[:10], float(sale_price)),
+                        (imei, warehouse_id, str(sale_date)[:10], float(sale_price)),
                     ).fetchone()
                     if already:
                         skipped += 1
                         continue
-                    # Правило: IMEI уже был в истории → продаём как Б/У (склад Б/У, condition used).
                     unit_id = int(existing_any["id"])
-                    old_wh = int(existing_any["warehouse_id"] or warehouse_id)
-                    old_status = (existing_any["status"] or "").strip()
-                    target_wh = bu_wh
-                    sale_wh_for_row = bu_wh
-                    ret_condition = "used"
-                    existing_prod = conn.execute(
-                        """
-                        SELECT id FROM products
-                        WHERE category = 'phone' AND LOWER(TRIM(name)) = LOWER(TRIM(?))
-                          AND LOWER(TRIM(COALESCE(model, ''))) = LOWER(TRIM(?))
-                          AND LOWER(TRIM(COALESCE(memory, ''))) = LOWER(TRIM(?))
-                          AND LOWER(TRIM(COALESCE(color, ''))) = LOWER(TRIM(?))
-                          AND condition = ?
-                        LIMIT 1
-                        """,
-                        (name, name, memory, color, ret_condition),
-                    ).fetchone()
-                    if existing_prod:
-                        product_id = int(existing_prod["id"])
-                        conn.execute(
-                            "UPDATE products SET purchase_price = ?, sale_price = COALESCE(?, sale_price), condition = ? WHERE id = ?",
-                            (purchase, sale_price, ret_condition, product_id),
-                        )
-                    else:
-                        cur = conn.execute(
-                            """
-                            INSERT INTO products
-                            (name, category, ownership_type, supplier_name, brand, sku, barcode,
-                             purchase_price, sale_price, stock, min_stock, created_at,
-                             model, color, size, memory, ram, customs_cleared, customs_price, specs_extra,
-                             condition, track_units, image_url)
-                            VALUES (?, 'phone', 'own', '', '', '', '', ?, ?, 0, 0, ?,
-                                    ?, ?, '', ?, '', 0, 0, '', ?, 1, '')
-                            """,
-                            (
-                                name,
-                                purchase,
-                                float(sale_price) if sale_price else round(purchase * 1.15, 2),
-                                utc_now(),
-                                name,
-                                color,
-                                memory,
-                                ret_condition,
-                            ),
-                        )
-                        product_id = int(cur.lastrowid)
+                    product_id = resolve_sheet_product(
+                        name=name,
+                        memory=memory,
+                        color=color,
+                        purchase=purchase,
+                        sale_price=sale_price,
+                    )
                     unit_notes = (row["comments"] or "").strip()
                     unit_notes = (
-                        f"Z-импорт возврат+продажа → Б/У: {unit_notes}"
+                        f"Z-импорт возврат+продажа: {unit_notes}"
                         if unit_notes
-                        else "Z-импорт возврат+продажа → Б/У (IMEI в истории)"
+                        else "Z-импорт возврат+продажа Excel"
                     )
-                    conn.execute(
-                        """
-                        UPDATE product_units
-                        SET status = 'in_stock', sale_id = NULL, product_id = ?, warehouse_id = ?,
-                            purchase_price = ?, customs_price = ?, battery_capacity = ?,
-                            client_name = ?, region = ?, arrival_date = ?, notes = ?,
-                            serial = COALESCE(NULLIF(serial, ''), ?)
-                        WHERE id = ?
-                        """,
-                        (
-                            product_id,
-                            target_wh,
-                            purchase,
-                            extra,
-                            row["battery"],
-                            row["comments"] or "",
-                            row["region"] or "",
-                            (row["arrival_date"] or "")[:10],
-                            unit_notes,
-                            imei,
-                            unit_id,
-                        ),
+                    bind_unit_to_sheet(
+                        unit_id,
+                        product_id=product_id,
+                        purchase=purchase,
+                        extra=extra,
+                        row=row,
+                        imei=imei,
+                        notes=unit_notes,
                     )
-                    if old_status != "in_stock":
-                        adjust_warehouse_stock(
-                            conn,
-                            target_wh,
-                            product_id,
-                            1,
-                            "inbound",
-                            notes=f"Z-импорт возврат IMEI {imei} → Б/У перед повторной продажей",
-                        )
-                        if old_wh != target_wh or int(existing_any["product_id"]) != product_id:
-                            sync_product_stock(conn, int(existing_any["product_id"]))
-                        sync_product_stock(conn, product_id)
                     reuse_unit = conn.execute(
                         "SELECT id, product_id FROM product_units WHERE id = ?",
                         (unit_id,),
@@ -2350,17 +2357,28 @@ def _import_z_register_rows(
                 (serial,),
             ).fetchone()
             if by_serial:
+                product_id = resolve_sheet_product(
+                    name=name,
+                    memory=memory,
+                    color=color,
+                    purchase=purchase,
+                    sale_price=sale_price,
+                )
+                bind_unit_to_sheet(
+                    int(by_serial["id"]),
+                    product_id=product_id,
+                    purchase=purchase,
+                    extra=extra,
+                    row=row,
+                    imei=serial,
+                    notes=(row["comments"] or "").strip() or "Z-импорт Excel",
+                )
                 if has_sale:
-                    reuse_unit = by_serial
+                    reuse_unit = conn.execute(
+                        "SELECT id, product_id FROM product_units WHERE id = ?",
+                        (int(by_serial["id"]),),
+                    ).fetchone()
                 else:
-                    conn.execute(
-                        """
-                        UPDATE product_units
-                        SET purchase_price = ?, customs_price = ?
-                        WHERE id = ?
-                        """,
-                        (purchase, extra, int(by_serial["id"])),
-                    )
                     skipped += 1
                     continue
 
@@ -2372,43 +2390,21 @@ def _import_z_register_rows(
                 (purchase, sale_price, product_id),
             )
             conn.execute(
-                "UPDATE product_units SET purchase_price = ?, customs_price = ? WHERE id = ?",
-                (purchase, extra, unit_id),
+                """
+                UPDATE product_units
+                SET purchase_price = ?, customs_price = ?, warehouse_id = ?, product_id = ?
+                WHERE id = ?
+                """,
+                (purchase, extra, warehouse_id, product_id, unit_id),
             )
         else:
-            existing = conn.execute(
-                """
-                SELECT id FROM products
-                WHERE category = 'phone' AND LOWER(TRIM(name)) = LOWER(TRIM(?))
-                  AND LOWER(TRIM(COALESCE(model, ''))) = LOWER(TRIM(?))
-                  AND LOWER(TRIM(COALESCE(memory, ''))) = LOWER(TRIM(?))
-                  AND LOWER(TRIM(COALESCE(color, ''))) = LOWER(TRIM(?))
-                  AND condition = ?
-                LIMIT 1
-                """,
-                (name, name, memory, color, condition),
-            ).fetchone()
-            if existing:
-                product_id = int(existing["id"])
-                conn.execute(
-                    "UPDATE products SET purchase_price = ?, sale_price = COALESCE(?, sale_price), condition = ? WHERE id = ?",
-                    (purchase, sale_price, condition, product_id),
-                )
-            else:
-                sp = sale_price if sale_price and sale_price > 0 else round(purchase * 1.15, 2)
-                cur = conn.execute(
-                    """
-                    INSERT INTO products
-                    (name, category, ownership_type, supplier_name, brand, sku, barcode,
-                     purchase_price, sale_price, stock, min_stock, created_at,
-                     model, color, size, memory, ram, customs_cleared, customs_price, specs_extra,
-                     condition, track_units, image_url)
-                    VALUES (?, 'phone', 'own', '', '', '', '', ?, ?, 0, 0, ?,
-                            ?, ?, '', ?, '', 0, 0, '', ?, 1, '')
-                    """,
-                    (name, purchase, sp, utc_now(), name, color, memory, condition),
-                )
-                product_id = int(cur.lastrowid)
+            product_id = resolve_sheet_product(
+                name=name,
+                memory=memory,
+                color=color,
+                purchase=purchase,
+                sale_price=sale_price,
+            )
 
             unit_notes = (row["comments"] or "").strip()
             unit_notes = f"Z-импорт: {unit_notes}" if unit_notes else "Z-импорт Excel"
@@ -2443,7 +2439,6 @@ def _import_z_register_rows(
                 sale_price=float(sale_price),
                 sale_date=sale_date,
                 profit=profit,
-                sale_warehouse_id=sale_wh_for_row,
             )
 
     return {
@@ -3126,47 +3121,55 @@ def _z_register_lines(
     year: int | None = None,
     month: int | None = None,
 ) -> dict[str, Any]:
-    condition_clause = _z_register_condition_clause(conn, warehouse_id)
-    rows = conn.execute(
-        f"""
+    """Строки Z-отчёта склада.
+
+    Продажи — строго по sales.warehouse_id (лист Excel / склад продажи).
+    Один IMEI может быть продан с партнёрства и с Б/У в разные циклы:
+    каждая продажа остаётся на своём складе; чужой склад не трогаем.
+    Остатки — по текущему warehouse_id единицы и её себестоимости из Excel
+    (не из старой продажи), иначе после возврата остаток «плывёт».
+    Фильтр condition не применяем: склады раздельные, а карточка товара
+    после смены листа может ещё быть partnership/used — иначе теряем строки.
+    """
+    stock_rows = conn.execute(
+        """
         SELECT u.id AS unit_id, u.arrival_date, u.imei, u.serial, u.battery_capacity,
                u.client_name, u.region, u.customs_price AS extra_cost, u.status, u.notes,
                u.purchase_price AS unit_purchase_price,
                p.name AS product_name, p.model, p.memory, p.color,
-               p.purchase_price AS product_purchase_price, p.condition,
-               si.subtotal AS sale_price, si.shop_profit, si.purchase_price AS item_purchase_price,
-               s.created_at AS sale_date, s.id AS sale_id
+               p.purchase_price AS product_purchase_price, p.condition
         FROM product_units u
         JOIN products p ON p.id = u.product_id
-        LEFT JOIN sale_item_units siu ON siu.unit_id = u.id
-        LEFT JOIN sale_items si ON si.id = siu.sale_item_id
-        LEFT JOIN sales s ON s.id = si.sale_id AND s.status = 'completed'
-        WHERE u.warehouse_id = ?{condition_clause}
+        WHERE u.warehouse_id = ? AND u.status = 'in_stock'
         ORDER BY COALESCE(u.arrival_date, u.created_at), p.name, u.id
         """,
         (warehouse_id,),
     ).fetchall()
-    all_lines: list[dict[str, Any]] = []
-    sold_period: list[dict[str, Any]] = []
-    stock_lines: list[dict[str, Any]] = []
-    period_profit = period_revenue = 0.0
-    period_count = 0
 
-    for r in rows:
-        d = row_to_dict(r) or {}
+    sold_rows = conn.execute(
+        """
+        SELECT u.id AS unit_id, u.arrival_date, u.imei, u.serial, u.battery_capacity,
+               u.client_name, u.region,
+               COALESCE(siu.customs_price, u.customs_price, 0) AS extra_cost,
+               'sold' AS status, COALESCE(s.notes, u.notes) AS notes,
+               COALESCE(si.purchase_price, u.purchase_price) AS unit_purchase_price,
+               p.name AS product_name, p.model, p.memory, p.color,
+               p.purchase_price AS product_purchase_price, p.condition,
+               si.subtotal AS sale_price, si.shop_profit, si.purchase_price AS item_purchase_price,
+               s.created_at AS sale_date, s.id AS sale_id
+        FROM sales s
+        JOIN sale_items si ON si.sale_id = s.id
+        JOIN sale_item_units siu ON siu.sale_item_id = si.id
+        JOIN product_units u ON u.id = siu.unit_id
+        JOIN products p ON p.id = COALESCE(si.product_id, u.product_id)
+        WHERE s.status = 'completed' AND s.warehouse_id = ?
+        ORDER BY s.created_at, p.name, u.id
+        """,
+        (warehouse_id,),
+    ).fetchall()
+
+    def _build_line(d: dict[str, Any], *, has_sale: bool) -> dict[str, Any]:
         sd = d.get("sale_date") or ""
-        in_period = False
-        if year and month and sd:
-            try:
-                dt = datetime.strptime(sd[:10], "%Y-%m-%d")
-                in_period = dt.year == year and dt.month == month
-            except ValueError:
-                pass
-        elif year and month and not sd:
-            in_period = False
-        elif not year and not month:
-            in_period = bool(sd)
-
         product_purchase = unit_purchase_price(
             {"purchase_price": d.get("unit_purchase_price")},
             {"purchase_price": d.get("product_purchase_price")},
@@ -3177,8 +3180,8 @@ def _z_register_lines(
         sale_price = float(d.get("sale_price") or 0) if d.get("sale_price") else None
         shop_profit_raw = d.get("shop_profit")
         shop_profit = float(shop_profit_raw) if shop_profit_raw is not None else None
-        display_purchase = item_purchase if sd and item_purchase is not None else product_purchase
-        line = {
+        display_purchase = item_purchase if has_sale and item_purchase is not None else product_purchase
+        return {
             "arrival_date": (d.get("arrival_date") or "")[:10] or "—",
             "product_name": d.get("product_name") or "",
             "condition": d.get("condition") or "",
@@ -3192,7 +3195,7 @@ def _z_register_lines(
             "sale_date": sd[:10] if sd else "",
             "profit": _unit_line_profit(
                 shop_profit=shop_profit,
-                has_sale=bool(sd),
+                has_sale=has_sale,
                 sale_price=sale_price,
                 item_purchase_price=item_purchase,
                 product_purchase_price=product_purchase,
@@ -3202,15 +3205,37 @@ def _z_register_lines(
             "battery": d.get("battery_capacity"),
             "status": d.get("status") or "",
         }
-        all_lines.append(line)
-        if d.get("status") == "in_stock":
-            stock_lines.append(line)
+
+    stock_lines: list[dict[str, Any]] = []
+    for r in stock_rows:
+        d = row_to_dict(r) or {}
+        stock_lines.append(_build_line(d, has_sale=False))
+
+    sold_period: list[dict[str, Any]] = []
+    period_profit = period_revenue = 0.0
+    period_count = 0
+    all_sold_lines: list[dict[str, Any]] = []
+    for r in sold_rows:
+        d = row_to_dict(r) or {}
+        sd = d.get("sale_date") or ""
+        line = _build_line(d, has_sale=True)
+        all_sold_lines.append(line)
+        in_period = False
+        if year and month and sd:
+            try:
+                dt = datetime.strptime(sd[:10], "%Y-%m-%d")
+                in_period = dt.year == year and dt.month == month
+            except ValueError:
+                pass
+        elif not year and not month:
+            in_period = bool(sd)
         if in_period and sd:
             sold_period.append(line)
             period_profit += float(line["profit"] or 0)
             period_revenue += float(line["sale_price"] or 0)
             period_count += 1
 
+    all_lines = list(stock_lines) + list(all_sold_lines)
     month_names = ["", "январь", "февраль", "март", "апрель", "май", "июнь",
                    "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь"]
     period_label = f"{month_names[month]} {year}" if year and month else "Все данные"
@@ -4106,28 +4131,9 @@ def sale_return_target_warehouse(
 ) -> tuple[int, bool]:
     """Куда вернуть товар при отмене продажи.
 
-    Партнёрская продажа → склад Б/У (не обратно в партнёрство).
-    Остальное → исходный склад продажи.
+    Всегда на исходный склад продажи (партнёрство остаётся партнёрством и т.д.).
     """
     sale_wh = int(sale_warehouse_id or get_default_warehouse_id(conn))
-    partnership = is_partnership_warehouse(conn, sale_wh)
-    if not partnership:
-        row = conn.execute(
-            f"""
-            SELECT 1
-            FROM product_units u
-            JOIN warehouses w ON w.id = u.warehouse_id
-            LEFT JOIN products p ON p.id = u.product_id
-            WHERE u.sale_id = ?
-              AND ({_partnership_warehouse_clause("w.name")}
-                   OR COALESCE(p.condition, '') = 'partnership')
-            LIMIT 1
-            """,
-            (sale_id,),
-        ).fetchone()
-        partnership = bool(row)
-    if partnership:
-        return resolve_bu_warehouse_id(conn), True
     return sale_wh, False
 
 
@@ -4193,57 +4199,6 @@ def find_or_create_used_product_for_return(
     return int(cur.lastrowid)
 
 
-def imei_seen_in_history(conn: sqlite3.Connection, imei: str) -> bool:
-    """IMEI уже встречался в системе (принимали/продавали раньше) → устройство Б/У.
-
-    Если этот IMEI хоть раз был в product_units или в чеках (sale_item_units),
-    значит телефон уже проходил через магазин — при повторном приёме он Б/У.
-    """
-    imei = (imei or "").strip()
-    if not imei or imei.lower() in ("id", "none", "n/a"):
-        return False
-    row = conn.execute(
-        "SELECT 1 FROM product_units WHERE TRIM(imei) = ? AND TRIM(imei) != '' LIMIT 1",
-        (imei,),
-    ).fetchone()
-    if row:
-        return True
-    if _table_exists(conn, "sale_item_units"):
-        row = conn.execute(
-            "SELECT 1 FROM sale_item_units WHERE TRIM(imei) = ? AND TRIM(imei) != '' LIMIT 1",
-            (imei,),
-        ).fetchone()
-    return bool(row)
-
-
-def route_used_imei_on_receipt(
-    conn: sqlite3.Connection,
-    *,
-    product: sqlite3.Row,
-    imei: str,
-    default_warehouse_id: int,
-    purchase_price: float | None = None,
-) -> tuple[int, int, bool]:
-    """Маршрутизация при приёме единицы с IMEI.
-
-    Правило: если IMEI уже есть в истории — телефон Б/У. Возвращаем склад Б/У и
-    карточку used (валюту/цену не конвертируем — Б/У мультивалютный).
-    Возвращает (warehouse_id, product_id, is_used_override).
-    """
-    if not imei_seen_in_history(conn, imei):
-        return int(default_warehouse_id), int(product["id"]), False
-    try:
-        bu_wh = resolve_bu_warehouse_id(conn)
-    except HTTPException:
-        return int(default_warehouse_id), int(product["id"]), False
-    price = float(
-        purchase_price if purchase_price and purchase_price > 0
-        else (product["purchase_price"] or 0)
-    )
-    used_pid = find_or_create_used_product_for_return(conn, product, price)
-    return int(bu_wh), int(used_pid), True
-
-
 def restore_units_for_sale(
     conn: sqlite3.Connection,
     sale_id: int,
@@ -4290,7 +4245,7 @@ def restore_units_for_sale(
 
         note_extra = ""
         if to_bu:
-            note_extra = "Возврат партнёрства → Б/У"
+            note_extra = "Возврат на склад продажи"
         old_notes = (unit["notes"] or "").strip() if "notes" in unit.keys() else ""
         if note_extra and note_extra not in old_notes:
             new_notes = f"{old_notes}; {note_extra}".strip("; ").strip()
@@ -5618,7 +5573,7 @@ async def web_manifest():
 async def health():
     return {
         "status": "ok",
-        "build": "imei-history-to-bu-v1",
+        "build": "z-sheet-sales-match-v2",
         "db": str(DB_PATH),
         "db_exists": DB_PATH.exists(),
     }
@@ -7381,16 +7336,8 @@ async def create_unit(body: UnitIn, x_pin: str | None = Header(default=None, ali
             ).fetchone()
             if dup:
                 raise HTTPException(status_code=400, detail="IMEI уже в системе")
-        # Правило: если IMEI уже был в истории — телефон Б/У (склад Б/У, карточка used).
         target_pid = body.product_id
         unit_note = body.notes
-        if imei:
-            wh, target_pid, is_used = route_used_imei_on_receipt(
-                conn, product=product, imei=imei,
-                default_warehouse_id=wh, purchase_price=body.purchase_price,
-            )
-            if is_used:
-                unit_note = (f"{body.notes}; " if body.notes else "") + "IMEI в истории → Б/У"
         cur = conn.execute(
             """
             INSERT INTO product_units
@@ -8766,17 +8713,7 @@ async def stock_inbound_receipt(body: InboundReceiptIn, x_pin: str | None = Head
             unit_extra = float(body.unit_extra_cost or 0)
             if unit_extra <= 0 and body.mode == "new" and body.product:
                 unit_extra = float(body.product.customs_price or 0)
-            # Правило: если IMEI уже был в истории — телефон Б/У (склад Б/У, карточка used).
             unit_note = body.notes or "Приход на склад"
-            if imei:
-                wh_id, product_id, is_used = route_used_imei_on_receipt(
-                    conn, product=product, imei=imei,
-                    default_warehouse_id=wh_id, purchase_price=unit_cost,
-                )
-                if is_used:
-                    cs = "none"
-                    unit_note = f"{unit_note}; IMEI в истории → Б/У"
-                    product = conn.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
             cur_u = conn.execute(
                 """
                 INSERT INTO product_units
@@ -9859,10 +9796,10 @@ async def void_sale(sale_id: int, x_pin: str | None = Header(default=None, alias
         restored = restore_units_for_sale(
             conn,
             sale_id,
-            return_warehouse_id=target_wh if to_bu else None,
-            to_bu=to_bu,
+            return_warehouse_id=target_wh,
+            to_bu=False,
         )
-        # Единицы по IMEI — на целевой склад (партнёрство → Б/У), не обратно в партнёрство.
+        # Единицы по IMEI — обратно на склад продажи (склад не меняем).
         for ru in restored:
             adjust_warehouse_stock(
                 conn,
@@ -9871,11 +9808,7 @@ async def void_sale(sale_id: int, x_pin: str | None = Header(default=None, alias
                 1,
                 "void",
                 reference_id=sale_id,
-                notes=(
-                    f"Возврат партнёрства → Б/У, продажа #{sale_id}"
-                    if to_bu
-                    else f"Возврат продажи #{sale_id}"
-                ),
+                notes=f"Возврат продажи #{sale_id}",
             )
         # Позиции без серийников (аксессуары и т.п.) — на склад продажи.
         for item in conn.execute("SELECT * FROM sale_items WHERE sale_id = ?", (sale_id,)).fetchall():
@@ -9900,9 +9833,7 @@ async def void_sale(sale_id: int, x_pin: str | None = Header(default=None, alias
                 notes=f"Возврат продажи #{sale_id}",
             )
         _close_receivables_for_return(conn, sale_id, now)
-        note_suffix = (
-            f" [Возврат {now[:10]} → Б/У]" if to_bu else f" [Возврат {now[:10]}]"
-        )
+        note_suffix = f" [Возврат {now[:10]}]"
         conn.execute(
             """
             UPDATE sales
@@ -10042,19 +9973,8 @@ async def create_trade_in(body: TradeInIn, x_pin: str | None = Header(default=No
         )
         received_product_id = recv_cur.lastrowid
 
-        # Правило: если IMEI принятого телефона уже был в истории — он Б/У (склад Б/У, карточка used).
         recv_imei = body.received_imei.strip()
         recv_note = "Trade-in"
-        if recv_imei:
-            recv_product_row = conn.execute(
-                "SELECT * FROM products WHERE id = ?", (received_product_id,)
-            ).fetchone()
-            received_wh, received_product_id, is_used = route_used_imei_on_receipt(
-                conn, product=recv_product_row, imei=recv_imei,
-                default_warehouse_id=received_wh, purchase_price=body.received_purchase_price,
-            )
-            if is_used:
-                recv_note = "Trade-in; IMEI в истории → Б/У"
 
         if recv_imei or body.received_serial.strip():
             conn.execute(

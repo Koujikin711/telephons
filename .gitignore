@@ -10,3 +10,10 @@ node_modules
 *.session
 
 demo-desktop/runtime/.venv
+
+AGENTS.md
+.cursor/
+.claude/
+*.session
+.env
+.env.local

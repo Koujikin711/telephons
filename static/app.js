@@ -2864,7 +2864,7 @@ window.showSale = async (id) => {
 };
 
 window.returnSale = async (id) => {
-  if (!confirm("Оформить возврат? Телефон с партнёрства вернётся на Б/У (по IMEI), остальные — на свой склад. Долг клиента закроется.")) return;
+  if (!confirm("Оформить возврат? Товар вернётся на тот же склад, с которого продали. Долг клиента закроется.")) return;
   try {
     const res = await api(`/api/sales/${id}/void`, { method: "POST" });
     document.getElementById("sale-detail-modal")?.close();
