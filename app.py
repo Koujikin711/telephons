@@ -4886,8 +4886,12 @@ def _period_cash_by_currency(
                 continue
             add(cur, "+", r["amt"], wcode)
 
-    exp_clause, exp_params, _ = _report_period_clause(period, date_from, date_to, "expense_date")
-    if period != "all" and not date_from and not date_to and not exp_params:
+    # expense_date хранится как YYYY-MM-DD — нельзя сравнивать с datetime opened_at,
+    # иначе все расходы дня отсекаются (минусы «не считаются»).
+    exp_from = (date_from or "")[:10]
+    exp_to = (date_to or "")[:10]
+    exp_clause, exp_params, _ = _report_period_clause(period, exp_from, exp_to, "expense_date")
+    if period != "all" and not exp_from and not exp_to and not exp_params:
         exp_clause = " AND expense_date >= ?"
         exp_params = [period_start(period)[:10]]
     exp_sql = f"""
@@ -5573,7 +5577,7 @@ async def web_manifest():
 async def health():
     return {
         "status": "ok",
-        "build": "shift-move-plus-minus-v1",
+        "build": "shift-move-plus-minus-v2",
         "db": str(DB_PATH),
         "db_exists": DB_PATH.exists(),
     }
@@ -6580,9 +6584,11 @@ def shift_expected_wallets(conn: sqlite3.Connection, shift: sqlite3.Row) -> list
             "expected": float(w.get("amount") or 0),
         }
     opened_at = (shift["opened_at"] or "")[:19]
-    day = utc_now()[:10]
+    day = (opened_at or utc_now())[:10]
+    # Движение за календарный день смены (как KPI кассы): иначе expense_date
+    # не попадает в фильтр opened_at с временем.
     period = _period_cash_by_currency(
-        conn, "all", date_from=opened_at or day, date_to=day,
+        conn, "all", date_from=day, date_to=day,
     )
     for bal in period.get("balances") or []:
         code = bal.get("code") or ""
