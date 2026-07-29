@@ -731,7 +731,12 @@ function fillWarehouseSelect(el, selectedId, { empty = false, emptyLabel = "— 
 }
 
 async function api(path, opts = {}) {
-  const headers = { "Content-Type": "application/json", ...(opts.headers || {}) };
+  const headers = { ...(opts.headers || {}) };
+  // Only set JSON Content-Type when there is a body — bare DELETE/GET with
+  // application/json confuses some clients and produced opaque 422s.
+  if (opts.body != null && headers["Content-Type"] == null) {
+    headers["Content-Type"] = "application/json";
+  }
   if (pin) headers["X-Pin"] = pin;
   const res = await fetch(path, { ...opts, headers });
   if (res.status === 401) {
@@ -750,7 +755,14 @@ async function api(path, opts = {}) {
     }
     throw new Error(typeof detail === "string" && detail ? detail : `Ошибка ${res.status}`);
   }
-  return res.json();
+  if (res.status === 204) return null;
+  const text = await res.text();
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
 }
 
 function toast(msg, type = "success") {
@@ -5530,21 +5542,36 @@ async function loadSettingsPage() {
     if (!eff || eff.startsWith(":") || eff.length < 10) continue;
     latestIdByCode[code] = r.id;
   }
-  document.getElementById("rates-tbody").innerHTML = (data.exchange_rates || []).map((r) => {
+  const ratesTbody = document.getElementById("rates-tbody");
+  ratesTbody.innerHTML = (data.exchange_rates || []).map((r) => {
     const code = String(r.currency_code || "").toUpperCase();
     const eff = String(r.effective_at || "");
+    const rid = Number(r.id);
     const isJunk = !eff || eff.startsWith(":") || eff.length < 10;
     const isCurrent = !isJunk && latestIdByCode[code] === r.id && code !== String(data.currency?.code || "TJS").toUpperCase();
+    const delBtn = Number.isFinite(rid) && rid > 0
+      ? `<button type="button" class="btn btn-danger btn-sm btn-del-rate" data-rate-id="${rid}" title="Удалить">✕</button>`
+      : "";
     return `<tr>
       <td>${esc(r.currency_code)}${isCurrent ? ' <span class="tag tag-own" style="font-size:.65rem">текущий</span>' : ""}${isJunk ? ' <span class="hint">(битая дата)</span>' : ""}</td>
       <td>${r.rate}</td>
       <td>${esc(r.effective_at || "—")}</td>
       <td style="white-space:nowrap">
         ${esc(r.notes || "")}
-        <button type="button" class="btn btn-danger btn-sm" onclick="deleteExchangeRate(${r.id})" title="Удалить">✕</button>
+        ${delBtn}
       </td>
     </tr>`;
   }).join("") || '<tr><td colspan="4">Нет курсов</td></tr>';
+  if (!ratesTbody.dataset.delBound) {
+    ratesTbody.dataset.delBound = "1";
+    ratesTbody.addEventListener("click", (ev) => {
+      const btn = ev.target.closest(".btn-del-rate");
+      if (!btn) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      deleteExchangeRate(btn.dataset.rateId);
+    });
+  }
   // default «действует с» = сейчас (локально), чтобы не ставили старый год по ошибке
   const effInput = document.getElementById("rate-effective");
   if (effInput && !effInput.value) {
@@ -5611,9 +5638,14 @@ async function saveExpenseAllocation(e) {
 }
 
 window.deleteExchangeRate = async (id) => {
+  const rateId = Number(id);
+  if (!Number.isFinite(rateId) || rateId <= 0) {
+    toast("Не удалось определить курс. Обновите страницу (Ctrl+F5).", "error");
+    return;
+  }
   if (!confirm("Удалить этот курс?")) return;
   try {
-    await api(`/api/settings/exchange-rates/${id}`, { method: "DELETE" });
+    await api(`/api/settings/exchange-rates/${rateId}`, { method: "DELETE" });
     toast("Курс удалён");
     loadSettingsPage();
   } catch (err) {

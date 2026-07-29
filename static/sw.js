@@ -1,4 +1,4 @@
-const CACHE = "telestore-v31";
+const CACHE = "telestore-v32";
 const ASSETS = ["/", "/static/style.css", "/static/app.js", "/manifest.webmanifest"];
 
 self.addEventListener("install", (e) => {

@@ -5597,7 +5597,7 @@ async def web_manifest():
 async def health():
     return {
         "status": "ok",
-        "build": "exchange-rate-add-fix-v1",
+        "build": "exchange-rate-delete-fix-v1",
         "db": str(DB_PATH),
         "db_exists": DB_PATH.exists(),
     }
@@ -5694,13 +5694,19 @@ async def add_exchange_rate(body: ExchangeRateIn, x_pin: str | None = Header(def
 
 
 @app.delete("/api/settings/exchange-rates/{rate_id}")
-async def delete_exchange_rate(rate_id: int, x_pin: str | None = Header(default=None, alias="X-Pin")):
+async def delete_exchange_rate(rate_id: str, x_pin: str | None = Header(default=None, alias="X-Pin")):
     check_pin(x_pin, min_role="owner")
+    try:
+        rid = int(str(rate_id).strip())
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Некорректный id курса — обновите страницу (Ctrl+F5)")
+    if rid <= 0:
+        raise HTTPException(status_code=400, detail="Некорректный id курса")
     with db() as conn:
-        row = conn.execute("SELECT * FROM exchange_rates WHERE id = ?", (rate_id,)).fetchone()
+        row = conn.execute("SELECT * FROM exchange_rates WHERE id = ?", (rid,)).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Курс не найден")
-        conn.execute("DELETE FROM exchange_rates WHERE id = ?", (rate_id,))
+        conn.execute("DELETE FROM exchange_rates WHERE id = ?", (rid,))
     return {"ok": True, "deleted": row_to_dict(row)}
 
 
