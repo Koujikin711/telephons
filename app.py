@@ -5573,7 +5573,7 @@ async def web_manifest():
 async def health():
     return {
         "status": "ok",
-        "build": "pos-sale-scroll-v1",
+        "build": "shift-move-plus-minus-v1",
         "db": str(DB_PATH),
         "db_exists": DB_PATH.exists(),
     }
@@ -6559,7 +6559,7 @@ def _parse_shift_wallets(raw: str | None) -> list[dict[str, Any]]:
 
 
 def shift_expected_wallets(conn: sqlite3.Connection, shift: sqlite3.Row) -> list[dict[str, Any]]:
-    """Ожидаемые остатки на конец смены: старт + движение за смену по кошелькам/валютам."""
+    """Ожидаемые остатки: старт + приход − расход за смену (не net!)."""
     opening = _parse_shift_wallets(shift["opening_wallets_json"] if "opening_wallets_json" in shift.keys() else "")
     bags: dict[tuple[str, str], dict[str, Any]] = {}
     for w in opening:
@@ -6574,6 +6574,8 @@ def shift_expected_wallets(conn: sqlite3.Connection, shift: sqlite3.Row) -> list
             "method_type": w.get("method_type") or "",
             "currency_code": cur,
             "opening": float(w.get("amount") or 0),
+            "inflow": 0.0,
+            "outflow": 0.0,
             "movement": 0.0,
             "expected": float(w.get("amount") or 0),
         }
@@ -6588,7 +6590,9 @@ def shift_expected_wallets(conn: sqlite3.Connection, shift: sqlite3.Row) -> list
         name = bal.get("name") or code
         for row in bal.get("by_currency") or []:
             cur = (row.get("code") or "TJS").strip().upper() or "TJS"
-            net = float(row.get("net") or 0)
+            inn = float(row.get("inflow") or 0)
+            out = float(row.get("outflow") or 0)
+            net = round(inn - out, 2)
             key = (code, cur)
             if key not in bags:
                 bags[key] = {
@@ -6597,10 +6601,14 @@ def shift_expected_wallets(conn: sqlite3.Connection, shift: sqlite3.Row) -> list
                     "method_type": mtype,
                     "currency_code": cur,
                     "opening": 0.0,
+                    "inflow": 0.0,
+                    "outflow": 0.0,
                     "movement": 0.0,
                     "expected": 0.0,
                 }
-            bags[key]["movement"] = round(net, 2)
+            bags[key]["inflow"] = round(inn, 2)
+            bags[key]["outflow"] = round(out, 2)
+            bags[key]["movement"] = net
             bags[key]["expected"] = round(float(bags[key]["opening"]) + net, 2)
             if not bags[key].get("method_type"):
                 bags[key]["method_type"] = mtype
@@ -6619,6 +6627,8 @@ def shift_expected_wallets(conn: sqlite3.Connection, shift: sqlite3.Row) -> list
                     "method_type": pm["method_type"],
                     "currency_code": cur,
                     "opening": 0.0,
+                    "inflow": 0.0,
+                    "outflow": 0.0,
                     "movement": 0.0,
                     "expected": 0.0,
                 }
@@ -6633,7 +6643,7 @@ def balances_from_shift_expected(
     conn: sqlite3.Connection,
     expected: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Формат кошельков кассы: старт смены + движение = то, что должно быть в ящике."""
+    """Кошельки кассы: остаток = старт + приход − расход. Старт НЕ входит в «+»."""
     grouped: dict[str, dict[str, Any]] = {}
     for row in expected:
         code = (row.get("method_code") or "").strip()
@@ -6641,8 +6651,16 @@ def balances_from_shift_expected(
             continue
         cur = (row.get("currency_code") or "TJS").strip().upper() or "TJS"
         opening = float(row.get("opening") or 0)
-        movement = float(row.get("movement") or 0)
-        expected_amt = float(row.get("expected") or (opening + movement))
+        inn = float(row.get("inflow") or 0)
+        out = float(row.get("outflow") or 0)
+        # backward compat if only net movement present
+        if inn == 0 and out == 0 and row.get("movement") is not None:
+            mov = float(row.get("movement") or 0)
+            if mov >= 0:
+                inn = mov
+            else:
+                out = abs(mov)
+        expected_amt = float(row.get("expected") if row.get("expected") is not None else (opening + inn - out))
         bag = grouped.get(code)
         if not bag:
             pm = get_payment_method(conn, code)
@@ -6659,11 +6677,11 @@ def balances_from_shift_expected(
             grouped[code] = bag
         bag["by_currency"].append({
             **currency_meta(cur),
-            "inflow": round(opening + max(movement, 0.0), 2),
-            "outflow": round(abs(min(movement, 0.0)), 2),
+            "inflow": round(inn, 2),
+            "outflow": round(out, 2),
             "net": round(expected_amt, 2),
             "opening": round(opening, 2),
-            "movement": round(movement, 2),
+            "movement": round(inn - out, 2),
         })
     order = {m["code"]: i for i, m in enumerate(list_payment_methods(conn, active_only=True))}
     result = list(grouped.values())
@@ -8386,7 +8404,7 @@ async def pos_cash_register(
             expected = shift_expected_wallets(conn, shift_row)
             drawer_balances = balances_from_shift_expected(conn, expected)
             balances_source = "shift"
-            balances_label = "Сейчас в кассе (старт смены + движение)"
+            balances_label = "Сейчас в кассе (старт + приход − расход)"
         till = till_summary_from_balances(drawer_balances)
         till_period = till_summary_from_balances(cash["balances"])
     return {

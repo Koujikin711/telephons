@@ -1768,12 +1768,13 @@ async function loadPosCashRegister() {
     const balHeading = document.getElementById("pos-balances-heading");
     if (balHeading) {
       balHeading.textContent = r.balances_label
-        || (r.shift ? "Сейчас в кассе (старт смены + движение)" : "Сейчас в кошельках (весь период)");
+        || (r.shift ? "Сейчас в кассе (старт + приход − расход)" : "Сейчас в кошельках (весь период)");
     }
     const balBox = document.getElementById("pos-balances");
     if (balBox) {
-      // При открытой смене balances уже = старт + движение; иначе весь период.
+      // При открытой смене balances = старт + приход − расход; иначе весь период.
       const wallets = r.balances || r.wallets_all_time || [];
+      const shiftOpen = !!r.shift;
       balBox.innerHTML = wallets.map((b) => {
         const bound = inferWalletCurrency(b);
         const mainCls = bound ? "wallet-amt" : "value value-multi";
@@ -1783,12 +1784,13 @@ async function loadPosCashRegister() {
         const openHint = openParts.length
           ? `<small class="hint">${esc(openParts.join(" · "))}</small>`
           : "";
+        const moveLabel = shiftOpen ? "движение" : "всего";
         return `
         <button type="button" class="pos-balance-row pos-balance-btn" data-method="${esc(b.code)}" title="Остаток в кассе — нажмите для деталей">
           <span>${esc(b.name)}${bound ? ` <small class="hint">(${bound === "USD" ? "$" : "смн"})</small>` : ""}</span>
           <strong class="${mainCls}">${formatWalletField(b, "net")}</strong>
           ${openHint}
-          <small>всего: +${formatWalletField(b, "inflow")} / −${formatWalletField(b, "outflow")}</small>
+          <small>${moveLabel}: +${formatWalletField(b, "inflow")} / −${formatWalletField(b, "outflow")}</small>
         </button>`;
       }).join("") || '<p class="muted">Нет данных</p>';
       balBox.querySelectorAll(".pos-balance-btn").forEach((btn) => {
