@@ -5573,7 +5573,7 @@ async def web_manifest():
 async def health():
     return {
         "status": "ok",
-        "build": "shift-close-cash-v1",
+        "build": "pos-sale-scroll-v1",
         "db": str(DB_PATH),
         "db_exists": DB_PATH.exists(),
     }

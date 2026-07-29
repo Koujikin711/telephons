@@ -709,6 +709,12 @@ body {
   flex: 1;
   min-height: 0;
 }
+/* Касса: чек + оплата (карта/наличка) должны прокручиваться, иначе кнопки обрезаются */
+.pos-col-sale > .pos-col-body {
+  overflow-y: auto;
+  overflow-x: hidden;
+  -webkit-overflow-scrolling: touch;
+}
 .pos-col-body > .form-stack,
 .pos-col-body > .segmented {
   flex-shrink: 0;
@@ -805,8 +811,11 @@ body {
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
-  flex: 1;
-  min-height: 200px;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding-bottom: 0.35rem;
 }
 .pos-cart-head {
   display: flex;
@@ -815,9 +824,9 @@ body {
   flex-shrink: 0;
 }
 .pos-col-sale .cart-items {
-  flex: 1 1 auto;
-  min-height: 6.5rem;
-  max-height: 280px;
+  flex: 0 1 auto;
+  min-height: 4rem;
+  max-height: min(220px, 28vh);
   overflow-y: auto;
   padding: 0;
 }
