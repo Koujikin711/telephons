@@ -5249,6 +5249,26 @@ class ExchangeRateIn(BaseModel):
     notes: str = ""
 
 
+def normalize_exchange_effective_at(raw: str | None) -> str:
+    """datetime-local / ручной ввод → 'YYYY-MM-DD HH:MM:SS'. Пустое/битое → сейчас."""
+    s = (raw or "").strip().replace("T", " ")
+    if not s or s in (":00", "00:00", "00:00:00"):
+        return utc_now()
+    # already full
+    if len(s) >= 19 and s[4] == "-" and s[7] == "-":
+        return s[:19]
+    # YYYY-MM-DD HH:MM
+    if len(s) >= 16 and s[4] == "-" and s[7] == "-":
+        return s[:16] + ":00"
+    # YYYY-MM-DD
+    if len(s) >= 10 and s[4] == "-" and s[7] == "-":
+        return s[:10] + " 00:00:00"
+    raise HTTPException(
+        status_code=400,
+        detail="Некорректная дата курса. Укажите «Действует с» или оставьте пустым (сейчас).",
+    )
+
+
 class PaymentMethodIn(BaseModel):
     code: str = Field(min_length=1, max_length=32)
     name: str = Field(min_length=1, max_length=100)
@@ -5577,7 +5597,7 @@ async def web_manifest():
 async def health():
     return {
         "status": "ok",
-        "build": "shift-move-plus-minus-v2",
+        "build": "exchange-rate-add-fix-v1",
         "db": str(DB_PATH),
         "db_exists": DB_PATH.exists(),
     }
@@ -5660,14 +5680,28 @@ async def update_currency(body: CurrencySettingsIn, x_pin: str | None = Header(d
 @app.post("/api/settings/exchange-rates")
 async def add_exchange_rate(body: ExchangeRateIn, x_pin: str | None = Header(default=None, alias="X-Pin")):
     check_pin(x_pin, min_role="owner")
-    when = body.effective_at or utc_now()
+    when = normalize_exchange_effective_at(body.effective_at)
+    code = (body.currency_code or "").strip().upper()
+    if len(code) != 3:
+        raise HTTPException(status_code=400, detail="Код валюты: 3 буквы, например USD")
     with db() as conn:
         cur = conn.execute(
             "INSERT INTO exchange_rates (currency_code, rate, effective_at, notes, created_at) VALUES (?, ?, ?, ?, ?)",
-            (body.currency_code.upper(), body.rate, when, body.notes, utc_now()),
+            (code, float(body.rate), when, (body.notes or "").strip(), utc_now()),
         )
         row = conn.execute("SELECT * FROM exchange_rates WHERE id = ?", (cur.lastrowid,)).fetchone()
     return row_to_dict(row)
+
+
+@app.delete("/api/settings/exchange-rates/{rate_id}")
+async def delete_exchange_rate(rate_id: int, x_pin: str | None = Header(default=None, alias="X-Pin")):
+    check_pin(x_pin, min_role="owner")
+    with db() as conn:
+        row = conn.execute("SELECT * FROM exchange_rates WHERE id = ?", (rate_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Курс не найден")
+        conn.execute("DELETE FROM exchange_rates WHERE id = ?", (rate_id,))
+    return {"ok": True, "deleted": row_to_dict(row)}
 
 
 @app.post("/api/settings/payment-methods")

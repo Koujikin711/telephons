@@ -711,7 +711,7 @@
               <form id="rate-form" class="form-stack card-body">
                 <label>Валюта<input id="rate-code" class="input" maxlength="3" placeholder="USD"></label>
                 <label>Курс к базовой<input type="number" id="rate-value" class="input" min="0" step="0.0001" required></label>
-                <p class="hint" style="margin:0">Например USD = 10.5 означает: 1 $ = 10.5 смн. Нужен для конвертации на кассе.</p>
+                <p class="hint" style="margin:0">Например USD = 9.3 означает: 1 $ = 9.3 смн. Дата «Действует с» — с какого момента курс активен (для кассы нужен курс с сегодняшней/будущей датой, не из прошлого года).</p>
                 <label>Действует с<input type="datetime-local" id="rate-effective" class="input"></label>
                 <label>Комментарий<input id="rate-notes" class="input"></label>
                 <button type="submit" class="btn btn-primary">Добавить курс</button>

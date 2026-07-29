@@ -742,7 +742,13 @@ async function api(path, opts = {}) {
   }
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    throw new Error(typeof err.detail === "string" ? err.detail : `Ошибка ${res.status}`);
+    let detail = err.detail;
+    if (Array.isArray(detail)) {
+      detail = detail.map((d) => d.msg || d.message || JSON.stringify(d)).join("; ");
+    } else if (detail && typeof detail === "object") {
+      detail = detail.msg || detail.message || JSON.stringify(detail);
+    }
+    throw new Error(typeof detail === "string" && detail ? detail : `Ошибка ${res.status}`);
   }
   return res.json();
 }
@@ -5416,14 +5422,36 @@ function bindSettings() {
   });
   document.getElementById("rate-form")?.addEventListener("submit", async (e) => {
     e.preventDefault();
+    const code = document.getElementById("rate-code").value.trim().toUpperCase();
+    const rateRaw = String(document.getElementById("rate-value").value || "").replace(",", ".");
+    const rate = +rateRaw;
+    const effEl = document.getElementById("rate-effective");
+    let effective_at = (effEl?.value || "").trim();
+    if (effective_at) {
+      // datetime-local: 2026-07-29T15:00 or …:00:00
+      effective_at = effective_at.replace("T", " ");
+      if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(effective_at)) effective_at += ":00";
+    } else {
+      effective_at = ""; // backend → сейчас
+    }
+    if (!/^[A-Z]{3}$/.test(code)) {
+      toast("Код валюты: 3 буквы, например USD", "error");
+      return;
+    }
+    if (!(rate > 0)) {
+      toast("Укажите курс числом больше 0 (например 9.3)", "error");
+      return;
+    }
     try {
-      await api("/api/settings/exchange-rates", { method: "POST", body: JSON.stringify({
-        currency_code: document.getElementById("rate-code").value.trim(),
-        rate: +document.getElementById("rate-value").value,
-        effective_at: document.getElementById("rate-effective").value.replace("T", " ") + ":00",
+      const saved = await api("/api/settings/exchange-rates", { method: "POST", body: JSON.stringify({
+        currency_code: code,
+        rate,
+        effective_at,
         notes: document.getElementById("rate-notes").value,
       }) });
-      toast("Курс добавлен");
+      toast(`Курс добавлен: 1 ${saved.currency_code} = ${saved.rate} с ${saved.effective_at}`);
+      document.getElementById("rate-value").value = "";
+      document.getElementById("rate-notes").value = "";
       loadSettingsPage();
     } catch (err) { toast(err.message, "error"); }
   });
@@ -5485,16 +5513,47 @@ async function loadSettingsPage() {
   const rateMap = { [(data.currency?.code || "TJS").toUpperCase()]: 1 };
   for (const r of data.exchange_rates || []) {
     const code = String(r.currency_code || "").toUpperCase();
+    const eff = String(r.effective_at || "");
     if (!code || rateMap[code] != null) continue; // first = latest (DESC)
+    if (!eff || eff.startsWith(":") || eff.length < 10) continue;
     rateMap[code] = +r.rate;
   }
   storeConfig.exchange_rates = rateMap;
   document.getElementById("set-currency-code").value = data.currency.code || "";
   document.getElementById("set-currency-symbol").value = data.currency.symbol || "";
   document.getElementById("set-currency-name").value = data.currency.name || "";
-  document.getElementById("rates-tbody").innerHTML = (data.exchange_rates || []).map((r) =>
-    `<tr><td>${esc(r.currency_code)}</td><td>${r.rate}</td><td>${esc(r.effective_at)}</td><td>${esc(r.notes || "")}</td></tr>`
-  ).join("") || '<tr><td colspan="4">Нет курсов</td></tr>';
+  const latestIdByCode = {};
+  for (const r of data.exchange_rates || []) {
+    const code = String(r.currency_code || "").toUpperCase();
+    const eff = String(r.effective_at || "");
+    if (!code || latestIdByCode[code] != null) continue;
+    if (!eff || eff.startsWith(":") || eff.length < 10) continue;
+    latestIdByCode[code] = r.id;
+  }
+  document.getElementById("rates-tbody").innerHTML = (data.exchange_rates || []).map((r) => {
+    const code = String(r.currency_code || "").toUpperCase();
+    const eff = String(r.effective_at || "");
+    const isJunk = !eff || eff.startsWith(":") || eff.length < 10;
+    const isCurrent = !isJunk && latestIdByCode[code] === r.id && code !== String(data.currency?.code || "TJS").toUpperCase();
+    return `<tr>
+      <td>${esc(r.currency_code)}${isCurrent ? ' <span class="tag tag-own" style="font-size:.65rem">текущий</span>' : ""}${isJunk ? ' <span class="hint">(битая дата)</span>' : ""}</td>
+      <td>${r.rate}</td>
+      <td>${esc(r.effective_at || "—")}</td>
+      <td style="white-space:nowrap">
+        ${esc(r.notes || "")}
+        <button type="button" class="btn btn-danger btn-sm" onclick="deleteExchangeRate(${r.id})" title="Удалить">✕</button>
+      </td>
+    </tr>`;
+  }).join("") || '<tr><td colspan="4">Нет курсов</td></tr>';
+  // default «действует с» = сейчас (локально), чтобы не ставили старый год по ошибке
+  const effInput = document.getElementById("rate-effective");
+  if (effInput && !effInput.value) {
+    const d = new Date();
+    d.setMinutes(d.getMinutes() - d.getTimezoneOffset());
+    effInput.value = d.toISOString().slice(0, 16);
+  }
+  const rateCode = document.getElementById("rate-code");
+  if (rateCode && !rateCode.value) rateCode.value = "USD";
   document.getElementById("paymethods-tbody").innerHTML = (data.payment_methods || []).map((m) =>
     `<tr><td>${esc(m.code)}</td><td>${esc(m.name)}</td><td>${esc(m.method_type)}</td><td>${m.is_active ? "✓" : "—"}</td></tr>`
   ).join("");
@@ -5550,6 +5609,17 @@ async function saveExpenseAllocation(e) {
     toast("Распределение сохранено");
   } catch (err) { toast(err.message, "error"); }
 }
+
+window.deleteExchangeRate = async (id) => {
+  if (!confirm("Удалить этот курс?")) return;
+  try {
+    await api(`/api/settings/exchange-rates/${id}`, { method: "DELETE" });
+    toast("Курс удалён");
+    loadSettingsPage();
+  } catch (err) {
+    toast(err.message, "error");
+  }
+};
 
 window.deleteExpense = async (id) => {
   if (!confirm("Удалить расход?")) return;
