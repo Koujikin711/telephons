@@ -4850,7 +4850,8 @@ def _period_cash_by_currency(
     if _table_exists(conn, "mutual_payments"):
         m_clause, m_params, _ = _report_period_clause(period, date_from, date_to, "mp.created_at")
         m_sql = f"""
-            SELECT UPPER(COALESCE(
+            SELECT me.direction AS direction,
+                   UPPER(COALESCE(
                        NULLIF(TRIM(mp.pay_currency_code), ''),
                        NULLIF(TRIM(me.currency_code), ''),
                        'TJS'
@@ -4859,15 +4860,16 @@ def _period_cash_by_currency(
                    SUM(COALESCE(NULLIF(mp.pay_amount, 0), mp.amount)) AS amt
             FROM mutual_payments mp
             JOIN mutual_entries me ON me.id = mp.entry_id
-            WHERE me.direction = 'owe_us' {m_clause}
-            GROUP BY 1, 2
+            WHERE me.direction IN ('owe_us', 'we_owe') {m_clause}
+            GROUP BY 1, 2, 3
         """
         for r in conn.execute(m_sql, list(m_params)).fetchall():
             cur = r["cur"] or "TJS"
             wcode = wallet_code(r["method_code"] or "cash", cur)
             if not wcode:
                 continue
-            add(cur, "+", r["amt"], wcode)
+            # owe_us: должник принёс деньги → приход; we_owe: мы отдали → расход
+            add(cur, "+" if r["direction"] == "owe_us" else "−", r["amt"], wcode)
 
     if _table_exists(conn, "cash_inflows"):
         c_clause, c_params, _ = _report_period_clause(period, date_from, date_to, "created_at")
@@ -5083,6 +5085,28 @@ def funds_snapshot(conn: sqlite3.Connection) -> dict[str, Any]:
             pm = get_payment_method(conn, r["payment_method_code"] or "cash")
             mtype = pm["method_type"] if pm else "cash"
             add(r["cur"], _pay_bucket(mtype), r["amt"])
+
+    if _table_exists(conn, "mutual_payments"):
+        for r in conn.execute(
+            """
+            SELECT me.direction AS direction,
+                   UPPER(COALESCE(
+                       NULLIF(TRIM(mp.pay_currency_code), ''),
+                       NULLIF(TRIM(me.currency_code), ''),
+                       'TJS'
+                   )) AS cur,
+                   mp.payment_method_code AS method_code,
+                   SUM(COALESCE(NULLIF(mp.pay_amount, 0), mp.amount)) AS amt
+            FROM mutual_payments mp
+            JOIN mutual_entries me ON me.id = mp.entry_id
+            WHERE me.direction IN ('owe_us', 'we_owe')
+            GROUP BY 1, 2, 3
+            """
+        ).fetchall():
+            pm = get_payment_method(conn, r["method_code"] or "cash")
+            mtype = pm["method_type"] if pm else "cash"
+            signed = float(r["amt"] or 0) if r["direction"] == "owe_us" else -float(r["amt"] or 0)
+            add(r["cur"], _pay_bucket(mtype), signed)
 
     for r in conn.execute(
         """
@@ -5597,7 +5621,7 @@ async def web_manifest():
 async def health():
     return {
         "status": "ok",
-        "build": "exchange-rate-delete-fix-v1",
+        "build": "we-owe-wallet-minus-v1",
         "db": str(DB_PATH),
         "db_exists": DB_PATH.exists(),
     }
@@ -8715,6 +8739,37 @@ async def pos_cash_register_detail(
                             who=r["supplier_name"] or "—", amount=r["amount"], currency="TJS",
                             note=r["notes"] or "", method_name=pm["name"] if pm else "Наличные",
                         )
+
+            if _table_exists(conn, "mutual_payments"):
+                m_clause, m_params, _ = _report_period_clause(period, "", "", "mp.created_at")
+                m_sql = f"""
+                    SELECT mp.created_at AS at,
+                           COALESCE(NULLIF(mp.pay_amount, 0), mp.amount) AS amount,
+                           mp.payment_method_code,
+                           COALESCE(pm.name, mp.payment_method_code) AS method_name,
+                           me.person_name AS who,
+                           me.product_note AS note,
+                           UPPER(COALESCE(
+                               NULLIF(TRIM(mp.pay_currency_code), ''),
+                               NULLIF(TRIM(me.currency_code), ''),
+                               'TJS'
+                           )) AS currency_code
+                    FROM mutual_payments mp
+                    JOIN mutual_entries me ON me.id = mp.entry_id
+                    LEFT JOIN payment_methods pm ON pm.code = mp.payment_method_code
+                    WHERE me.direction = 'we_owe' {m_clause}
+                """
+                mparams = list(m_params)
+                if kind == "wallet" and method:
+                    m_sql += " AND mp.payment_method_code = ?"
+                    mparams.append(method)
+                m_sql += " ORDER BY mp.created_at DESC LIMIT 200"
+                for r in conn.execute(m_sql, mparams).fetchall():
+                    add_line(
+                        at=r["at"], side="−", source="Оплата: мы должны",
+                        who=r["who"], amount=r["amount"], currency=r["currency_code"],
+                        note=r["note"] or "", method_name=r["method_name"],
+                    )
 
         if kind == "profit":
             fin = _finance_report(conn, period, "all", "", "")
