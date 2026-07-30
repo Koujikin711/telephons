@@ -563,7 +563,19 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     _add_column(conn, "expenses", "kind", "TEXT NOT NULL DEFAULT 'expense'")
     _add_column(conn, "sales", "affects_cash", "INTEGER NOT NULL DEFAULT 1")
     _add_column(conn, "expenses", "affects_cash", "INTEGER NOT NULL DEFAULT 1")
+    _add_column(conn, "expenses", "currency_code", "TEXT NOT NULL DEFAULT 'TJS'")
     _add_column(conn, "sale_payments", "pay_currency_code", "TEXT NOT NULL DEFAULT ''")
+    # Расходы через долларовый кошелёк раньше всегда шли как TJS — поправить остатки
+    if get_setting(conn, "expense_currency_from_wallet_v1", "") != "1":
+        for pm in list_payment_methods(conn, active_only=False):
+            bound = payment_method_currency(pm)
+            if bound not in ("USD", "TJS"):
+                continue
+            conn.execute(
+                "UPDATE expenses SET currency_code = ? WHERE payment_method_code = ?",
+                (bound, pm["code"]),
+            )
+        set_setting(conn, "expense_currency_from_wallet_v1", "1")
     _add_column(conn, "sale_payments", "pay_amount", "REAL")
     # Mark Excel-imported rows for display when created_by is empty
     if _table_exists(conn, "expenses"):
@@ -3376,6 +3388,22 @@ def cash_wallet_code_for_currency(conn: sqlite3.Connection, currency: str) -> st
     return None
 
 
+def resolve_expense_currency(
+    conn: sqlite3.Connection,
+    payment_method_code: str,
+    currency_code: str | None = None,
+) -> str:
+    """Currency for expense outflow: bound wallet currency wins, else explicit/TJS."""
+    pm = get_payment_method(conn, payment_method_code or "cash")
+    bound = payment_method_currency(pm) if pm else ""
+    if bound in ("USD", "TJS"):
+        return bound
+    cur = (currency_code or "").strip().upper()
+    if cur in ("USD", "TJS"):
+        return cur
+    return "TJS"
+
+
 def resolve_wallet_method_code(
     conn: sqlite3.Connection,
     method_code: str,
@@ -4897,15 +4925,18 @@ def _period_cash_by_currency(
         exp_clause = " AND expense_date >= ?"
         exp_params = [period_start(period)[:10]]
     exp_sql = f"""
-        SELECT payment_method_code AS method_code, SUM(amount) AS amt
+        SELECT payment_method_code AS method_code,
+               UPPER(COALESCE(NULLIF(TRIM(currency_code), ''), 'TJS')) AS cur,
+               SUM(amount) AS amt
         FROM expenses WHERE COALESCE(affects_cash, 1) = 1 {exp_clause}
-        GROUP BY 1
+        GROUP BY 1, 2
     """
     for r in conn.execute(exp_sql, list(exp_params)).fetchall():
-        wcode = wallet_code(r["method_code"] or "cash", "TJS")
+        cur = r["cur"] or "TJS"
+        wcode = wallet_code(r["method_code"] or "cash", cur)
         if not wcode:
             continue
-        add("TJS", "−", r["amt"], wcode)
+        add(cur, "−", r["amt"], wcode)
 
     if _table_exists(conn, "supplier_payments"):
         s_clause, s_params, _ = _report_period_clause(period, date_from, date_to, "created_at")
@@ -5110,15 +5141,17 @@ def funds_snapshot(conn: sqlite3.Connection) -> dict[str, Any]:
 
     for r in conn.execute(
         """
-        SELECT payment_method_code, SUM(amount) AS amt
+        SELECT payment_method_code,
+               UPPER(COALESCE(NULLIF(TRIM(currency_code), ''), 'TJS')) AS cur,
+               SUM(amount) AS amt
         FROM expenses
         WHERE COALESCE(affects_cash, 1) = 1
-        GROUP BY payment_method_code
+        GROUP BY 1, 2
         """
     ).fetchall():
         pm = get_payment_method(conn, r["payment_method_code"] or "cash")
         mtype = pm["method_type"] if pm else "cash"
-        add("TJS", _pay_bucket(mtype), -float(r["amt"] or 0))
+        add(r["cur"] or "TJS", _pay_bucket(mtype), -float(r["amt"] or 0))
 
     if _table_exists(conn, "supplier_payments"):
         for r in conn.execute(
@@ -5314,6 +5347,7 @@ class ExpenseIn(BaseModel):
     amount: float = Field(gt=0)
     description: str = ""
     payment_method_code: str = "cash"
+    currency_code: str = ""  # USD/TJS; пусто → из кошелька оплаты
     expense_date: str = ""
     department: str = "main"
     warehouse_id: int | None = None
@@ -5621,7 +5655,7 @@ async def web_manifest():
 async def health():
     return {
         "status": "ok",
-        "build": "we-owe-wallet-minus-v1",
+        "build": "expense-usd-wallet-v1",
         "db": str(DB_PATH),
         "db_exists": DB_PATH.exists(),
     }
@@ -5858,20 +5892,23 @@ async def create_expense(body: ExpenseIn, x_pin: str | None = Header(default=Non
         desc = body.description or ""
         if kind == "payout" and payee and payee.lower() not in desc.lower():
             desc = f"{payee}" + (f" — {desc}" if desc.strip() else "")
+        currency = resolve_expense_currency(conn, body.payment_method_code, body.currency_code)
+        # Для наличных с привязкой к валюте кладём списание в нужный кошелёк
+        pay_code = resolve_wallet_method_code(conn, body.payment_method_code, currency)
         cur = conn.execute(
             """
             INSERT INTO expenses (
                 category, amount, description, payment_method_code, expense_date,
                 created_at, department, created_by, created_by_user_id,
-                warehouse_id, payee, kind
+                warehouse_id, payee, kind, currency_code
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 category,
                 body.amount,
                 desc,
-                body.payment_method_code,
+                pay_code,
                 when,
                 utc_now(),
                 dept,
@@ -5880,6 +5917,7 @@ async def create_expense(body: ExpenseIn, x_pin: str | None = Header(default=Non
                 warehouse_id,
                 payee,
                 kind,
+                currency,
             ),
         )
         row = conn.execute(
@@ -8700,7 +8738,8 @@ async def pos_cash_register_detail(
             out_sql = f"""
                 SELECT e.expense_date AS at, e.amount, e.category, e.description,
                        e.payment_method_code, COALESCE(pm.name, e.payment_method_code) AS method_name,
-                       COALESCE(NULLIF(e.created_by, ''), '—') AS who
+                       COALESCE(NULLIF(e.created_by, ''), '—') AS who,
+                       UPPER(COALESCE(NULLIF(TRIM(e.currency_code), ''), 'TJS')) AS currency_code
                 FROM expenses e
                 LEFT JOIN payment_methods pm ON pm.code = e.payment_method_code
                 WHERE COALESCE(e.affects_cash, 1) = 1 {exp_clause}
@@ -8713,7 +8752,7 @@ async def pos_cash_register_detail(
             for r in conn.execute(out_sql, out_params).fetchall():
                 add_line(
                     at=r["at"], side="−", source="Расход",
-                    who=r["who"], amount=r["amount"], currency="TJS",
+                    who=r["who"], amount=r["amount"], currency=r["currency_code"] or "TJS",
                     note=f"{r['category'] or ''} {r['description'] or ''}".strip(),
                     method_name=r["method_name"] or "",
                 )

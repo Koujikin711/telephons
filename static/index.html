@@ -308,8 +308,15 @@
                     </div>
                     <div class="form-row">
                       <label>Сумма<input type="number" id="pos-exp-amount" class="input" min="0.01" step="0.01" required></label>
+                      <label>Валюта
+                        <select id="pos-exp-currency" class="select">
+                          <option value="TJS">смн</option>
+                          <option value="USD">$</option>
+                        </select>
+                      </label>
                       <label>Оплата<select id="pos-exp-pay" class="select"></select></label>
                     </div>
+                    <p class="hint muted" id="pos-exp-currency-hint" style="margin:0">Для «Наличными Доллары» списание идёт с $; для «Наличные» — с смн.</p>
                     <label>Описание<input id="pos-exp-desc" class="input"></label>
                     <button type="submit" class="btn btn-primary btn-block" id="pos-exp-submit">Добавить расход</button>
                   </form>
@@ -566,6 +573,12 @@
                     <label>Категория<input id="acc-exp-category" class="input" required placeholder="Аренда"></label>
                     <div class="form-row">
                       <label>Сумма<input type="number" id="acc-exp-amount" class="input" min="0.01" step="0.01" required></label>
+                      <label>Валюта
+                        <select id="acc-exp-currency" class="select">
+                          <option value="TJS">смн</option>
+                          <option value="USD">$</option>
+                        </select>
+                      </label>
                       <label>Оплата<select id="acc-exp-pay" class="select"></select></label>
                     </div>
                     <label>Описание<input id="acc-exp-desc" class="input"></label>
@@ -753,6 +766,12 @@
             <form id="expense-form" class="form-stack card-body">
               <label>Категория<input id="exp-category" class="input" required placeholder="Аренда"></label>
               <label>Сумма<input type="number" id="exp-amount" class="input" min="0.01" step="0.01" required></label>
+              <label>Валюта
+                <select id="exp-currency" class="select">
+                  <option value="TJS">смн</option>
+                  <option value="USD">$</option>
+                </select>
+              </label>
               <label>Дата<input type="date" id="exp-date" class="input"></label>
               <label>Описание<input id="exp-desc" class="input"></label>
               <label>Оплата<select id="exp-pay" class="select"></select></label>
@@ -1453,7 +1472,7 @@
   </dialog>
 
   <div id="toast" class="toast"></div>
-  <script src="/static/app.js?v=81"></script>
+  <script src="/static/app.js?v=82"></script>
   <script>
     if ("serviceWorker" in navigator) {
       navigator.serviceWorker.register("/sw.js").then((reg) => {

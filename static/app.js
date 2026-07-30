@@ -1330,6 +1330,7 @@ function bindPos() {
     } catch (err) { toast(err.message, "error"); }
   });
   fillPaySelect(document.getElementById("pos-exp-pay"));
+  bindExpenseCurrencySync("pos-exp-pay", "pos-exp-currency");
   let posExpType = "expense";
   const syncPosExpTypeUi = () => {
     const isPayout = posExpType === "payout";
@@ -1363,6 +1364,7 @@ function bindPos() {
         expense_date: new Date().toISOString().slice(0, 10),
         description: document.getElementById("pos-exp-desc").value,
         payment_method_code: document.getElementById("pos-exp-pay").value,
+        currency_code: document.getElementById("pos-exp-currency")?.value || "TJS",
       };
       if (isPayout) {
         body.payee = document.getElementById("pos-exp-payee").value.trim();
@@ -1378,6 +1380,7 @@ function bindPos() {
       document.getElementById("pos-expense-form").reset();
       syncPosExpTypeUi();
       fillPaySelect(document.getElementById("pos-exp-pay"));
+      syncExpenseCurrencyFromPay("pos-exp-pay", "pos-exp-currency");
       fillWarehouseSelect(document.getElementById("pos-exp-warehouse"), defaultWarehouseId(), { phonesOnly: true });
       loadPosCashRegister();
     } catch (err) { toast(err.message, "error"); }
@@ -3726,9 +3729,33 @@ async function submitWhSell(e) {
 
 function fillPaySelect(sel) {
   if (!sel) return;
-  sel.innerHTML = (storeConfig.payment_methods || []).map((m) =>
-    `<option value="${esc(m.code)}">${esc(m.name)}</option>`
-  ).join("") || '<option value="cash">Наличные</option>';
+  sel.innerHTML = (storeConfig.payment_methods || []).map((m) => {
+    const cur = String(m.currency_code || "").toUpperCase();
+    const suffix = cur === "USD" ? " ($)" : cur === "TJS" ? " (смн)" : "";
+    return `<option value="${esc(m.code)}" data-currency="${esc(cur)}">${esc(m.name)}${suffix}</option>`;
+  }).join("") || '<option value="cash" data-currency="TJS">Наличные (смн)</option>';
+}
+
+function syncExpenseCurrencyFromPay(paySelId, curSelId) {
+  const pay = document.getElementById(paySelId);
+  const cur = document.getElementById(curSelId);
+  if (!pay || !cur) return;
+  const opt = pay.selectedOptions?.[0];
+  const bound = String(opt?.dataset?.currency || "").toUpperCase();
+  if (bound === "USD" || bound === "TJS") {
+    cur.value = bound;
+    cur.disabled = true;
+  } else {
+    cur.disabled = false;
+  }
+}
+
+function bindExpenseCurrencySync(paySelId, curSelId) {
+  const pay = document.getElementById(paySelId);
+  if (!pay || pay.dataset.curSyncBound) return;
+  pay.dataset.curSyncBound = "1";
+  pay.addEventListener("change", () => syncExpenseCurrencyFromPay(paySelId, curSelId));
+  syncExpenseCurrencyFromPay(paySelId, curSelId);
 }
 
 async function onInboundExistingSelect() {
@@ -4689,6 +4716,7 @@ function bindAccessories() {
   document.getElementById("acc-report-refresh")?.addEventListener("click", loadAccReport);
   document.getElementById("acc-report-period")?.addEventListener("change", loadAccReport);
   fillPaySelect(document.getElementById("acc-exp-pay"));
+  bindExpenseCurrencySync("acc-exp-pay", "acc-exp-currency");
   document.getElementById("acc-expense-form")?.addEventListener("submit", async (e) => {
     e.preventDefault();
     try {
@@ -4698,10 +4726,13 @@ function bindAccessories() {
         expense_date: new Date().toISOString().slice(0, 10),
         description: document.getElementById("acc-exp-desc").value,
         payment_method_code: document.getElementById("acc-exp-pay").value,
+        currency_code: document.getElementById("acc-exp-currency")?.value || "TJS",
         department: "accessories",
       }) });
       toast("Расход добавлен");
       document.getElementById("acc-expense-form").reset();
+      fillPaySelect(document.getElementById("acc-exp-pay"));
+      syncExpenseCurrencyFromPay("acc-exp-pay", "acc-exp-currency");
       loadAccCashRegister();
       if (accViewMode === "report") loadAccReport();
     } catch (err) { toast(err.message, "error"); }
@@ -5491,11 +5522,13 @@ function bindSettings() {
         expense_date: document.getElementById("exp-date").value,
         description: document.getElementById("exp-desc").value,
         payment_method_code: document.getElementById("exp-pay").value,
+        currency_code: document.getElementById("exp-currency")?.value || "TJS",
       }) });
       toast("Расход добавлен");
       loadSettingsPage();
     } catch (err) { toast(err.message, "error"); }
   });
+  bindExpenseCurrencySync("exp-pay", "exp-currency");
   document.getElementById("btn-wipe-catalog")?.addEventListener("click", wipeCatalogData);
   document.getElementById("expense-allocation-form")?.addEventListener("submit", saveExpenseAllocation);
 }
