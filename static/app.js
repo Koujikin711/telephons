@@ -1261,6 +1261,12 @@ function bindPos() {
     });
     updateSplitSummary();
   });
+  document.getElementById("split-fill-credit")?.addEventListener("click", () => {
+    if (!cart.length) { toast("Корзина пуста", "error"); return; }
+    document.querySelectorAll(".split-pay-input").forEach((inp) => { inp.value = ""; });
+    updateSplitSummary();
+    checkout();
+  });
   document.getElementById("split-payments")?.addEventListener("input", (e) => {
     if (e.target.classList.contains("split-pay-input") || e.target.classList.contains("split-pay-currency")) {
       updateSplitSummary();
@@ -2485,7 +2491,9 @@ function promptDebtorModal(total, paid, currencyCode = null) {
     const due = Math.max(0, total - paid);
     const money = (n) => currencyCode ? fmtCurrency(n, currency_meta(currencyCode)) : posMoney(n);
     document.getElementById("debtor-modal-hint").textContent =
-      `К оплате ${money(total)}, оплачено ${money(paid)}. В долг: ${money(due)}. Укажите клиента.`;
+      paid < 0.01
+        ? `Продажа 100% в долг на ${money(total)}. Укажите клиента.`
+        : `К оплате ${money(total)}, оплачено ${money(paid)}. В долг: ${money(due)}. Укажите клиента.`;
     document.getElementById("debtor-name").value = "";
     document.getElementById("debtor-phone").value = "";
     document.getElementById("debtor-modal").showModal();
@@ -2534,7 +2542,8 @@ async function checkout() {
       }
       paidSale += conv;
     }
-    if (paidSale <= 0 && total > 0) { toast("Укажите суммы оплаты", "error"); return; }
+    if (paidSale < -0.01) { toast("Сумма оплат некорректна", "error"); return; }
+    // paidSale = 0 → 100% в долг (спросим клиента ниже)
     let debtor_name = "";
     let debtor_phone = "";
     if (total - paidSale > 0.01) {
@@ -4685,6 +4694,12 @@ function bindAccessories() {
     });
     updateAccSplitSummary();
   });
+  document.getElementById("acc-fill-credit")?.addEventListener("click", () => {
+    if (!accCart.length) { toast("Корзина пуста", "error"); return; }
+    document.querySelectorAll(".acc-split-pay-input").forEach((inp) => { inp.value = ""; });
+    updateAccSplitSummary();
+    accCheckout();
+  });
   document.getElementById("acc-split-payments")?.addEventListener("input", (e) => {
     if (e.target.classList.contains("acc-split-pay-input") || e.target.classList.contains("split-pay-currency")) {
       updateAccSplitSummary();
@@ -5192,7 +5207,8 @@ async function accCheckout() {
     }
     paidSale += conv;
   }
-  if (paidSale <= 0 && total > 0) { toast("Укажите оплату", "error"); return; }
+  if (paidSale < -0.01) { toast("Сумма оплат некорректна", "error"); return; }
+  // paidSale = 0 → 100% в долг
   let debtor_name = "";
   let debtor_phone = "";
   if (total - paidSale > 0.01) {

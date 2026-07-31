@@ -217,6 +217,7 @@
                       <span id="split-remain-label" class="hidden">Осталось: <strong id="split-remain-total">0</strong></span>
                     </div>
                     <button type="button" id="split-fill-cash" class="btn btn-ghost btn-sm btn-block">Вся сумма наличными</button>
+                    <button type="button" id="split-fill-credit" class="btn btn-ghost btn-sm btn-block">Вся сумма в долг</button>
                     <button id="checkout-btn" class="btn btn-success btn-block" disabled>Провести оплату</button>
                     <button id="clear-cart-btn" class="btn btn-ghost btn-block">Очистить</button>
                   </div>
@@ -621,6 +622,7 @@
                   <span id="acc-split-remain-wrap" class="hidden">Осталось: <strong id="acc-split-remain">0</strong></span>
                 </div>
                 <button type="button" id="acc-fill-cash" class="btn btn-ghost btn-sm btn-block">Вся сумма наличными</button>
+                <button type="button" id="acc-fill-credit" class="btn btn-ghost btn-sm btn-block">Вся сумма в долг</button>
                 <button id="acc-checkout-btn" class="btn btn-success btn-block" disabled>Провести оплату</button>
                 <button id="acc-clear-cart" class="btn btn-ghost btn-block">Очистить</button>
               </div>
@@ -1472,7 +1474,7 @@
   </dialog>
 
   <div id="toast" class="toast"></div>
-  <script src="/static/app.js?v=82"></script>
+  <script src="/static/app.js?v=83"></script>
   <script>
     if ("serviceWorker" in navigator) {
       navigator.serviceWorker.register("/sw.js").then((reg) => {

@@ -5655,7 +5655,7 @@ async def web_manifest():
 async def health():
     return {
         "status": "ok",
-        "build": "expense-usd-wallet-v1",
+        "build": "full-credit-sale-v1",
         "db": str(DB_PATH),
         "db_exists": DB_PATH.exists(),
     }
