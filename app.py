@@ -5655,7 +5655,7 @@ async def web_manifest():
 async def health():
     return {
         "status": "ok",
-        "build": "full-credit-sale-v1",
+        "build": "unit-card-dblclick-v1",
         "db": str(DB_PATH),
         "db_exists": DB_PATH.exists(),
     }
@@ -7667,19 +7667,7 @@ async def get_unit(unit_id: int, x_pin: str | None = Header(default=None, alias=
     check_pin(x_pin)
     with db() as conn:
         expire_reservations(conn)
-        row = conn.execute(
-            """
-            SELECT u.*, p.name AS product_name, p.model, p.color AS product_color,
-                   w.name AS warehouse_name
-            FROM product_units u
-            JOIN products p ON p.id = u.product_id
-            JOIN warehouses w ON w.id = u.warehouse_id
-            WHERE u.id = ?
-            """,
-            (unit_id,),
-        ).fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="Устройство не найдено")
+        data = _unit_detail_row(conn, unit_id)
         res = conn.execute(
             """
             SELECT * FROM unit_reservations
@@ -7688,7 +7676,6 @@ async def get_unit(unit_id: int, x_pin: str | None = Header(default=None, alias=
             """,
             (unit_id,),
         ).fetchone()
-    data = enrich_unit_row(row)
     if res:
         data["reservation"] = row_to_dict(res)
     return data
@@ -7758,11 +7745,31 @@ class UnitExtraCostIn(BaseModel):
     extra_cost: float = Field(ge=0)
 
 
+class UnitCardUpdate(BaseModel):
+    """Редактирование карточки устройства на складе."""
+    model: str | None = Field(default=None, max_length=200)
+    color: str | None = None
+    memory: str | None = None
+    sale_price: float | None = Field(default=None, ge=0)
+    purchase_price: float | None = Field(default=None, ge=0)
+    extra_cost: float | None = Field(default=None, ge=0)
+    imei: str | None = None
+    battery_capacity: int | None = Field(default=None, ge=0, le=100)
+    client_name: str | None = None
+    notes: str | None = None
+    region: str | None = None
+    arrival_date: str | None = None
+    supplier_name: str | None = None
+
+
 def _unit_detail_row(conn: sqlite3.Connection, unit_id: int) -> dict[str, Any]:
     row = conn.execute(
         """
-        SELECT u.*, p.name AS product_name, p.color AS product_color,
-               p.purchase_price AS product_purchase_price, w.name AS warehouse_name
+        SELECT u.*, p.name AS product_name, p.model AS product_model,
+               p.color AS product_color, p.memory AS product_memory,
+               p.sale_price AS product_sale_price, p.supplier_name AS product_supplier_name,
+               p.purchase_price AS product_purchase_price, p.condition AS product_condition,
+               p.ownership_type, w.name AS warehouse_name
         FROM product_units u
         JOIN products p ON p.id = u.product_id
         JOIN warehouses w ON w.id = u.warehouse_id
@@ -7773,10 +7780,99 @@ def _unit_detail_row(conn: sqlite3.Connection, unit_id: int) -> dict[str, Any]:
     if not row:
         raise HTTPException(status_code=404, detail="Устройство не найдено")
     d = enrich_unit_row(row)
+    d["model"] = row["product_name"] or row["product_model"] or ""
+    d["color"] = row["product_color"] or ""
+    d["memory"] = row["product_memory"] or ""
+    d["sale_price"] = float(row["product_sale_price"] or 0)
+    d["supplier_name"] = row["product_supplier_name"] or ""
     d["purchase_price"] = unit_purchase_price(row, {"purchase_price": row["product_purchase_price"]})
     d["extra_cost"] = unit_extra_cost(row)
     d["customs_price"] = d["extra_cost"]
+    d["ownership_type"] = row["ownership_type"] or "own"
+    d["condition"] = row["product_condition"] or ""
     return d
+
+
+@app.put("/api/units/{unit_id}")
+async def update_unit_card(
+    unit_id: int, body: UnitCardUpdate, x_pin: str | None = Header(default=None, alias="X-Pin")
+):
+    """Карточка устройства: цены, IMEI, комментарий и поля модели."""
+    check_pin(x_pin, min_role="warehouse")
+    data = body.model_dump(exclude_unset=True)
+    if not data:
+        raise HTTPException(status_code=400, detail="Нет данных для сохранения")
+    with db() as conn:
+        unit = conn.execute("SELECT * FROM product_units WHERE id = ?", (unit_id,)).fetchone()
+        if not unit:
+            raise HTTPException(status_code=404, detail="Устройство не найдено")
+        if unit["status"] == "sold":
+            raise HTTPException(status_code=400, detail="Устройство уже продано — карточку менять нельзя")
+
+        product_fields: dict[str, Any] = {}
+        if "model" in data and data["model"] is not None:
+            name = str(data["model"]).strip()
+            if not name:
+                raise HTTPException(status_code=400, detail="Укажите наименование")
+            product_fields["name"] = name
+        if "color" in data and data["color"] is not None:
+            product_fields["color"] = str(data["color"]).strip()
+        if "memory" in data and data["memory"] is not None:
+            product_fields["memory"] = str(data["memory"]).strip()
+        if "sale_price" in data and data["sale_price"] is not None:
+            product_fields["sale_price"] = float(data["sale_price"])
+        if "supplier_name" in data and data["supplier_name"] is not None:
+            product_fields["supplier_name"] = str(data["supplier_name"]).strip()
+
+        unit_sets: list[str] = []
+        unit_vals: list[Any] = []
+        if "purchase_price" in data and data["purchase_price"] is not None:
+            unit_sets.append("purchase_price = ?")
+            unit_vals.append(float(data["purchase_price"]))
+        if "extra_cost" in data and data["extra_cost"] is not None:
+            unit_sets.append("customs_price = ?")
+            unit_vals.append(float(data["extra_cost"]))
+        if "imei" in data and data["imei"] is not None:
+            imei = str(data["imei"]).strip()
+            if imei:
+                dup = conn.execute(
+                    "SELECT id FROM product_units WHERE imei = ? AND id != ?",
+                    (imei, unit_id),
+                ).fetchone()
+                if dup:
+                    raise HTTPException(status_code=400, detail=f"IMEI «{imei}» уже в системе")
+            unit_sets.append("imei = ?")
+            unit_vals.append(imei)
+        if "battery_capacity" in data:
+            bat = data["battery_capacity"]
+            unit_sets.append("battery_capacity = ?")
+            unit_vals.append(int(bat) if bat is not None else None)
+        if "client_name" in data and data["client_name"] is not None:
+            unit_sets.append("client_name = ?")
+            unit_vals.append(str(data["client_name"]).strip())
+        if "notes" in data and data["notes"] is not None:
+            unit_sets.append("notes = ?")
+            unit_vals.append(str(data["notes"]).strip())
+        if "region" in data and data["region"] is not None:
+            unit_sets.append("region = ?")
+            unit_vals.append(str(data["region"]).strip())
+        if "arrival_date" in data and data["arrival_date"] is not None:
+            ad = str(data["arrival_date"]).strip()[:10]
+            unit_sets.append("arrival_date = ?")
+            unit_vals.append(ad)
+
+        if product_fields:
+            sets = ", ".join(f"{k} = ?" for k in product_fields)
+            conn.execute(
+                f"UPDATE products SET {sets} WHERE id = ?",
+                (*product_fields.values(), unit["product_id"]),
+            )
+        if unit_sets:
+            conn.execute(
+                f"UPDATE product_units SET {', '.join(unit_sets)} WHERE id = ?",
+                (*unit_vals, unit_id),
+            )
+        return _unit_detail_row(conn, unit_id)
 
 
 @app.patch("/api/units/{unit_id}/purchase-price")

@@ -900,6 +900,7 @@ async function init() {
     bindDashboard();
     bindProducts();
     bindCatalog();
+    bindUnitCardModal();
     bindWarehouses();
     bindSuppliers();
     bindAccessories();
@@ -3389,10 +3390,10 @@ async function loadWarehouseStock() {
     const arrival = u.arrival_date || u.created_at?.slice(0, 10) || "—";
     const extra = +(u.customs_price || u.extra_cost || 0);
     const comment = u.client_name || u.notes || "—";
-    const sellBtn = `<button class="btn btn-primary btn-sm" onclick="openWhSellModal(${u.id})">Продать</button>`;
-    const extraBtn = `<button type="button" class="btn btn-ghost btn-sm" onclick="openUnitExtraModal(${u.id})" title="Изменить расходы">${extra ? whMoney(extra) : "＋ 0"}</button>`;
+    const sellBtn = `<button class="btn btn-primary btn-sm" onclick="event.stopPropagation(); openWhSellModal(${u.id})">Продать</button>`;
+    const extraBtn = `<button type="button" class="btn btn-ghost btn-sm" onclick="event.stopPropagation(); openUnitExtraModal(${u.id})" title="Изменить расходы">${extra ? whMoney(extra) : "＋ 0"}</button>`;
     if (kind === "used") {
-      return `<tr>
+      return `<tr class="wh-unit-row" data-unit-id="${u.id}" title="Двойной клик — карточка товара">
         <td>${esc(arrival)}</td>
         <td><strong>${esc(u.model)}</strong></td>
         <td>${u.battery_capacity != null ? u.battery_capacity + "%" : "—"}</td>
@@ -3405,7 +3406,7 @@ async function loadWarehouseStock() {
         <td>${sellBtn}</td>
       </tr>`;
     }
-    return `<tr>
+    return `<tr class="wh-unit-row" data-unit-id="${u.id}" title="Двойной клик — карточка товара">
       <td>${esc(arrival)}</td>
       <td><strong>${esc(u.model)}</strong></td>
       <td>${esc(u.region || "—")}</td>
@@ -3420,6 +3421,7 @@ async function loadWarehouseStock() {
   }).join("") || `<tr><td colspan="${colSpan}" style="text-align:center;color:var(--muted)">Нет остатков</td></tr>`;
   renderWhStockTotals(data.totals);
   applyWhDetailSearch();
+  bindWhUnitRowClicks();
 }
 
 async function loadWhZReport() {
@@ -3665,6 +3667,107 @@ window.openUnitExtraModal = (unitId) => {
   document.getElementById("unit-extra-amount").value = String(+(u.customs_price || u.extra_cost || 0));
   document.getElementById("unit-extra-modal")?.showModal();
 };
+
+function bindWhUnitRowClicks() {
+  const tb = document.getElementById("wh-stock-tbody");
+  if (!tb || tb.dataset.unitDblBound) return;
+  tb.dataset.unitDblBound = "1";
+  tb.addEventListener("dblclick", (e) => {
+    if (e.target.closest("button, a, input, select, label")) return;
+    const row = e.target.closest("tr.wh-unit-row");
+    const id = +row?.dataset?.unitId;
+    if (id) openUnitCard(id);
+  });
+}
+
+function updateUnitCardLanded() {
+  const purchase = +document.getElementById("uc-purchase")?.value || 0;
+  const extra = +document.getElementById("uc-extra")?.value || 0;
+  const sale = +document.getElementById("uc-sale")?.value || 0;
+  const elLanded = document.getElementById("uc-landed");
+  if (!elLanded) return;
+  const landed = purchase + extra;
+  const margin = sale > 0 ? sale - landed : null;
+  elLanded.textContent = margin == null
+    ? `Вложено: ${whMoney(landed)}`
+    : `Вложено: ${whMoney(landed)} · маржа при продаже: ${whMoney(margin)}`;
+}
+
+window.openUnitCard = async (unitId) => {
+  try {
+    const u = await api(`/api/units/${unitId}`);
+    document.getElementById("uc-id").value = String(u.id);
+    document.getElementById("uc-model").value = u.model || u.product_name || "";
+    document.getElementById("uc-imei").value = u.imei || "";
+    document.getElementById("uc-battery").value = u.battery_capacity != null ? u.battery_capacity : "";
+    document.getElementById("uc-memory").value = u.memory || "";
+    document.getElementById("uc-color").value = u.color || "";
+    document.getElementById("uc-region").value = u.region || "";
+    document.getElementById("uc-arrival").value = (u.arrival_date || u.created_at || "").slice(0, 10);
+    document.getElementById("uc-purchase").value = u.purchase_price ?? "";
+    document.getElementById("uc-sale").value = u.sale_price ?? "";
+    document.getElementById("uc-extra").value = +(u.extra_cost || u.customs_price || 0);
+    document.getElementById("uc-supplier").value = u.supplier_name || "";
+    document.getElementById("uc-client").value = u.client_name || "";
+    document.getElementById("uc-notes").value = u.notes || "";
+    const meta = document.getElementById("unit-card-meta");
+    if (meta) {
+      meta.textContent = `${u.warehouse_name || "Склад"} · #${u.id}`
+        + (u.status === "sold" ? " · продано" : "");
+    }
+    updateUnitCardLanded();
+    document.getElementById("unit-card-modal")?.showModal();
+  } catch (err) {
+    toast(err.message || "Не удалось открыть карточку", "error");
+  }
+};
+
+function bindUnitCardModal() {
+  const form = document.getElementById("unit-card-form");
+  if (!form || form.dataset.bound) return;
+  form.dataset.bound = "1";
+  document.getElementById("unit-card-cancel")?.addEventListener("click", () => {
+    document.getElementById("unit-card-modal")?.close();
+  });
+  document.getElementById("uc-purchase")?.addEventListener("input", updateUnitCardLanded);
+  document.getElementById("uc-extra")?.addEventListener("input", updateUnitCardLanded);
+  document.getElementById("uc-sale")?.addEventListener("input", updateUnitCardLanded);
+  document.getElementById("unit-card-sell")?.addEventListener("click", () => {
+    const id = +document.getElementById("uc-id")?.value;
+    document.getElementById("unit-card-modal")?.close();
+    if (id) openWhSellModal(id);
+  });
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const id = +document.getElementById("uc-id")?.value;
+    if (!id) return;
+    const batRaw = document.getElementById("uc-battery").value;
+    const body = {
+      model: document.getElementById("uc-model").value.trim(),
+      imei: document.getElementById("uc-imei").value.trim(),
+      battery_capacity: batRaw === "" ? null : +batRaw,
+      memory: document.getElementById("uc-memory").value.trim(),
+      color: document.getElementById("uc-color").value.trim(),
+      region: document.getElementById("uc-region").value.trim(),
+      arrival_date: document.getElementById("uc-arrival").value || "",
+      purchase_price: +document.getElementById("uc-purchase").value || 0,
+      sale_price: +document.getElementById("uc-sale").value || 0,
+      extra_cost: +document.getElementById("uc-extra").value || 0,
+      supplier_name: document.getElementById("uc-supplier").value.trim(),
+      client_name: document.getElementById("uc-client").value.trim(),
+      notes: document.getElementById("uc-notes").value.trim(),
+    };
+    if (!body.model) { toast("Укажите наименование", "error"); return; }
+    try {
+      await api(`/api/units/${id}`, { method: "PUT", body: JSON.stringify(body) });
+      toast("Карточка сохранена");
+      document.getElementById("unit-card-modal")?.close();
+      if (currentPage === "warehouses") loadWarehouseStock();
+    } catch (err) {
+      toast(err.message || "Ошибка сохранения", "error");
+    }
+  });
+}
 
 window.openWhSellModal = (unitId) => {
   sellUnitTarget = whDevicesCache.find((u) => u.id === unitId);

@@ -993,6 +993,7 @@
       </div>
       <div id="wh-z-report" class="hidden"></div>
       <div class="table-wrap wh-detail-table" id="wh-stock-table-wrap">
+        <p class="hint muted" style="margin:0 0 .5rem">Двойной клик по строке — открыть карточку товара для редактирования</p>
         <table class="data-table">
           <thead id="wh-stock-thead"><tr><th>Модель</th><th>Цвет</th><th>Память</th><th>IMEI</th><th>Себест.</th><th></th></tr></thead>
           <tbody id="wh-stock-tbody"></tbody>
@@ -1218,6 +1219,43 @@
       <p class="hint muted">Учитывается в прибыли при продаже: цена − себестоимость − расходы.</p>
       <div class="modal-actions">
         <button type="button" class="btn btn-ghost" id="unit-extra-cancel">Отмена</button>
+        <button type="submit" class="btn btn-primary">Сохранить</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="unit-card-modal" class="modal modal-lg">
+    <form id="unit-card-form" novalidate>
+      <h3>Карточка товара</h3>
+      <p id="unit-card-meta" class="hint muted"></p>
+      <input type="hidden" id="uc-id">
+      <label>Наименование<input id="uc-model" class="input" required></label>
+      <div class="form-row">
+        <label>IMEI<input id="uc-imei" class="input"></label>
+        <label>Батарея %<input type="number" id="uc-battery" class="input" min="0" max="100" step="1"></label>
+      </div>
+      <div class="form-row">
+        <label>Память<input id="uc-memory" class="input" placeholder="256"></label>
+        <label>Цвет<input id="uc-color" class="input"></label>
+      </div>
+      <div class="form-row">
+        <label>Регион<input id="uc-region" class="input"></label>
+        <label>Дата прихода<input type="date" id="uc-arrival" class="input"></label>
+      </div>
+      <div class="form-row">
+        <label>Себестоимость<input type="number" id="uc-purchase" class="input" min="0" step="0.01" required></label>
+        <label>Цена продажи<input type="number" id="uc-sale" class="input" min="0" step="0.01"></label>
+      </div>
+      <div class="form-row">
+        <label>Расходы<input type="number" id="uc-extra" class="input" min="0" step="0.01" value="0"></label>
+        <label>Поставщик<input id="uc-supplier" class="input"></label>
+      </div>
+      <label>Клиент / комментарий<input id="uc-client" class="input"></label>
+      <label>Заметка<textarea id="uc-notes" class="input textarea" rows="2"></textarea></label>
+      <p id="uc-landed" class="hint"></p>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-ghost" id="unit-card-cancel">Отмена</button>
+        <button type="button" class="btn btn-secondary" id="unit-card-sell">Продать</button>
         <button type="submit" class="btn btn-primary">Сохранить</button>
       </div>
     </form>
@@ -1474,7 +1512,7 @@
   </dialog>
 
   <div id="toast" class="toast"></div>
-  <script src="/static/app.js?v=83"></script>
+  <script src="/static/app.js?v=84"></script>
   <script>
     if ("serviceWorker" in navigator) {
       navigator.serviceWorker.register("/sw.js").then((reg) => {

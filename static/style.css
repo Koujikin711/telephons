@@ -1725,6 +1725,12 @@ button.pos-balance-btn:hover {
 .wh-detail-table .data-table {
   min-width: 920px;
 }
+.wh-unit-row {
+  cursor: pointer;
+}
+.wh-unit-row:hover {
+  background: rgba(99, 91, 255, 0.06);
+}
 .wh-detail-modal .modal-actions {
   padding: 0.65rem 1.1rem;
   border-top: 1px solid var(--border);
