@@ -1554,13 +1554,17 @@ async function openShiftOpenModal() {
   box.innerHTML = '<p class="muted">Загрузка кошельков…</p>';
   modal.showModal();
   try {
+    // Без открытой смены balances = весь период; явно берём wallets_all_time.
     const cash = await api("/api/pos/cash-register?period=all").catch(() => null);
     const list = (storeConfig.payment_methods || []).filter((m) => m.is_active !== 0);
     const balMap = {};
     for (const b of (cash?.wallets_all_time || cash?.balances || [])) {
       balMap[b.code] = b;
     }
-    box.innerHTML = list.map((m) => {
+    let prefilledTotal = 0;
+    box.innerHTML = `
+      <p class="hint" style="margin:0 0 .5rem">Суммы подставлены из текущих остатков. Если оставить пустым — система сама перенесёт остатки, чтобы они не обнулились.</p>
+      ${list.map((m) => {
       const bal = balMap[m.code] || {};
       const bound = (m.currency_code || inferWalletCurrency(bal) || "").toUpperCase();
       const currencies = bound === "USD" || bound === "TJS"
@@ -1569,11 +1573,12 @@ async function openShiftOpenModal() {
       const fields = currencies.map((cur) => {
         const row = (bal.by_currency || []).find((r) => String(r.code).toUpperCase() === cur);
         const prefill = row ? Math.max(0, +row.net || 0) : 0;
+        prefilledTotal += prefill;
         const label = cur === "USD" ? "$" : "смн";
         return `<label class="shift-open-amt">
           <span>${label}</span>
-          <input type="number" class="input" min="0" step="0.01" value="${prefill}"
-            data-open-amt data-method="${esc(m.code)}" data-currency="${cur}">
+          <input type="number" class="input" min="0" step="0.01" value="${prefill || ""}"
+            data-open-amt data-method="${esc(m.code)}" data-currency="${cur}" placeholder="0">
         </label>`;
       }).join("");
       const typeHint = (m.method_type || "") === "cash" ? "наличные" : "безнал";
@@ -1584,7 +1589,14 @@ async function openShiftOpenModal() {
         </div>
         <div class="shift-open-fields">${fields}</div>
       </div>`;
-    }).join("") || '<p class="muted">Нет активных способов оплаты — добавьте в Настройках</p>';
+    }).join("") || '<p class="muted">Нет активных способов оплаты — добавьте в Настройках</p>'}`;
+    if (prefilledTotal < 0.01) {
+      const tip = document.createElement("p");
+      tip.className = "hint";
+      tip.style.color = "var(--danger, #c44)";
+      tip.textContent = "Сейчас в ledger остатки нулевые — проверьте цифры вручную перед открытием.";
+      box.prepend(tip);
+    }
   } catch (err) {
     box.innerHTML = `<p class="muted">${esc(err.message)}</p>`;
   }
@@ -1595,7 +1607,8 @@ async function submitShiftOpen(e) {
   const opening_wallets = [];
   document.querySelectorAll("#shift-open-wallets input[data-open-amt]").forEach((inp) => {
     const amount = Math.max(0, +inp.value || 0);
-    if (!(amount > 0)) return;
+    // Отправляем и нули: сервер отличит «указали 0» от «не указали»
+    // и сам дотянет только отсутствующие кошельки с остатком.
     opening_wallets.push({
       method_code: inp.dataset.method,
       currency_code: inp.dataset.currency || "TJS",
@@ -1603,12 +1616,17 @@ async function submitShiftOpen(e) {
     });
   });
   try {
-    await api("/api/shifts/open", {
+    const opened = await api("/api/shifts/open", {
       method: "POST",
       body: JSON.stringify({ opening_wallets, opening_cash: 0 }),
     });
     document.getElementById("shift-open-modal")?.close();
-    toast(opening_wallets.length ? "Смена открыта со стартовыми суммами" : "Смена открыта");
+    const n = (opened.opening_wallets || []).filter((w) => +w.amount > 0).length;
+    if (opened.auto_carried_opening) {
+      toast(n ? "Смена открыта: остатки перенесены с кассы" : "Смена открыта");
+    } else {
+      toast(n ? "Смена открыта со стартовыми суммами" : "Смена открыта");
+    }
     loadPosCashRegister();
   } catch (err) {
     toast(err.message, "error");

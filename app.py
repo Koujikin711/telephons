@@ -5655,7 +5655,7 @@ async def web_manifest():
 async def health():
     return {
         "status": "ok",
-        "build": "unit-card-dblclick-v1",
+        "build": "shift-open-carry-balances-v1",
         "db": str(DB_PATH),
         "db_exists": DB_PATH.exists(),
     }
@@ -6899,6 +6899,31 @@ async def current_shift(x_pin: str | None = Header(default=None, alias="X-Pin"))
         }
 
 
+def opening_wallets_from_ledger(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Текущие остатки кошельков (весь ledger) — для старта смены."""
+    out: list[dict[str, Any]] = []
+    for b in (_period_cash_by_currency(conn, "all").get("balances") or []):
+        code = (b.get("code") or "").strip()
+        if not code:
+            continue
+        pm = get_payment_method(conn, code)
+        name = b.get("name") or (pm["name"] if pm else code)
+        mtype = b.get("method_type") or (pm["method_type"] if pm else "")
+        for row in b.get("by_currency") or []:
+            cur = str(row.get("code") or "TJS").strip().upper() or "TJS"
+            amt = round(float(row.get("net") or 0), 2)
+            if abs(amt) < 0.005:
+                continue
+            out.append({
+                "method_code": code,
+                "method_name": name,
+                "method_type": mtype,
+                "currency_code": cur,
+                "amount": amt,
+            })
+    return out
+
+
 @app.post("/api/shifts/open")
 async def open_shift(body: ShiftOpenIn, x_pin: str | None = Header(default=None, alias="X-Pin")):
     user = check_pin(x_pin)
@@ -6907,6 +6932,7 @@ async def open_shift(body: ShiftOpenIn, x_pin: str | None = Header(default=None,
             raise HTTPException(status_code=400, detail="Смена уже открыта")
         wallets: list[dict[str, Any]] = []
         opening_cash = float(body.opening_cash or 0)
+        provided: set[tuple[str, str]] = set()
         for w in body.opening_wallets:
             code = (w.method_code or "").strip()
             cur = (w.currency_code or "TJS").strip().upper() or "TJS"
@@ -6923,6 +6949,25 @@ async def open_shift(body: ShiftOpenIn, x_pin: str | None = Header(default=None,
                 "currency_code": cur,
                 "amount": amt,
             })
+            provided.add((code, cur))
+
+        # Если старт пустой или часть кошельков не указали — подтянуть текущие остатки,
+        # иначе после открытия «старт + день» обнуляет прошлые деньги.
+        auto_carried = False
+        ledger = opening_wallets_from_ledger(conn)
+        if not wallets:
+            wallets = ledger
+            auto_carried = bool(ledger)
+        else:
+            for row in ledger:
+                key = (row["method_code"], row["currency_code"])
+                if key in provided:
+                    continue
+                if float(row.get("amount") or 0) <= 0.005:
+                    continue
+                wallets.append(row)
+                auto_carried = True
+
         if wallets:
             # Нал смн — для совместимости со старым closing_cash
             opening_cash = round(
@@ -6963,6 +7008,7 @@ async def open_shift(body: ShiftOpenIn, x_pin: str | None = Header(default=None,
         data["opening_wallets"] = json.loads(data.get("opening_wallets_json") or "[]")
     except json.JSONDecodeError:
         data["opening_wallets"] = []
+    data["auto_carried_opening"] = auto_carried
     return data
 
 
