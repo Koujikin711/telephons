@@ -6951,13 +6951,16 @@ async def open_shift(body: ShiftOpenIn, x_pin: str | None = Header(default=None,
             })
             provided.add((code, cur))
 
-        # Если старт пустой или часть кошельков не указали — подтянуть текущие остатки,
+        # Если старт пустой / все нули — перенести текущие остатки ledger,
         # иначе после открытия «старт + день» обнуляет прошлые деньги.
+        # Недостающие кошельки (не пришли в запросе) тоже дотягиваем.
         auto_carried = False
         ledger = opening_wallets_from_ledger(conn)
-        if not wallets:
+        positive = [w for w in wallets if float(w.get("amount") or 0) > 0.005]
+        if not positive and ledger:
             wallets = ledger
-            auto_carried = bool(ledger)
+            auto_carried = True
+            provided = {(w["method_code"], w["currency_code"]) for w in wallets}
         else:
             for row in ledger:
                 key = (row["method_code"], row["currency_code"])
@@ -6967,7 +6970,10 @@ async def open_shift(body: ShiftOpenIn, x_pin: str | None = Header(default=None,
                     continue
                 wallets.append(row)
                 auto_carried = True
+                provided.add(key)
 
+        # Убрать явные нули из JSON старта (шум), оставить только реальные суммы
+        wallets = [w for w in wallets if float(w.get("amount") or 0) > 0.005]
         if wallets:
             # Нал смн — для совместимости со старым closing_cash
             opening_cash = round(
