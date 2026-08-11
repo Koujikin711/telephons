@@ -1434,10 +1434,24 @@ button.pos-balance-btn:hover {
 }
 .opiu-summary-table th:nth-child(2),
 .opiu-summary-table th:nth-child(3),
+.opiu-summary-table th:nth-child(4),
 .opiu-summary-table td.num {
   text-align: right;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
+}
+.opiu-detail-grid-3 {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+.opiu-compare-bar {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.75rem;
+  margin-bottom: 1rem;
+}
+@media (max-width: 1100px) {
+  .opiu-detail-grid-3,
+  .opiu-compare-bar { grid-template-columns: 1fr; }
 }
 .opiu-summary-table .opiu-label { font-weight: 600; }
 .opiu-summary-table tr.opiu-total td {

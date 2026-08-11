@@ -12089,6 +12089,7 @@ def _opiu_column_snapshot(
     month: int,
     month_start: str,
     closing_as_of: str,
+    include_wallets: bool = True,
 ) -> dict[str, Any]:
     wh = conn.execute(
         "SELECT id, name, currency_code FROM warehouses WHERE id = ?", (warehouse_id,)
@@ -12099,10 +12100,15 @@ def _opiu_column_snapshot(
     stock_open = _warehouse_stock_value_as_of(conn, warehouse_id, month_start, exclusive=True)
     # Closing money/debt as of day before month → opening money/debt
     prev_day = (datetime.strptime(month_start, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
-    money_open_all = _money_by_currency_as_of(conn, prev_day)
-    debt_open_all = _debt_net_by_currency_as_of(conn, prev_day)
-    money_open = money_open_all.get(cur) or {"cash": 0.0, "card": 0.0, "total": 0.0}
-    debt_open = (debt_open_all.get("by_currency") or {}).get(cur) or {"net": 0.0}
+    if include_wallets:
+        money_open_all = _money_by_currency_as_of(conn, prev_day)
+        debt_open_all = _debt_net_by_currency_as_of(conn, prev_day)
+        money_open = money_open_all.get(cur) or {"cash": 0.0, "card": 0.0, "total": 0.0}
+        debt_open = (debt_open_all.get("by_currency") or {}).get(cur) or {"net": 0.0}
+    else:
+        money_open = {"cash": 0.0, "card": 0.0, "total": 0.0}
+        debt_open = {"net": 0.0}
+        debt_open_all = {"by_currency": {}, "detail": {}}
 
     opening = round(
         float(stock_open["value"]) + float(debt_open.get("net") or 0) + float(money_open.get("total") or 0),
@@ -12127,12 +12133,17 @@ def _opiu_column_snapshot(
     else:
         stock_close = _warehouse_stock_value_as_of(conn, warehouse_id, closing_as_of, exclusive=False)
 
-    money_close_all = _money_by_currency_as_of(conn, closing_as_of)
-    debt_close_all = _debt_net_by_currency_as_of(conn, closing_as_of)
-    money_close = money_close_all.get(cur) or {"cash": 0.0, "card": 0.0, "total": 0.0}
-    debt_close = (debt_close_all.get("by_currency") or {}).get(cur) or {
-        "net": 0.0, "debtors": 0.0, "creditors": 0.0,
-    }
+    if include_wallets:
+        money_close_all = _money_by_currency_as_of(conn, closing_as_of)
+        debt_close_all = _debt_net_by_currency_as_of(conn, closing_as_of)
+        money_close = money_close_all.get(cur) or {"cash": 0.0, "card": 0.0, "total": 0.0}
+        debt_close = (debt_close_all.get("by_currency") or {}).get(cur) or {
+            "net": 0.0, "debtors": 0.0, "creditors": 0.0,
+        }
+    else:
+        money_close = {"cash": 0.0, "card": 0.0, "total": 0.0}
+        debt_close = {"net": 0.0, "debtors": 0.0, "creditors": 0.0}
+        debt_close_all = {"by_currency": {}, "detail": {}}
 
     stock_v = round(float(stock_close["value"]), 2)
     debt_net = round(float(debt_close.get("net") or 0), 2)
@@ -12145,6 +12156,7 @@ def _opiu_column_snapshot(
         "warehouse_name": wh["name"] if wh else f"#{warehouse_id}",
         "currency_code": cur,
         "currency": currency_meta(cur),
+        "include_wallets": include_wallets,
         "opening": opening,
         "z_profit": z_profit,
         "z_revenue": round(float(z.get("revenue") or 0), 2),
@@ -12194,6 +12206,7 @@ def _report_opiu_summary(
     )
     bu_id = resolve_bu_warehouse_id(conn)
     main_id = get_default_warehouse_id(conn)
+    part_id = resolve_partnership_warehouse_id(conn)
 
     bu = _opiu_column_snapshot(
         conn,
@@ -12203,6 +12216,7 @@ def _report_opiu_summary(
         month=month,
         month_start=month_start,
         closing_as_of=closing_as_of,
+        include_wallets=True,
     )
     main = _opiu_column_snapshot(
         conn,
@@ -12212,6 +12226,18 @@ def _report_opiu_summary(
         month=month,
         month_start=month_start,
         closing_as_of=closing_as_of,
+        include_wallets=True,
+    )
+    # Партнёрство — та же схема по складу/Z; деньги и долги $ уже в колонке Основной
+    part = _opiu_column_snapshot(
+        conn,
+        warehouse_id=part_id,
+        currency_code="USD",
+        year=year,
+        month=month,
+        month_start=month_start,
+        closing_as_of=closing_as_of,
+        include_wallets=False,
     )
 
     rate_at = f"{closing_as_of} 23:59:59"
@@ -12225,10 +12251,38 @@ def _report_opiu_summary(
     except HTTPException:
         bu_closing_usd = round(float(bu["closing"]) / usd_rate, 2) if usd_rate > 0 else 0.0
 
-    compare = round(bu_closing_usd - float(main["closing"]), 2)
+    main_closing = float(main["closing"])
+    part_closing = float(part["closing"])
+    compare_bu_main = round(bu_closing_usd - main_closing, 2)
+    compare_main_part = round(main_closing - part_closing, 2)
+    compare_bu_part = round(bu_closing_usd - part_closing, 2)
+
     bu["diff_usd"] = bu_diff_usd
     bu["closing_usd"] = bu_closing_usd
-    main["compare_vs_bu"] = compare
+    main["compare_vs_bu"] = compare_bu_main
+    part["compare_vs_main"] = compare_main_part
+    part["compare_vs_bu"] = compare_bu_part
+
+    comparisons = [
+        {
+            "key": "bu_main",
+            "label": "Б/У ($) − Основной",
+            "amount": compare_bu_main,
+            "currency_code": "USD",
+        },
+        {
+            "key": "main_part",
+            "label": "Основной − Партнёрство",
+            "amount": compare_main_part,
+            "currency_code": "USD",
+        },
+        {
+            "key": "bu_part",
+            "label": "Б/У ($) − Партнёрство",
+            "amount": compare_bu_part,
+            "currency_code": "USD",
+        },
+    ]
 
     return {
         "period_label": label,
@@ -12244,24 +12298,79 @@ def _report_opiu_summary(
             "closing": "склад + (дебиторка − кредиторка) + (нал + карты)",
             "diff": "сальдо_конец − должно",
             "diff_usd": "разница_БУ_смн → $ по курсу на конец месяца",
-            "compare": "остаток_БУ_$ − остаток_Основной_$",
+            "partnership_note": "У Партнёрства в сальдо только склад (деньги/$ долги — в колонке Основной, без двойного счёта)",
+            "compare": "остатки на конец между Б/У$, Основной и Партнёрство",
         },
         "bu": bu,
         "main": main,
+        "partnership": part,
+        "comparisons": comparisons,
         "rows": [
-            {"key": "opening", "label": "Сальдо на начало", "bu": bu["opening"], "main": main["opening"]},
-            {"key": "z_profit", "label": "Z-прибыль склада", "bu": bu["z_profit"], "main": main["z_profit"]},
-            {"key": "should", "label": "Итого «должно»", "bu": bu["should"], "main": main["should"], "total": True},
-            {"key": "stock", "label": "Товары на складе", "bu": bu["stock"], "main": main["stock"]},
-            {"key": "debt_net", "label": "Дебиторка − кредиторка", "bu": bu["debt_net"], "main": main["debt_net"]},
-            {"key": "money", "label": "Наличные + карты", "bu": bu["money"], "main": main["money"]},
-            {"key": "closing", "label": "Сальдо на конец", "bu": bu["closing"], "main": main["closing"], "total": True},
-            {"key": "diff", "label": "Разница (есть − должно)", "bu": bu["diff"], "main": main["diff"], "emph": True},
+            {
+                "key": "opening",
+                "label": "Сальдо на начало",
+                "bu": bu["opening"],
+                "main": main["opening"],
+                "partnership": part["opening"],
+            },
+            {
+                "key": "z_profit",
+                "label": "Z-прибыль склада",
+                "bu": bu["z_profit"],
+                "main": main["z_profit"],
+                "partnership": part["z_profit"],
+            },
+            {
+                "key": "should",
+                "label": "Итого «должно»",
+                "bu": bu["should"],
+                "main": main["should"],
+                "partnership": part["should"],
+                "total": True,
+            },
+            {
+                "key": "stock",
+                "label": "Товары на складе",
+                "bu": bu["stock"],
+                "main": main["stock"],
+                "partnership": part["stock"],
+            },
+            {
+                "key": "debt_net",
+                "label": "Дебиторка − кредиторка",
+                "bu": bu["debt_net"],
+                "main": main["debt_net"],
+                "partnership": part["debt_net"],
+            },
+            {
+                "key": "money",
+                "label": "Наличные + карты",
+                "bu": bu["money"],
+                "main": main["money"],
+                "partnership": part["money"],
+            },
+            {
+                "key": "closing",
+                "label": "Сальдо на конец",
+                "bu": bu["closing"],
+                "main": main["closing"],
+                "partnership": part["closing"],
+                "total": True,
+            },
+            {
+                "key": "diff",
+                "label": "Разница (есть − должно)",
+                "bu": bu["diff"],
+                "main": main["diff"],
+                "partnership": part["diff"],
+                "emph": True,
+            },
             {
                 "key": "footer",
-                "label": "Разница БУ в $ / сравнение остатков",
+                "label": "Разница БУ в $",
                 "bu": bu_diff_usd,
-                "main": compare,
+                "main": None,
+                "partnership": None,
                 "emph": True,
             },
         ],

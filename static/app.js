@@ -6279,6 +6279,7 @@ function opiuSignedClass(n) {
 function renderOpiuDetailBlocks(r) {
   const bu = r.bu || {};
   const main = r.main || {};
+  const part = r.partnership || {};
   const block = (col, title) => {
     const b = col.breakdown || {};
     const debt = b.debt || {};
@@ -6291,8 +6292,12 @@ function renderOpiuDetailBlocks(r) {
         ${items.map((x) => `<tr><td>${esc(x[nameKey] || x.product_name || x.imei || "—")}</td><td>${opiuMoney(x.amount ?? x.value, col.currency_code)}</td></tr>`).join("")}
       </tbody></table>`;
     };
+    const walletHint = col.include_wallets === false
+      ? `<p class="hint">Деньги и долги $ учтены в колонке Основной</p>`
+      : "";
     return `<div class="opiu-detail-col">
       <h4>${esc(title)} · ${esc(col.warehouse_name || "")}</h4>
+      ${walletHint}
       <div class="opiu-mini-kpi">
         <div><span>Склад</span><strong>${opiuMoney(col.stock, col.currency_code)}</strong></div>
         <div><span>Дебиторы</span><strong>${opiuMoney(debt.debtors, col.currency_code)}</strong></div>
@@ -6315,12 +6320,26 @@ function renderOpiuDetailBlocks(r) {
       </details>
     </div>`;
   };
-  return `<div class="opiu-detail-grid">${block(bu, "Б/У (смн)")}${block(main, "Основной ($)")}</div>`;
+  return `<div class="opiu-detail-grid opiu-detail-grid-3">${block(bu, "Б/У (смн)")}${block(main, "Основной ($)")}${block(part, "Партнёрство ($)")}</div>`;
+}
+
+function renderOpiuComparisons(r) {
+  const items = r.comparisons || [];
+  if (!items.length) return "";
+  return `<div class="opiu-compare-bar">
+    ${items.map((c) => `
+      <div class="opiu-saldo-item">
+        <span>${esc(c.label)}</span>
+        <strong class="${opiuSignedClass(c.amount)}">${opiuMoney(c.amount, c.currency_code || "USD")}</strong>
+      </div>`).join("")}
+  </div>`;
 }
 
 function renderOpiuSummaryTable(r) {
   const buCur = r.bu?.currency_code || "TJS";
   const mainCur = r.main?.currency_code || "USD";
+  const partCur = r.partnership?.currency_code || "USD";
+  const cell = (v, code) => (v == null ? "—" : opiuMoney(v, code));
   const rows = (r.rows || []).map((row) => {
     const cls = [
       row.total ? "opiu-total" : "",
@@ -6329,19 +6348,20 @@ function renderOpiuSummaryTable(r) {
     ].filter(Boolean).join(" ");
     return `<tr class="${cls}" data-opiu-key="${esc(row.key || "")}">
       <td class="opiu-label">${esc(row.label)}</td>
-      <td class="num ${opiuSignedClass(row.bu)}">${opiuMoney(row.bu, buCur)}</td>
-      <td class="num ${opiuSignedClass(row.main)}">${opiuMoney(row.main, mainCur)}</td>
+      <td class="num ${opiuSignedClass(row.bu)}">${cell(row.bu, buCur)}</td>
+      <td class="num ${opiuSignedClass(row.main)}">${cell(row.main, mainCur)}</td>
+      <td class="num ${opiuSignedClass(row.partnership)}">${cell(row.partnership, partCur)}</td>
     </tr>`;
   }).join("");
   return `
-    <div class="opiu-saldo-bar">
+    <div class="opiu-saldo-bar opiu-saldo-bar-4">
       <div class="opiu-saldo-item">
         <span>Сальдо на начало · ${esc(r.date_from || "")}</span>
-        <strong>${opiuMoney(r.bu?.opening, buCur)} <span class="hint">/</span> ${opiuMoney(r.main?.opening, mainCur)}</strong>
+        <strong>${opiuMoney(r.bu?.opening, buCur)} <span class="hint">/</span> ${opiuMoney(r.main?.opening, mainCur)} <span class="hint">/</span> ${opiuMoney(r.partnership?.opening, partCur)}</strong>
       </div>
       <div class="opiu-saldo-item">
         <span>Сальдо на конец · ${esc(r.closing_as_of || r.date_to || "")}</span>
-        <strong>${opiuMoney(r.bu?.closing, buCur)} <span class="hint">/</span> ${opiuMoney(r.main?.closing, mainCur)}</strong>
+        <strong>${opiuMoney(r.bu?.closing, buCur)} <span class="hint">/</span> ${opiuMoney(r.main?.closing, mainCur)} <span class="hint">/</span> ${opiuMoney(r.partnership?.closing, partCur)}</strong>
       </div>
       <div class="opiu-saldo-item">
         <span>Курс USD на конец</span>
@@ -6355,6 +6375,7 @@ function renderOpiuSummaryTable(r) {
             <th></th>
             <th>Б/У · ${esc(r.bu?.warehouse_name || "смн")}</th>
             <th>Основной · ${esc(r.main?.warehouse_name || "$")}</th>
+            <th>Партнёрство · ${esc(r.partnership?.warehouse_name || "$")}</th>
           </tr>
         </thead>
         <tbody>${rows}</tbody>
@@ -6362,9 +6383,11 @@ function renderOpiuSummaryTable(r) {
       <p class="hint" style="margin-top:.75rem">
         Должно = сальдо начало + Z-прибыль.
         Конец = склад + (дебиторка − кредиторка) + (нал + карты).
-        Последняя строка: разница БУ в $ и «остаток БУ$ − остаток Основной$».
+        У Партнёрства в сальдо только склад — деньги и долги $ в колонке Основной (без двойного счёта).
       </p>
-    </div></div>`;
+    </div></div>
+    <h4 class="section-title" style="margin:1rem 0 .5rem">Разница между складами (остаток на конец, $)</h4>
+    ${renderOpiuComparisons(r)}`;
 }
 
 async function renderOpiuClassic(q) {
