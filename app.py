@@ -10,7 +10,7 @@ import logging
 import os
 import sqlite3
 from contextlib import asynccontextmanager, contextmanager
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
@@ -81,8 +81,25 @@ settings = Settings()
 settings.port = int(os.environ.get("PORT", settings.port))
 
 
+SHIFT_CLOSE_EXPLAIN_BUILD = "v1"
+
 def utc_now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def normalize_entry_datetime(raw: str | None) -> str:
+    """YYYY-MM-DD or datetime → 'YYYY-MM-DD HH:MM:SS'. Empty → now."""
+    s = (raw or "").strip().replace("T", " ")
+    if not s:
+        return utc_now()
+    now = utc_now()
+    if len(s) >= 19 and s[4] == "-" and s[7] == "-":
+        return s[:19]
+    if len(s) >= 16 and s[4] == "-" and s[7] == "-":
+        return s[:16] + ":00"
+    if len(s) >= 10 and s[4] == "-" and s[7] == "-":
+        return s[:10] + " " + now[11:19]
+    raise HTTPException(status_code=400, detail="Некорректная дата. Формат: ГГГГ-ММ-ДД")
 
 
 def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -93,7 +110,34 @@ def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
 
 
 def normalize_search_q(q: str) -> str:
-    return q.strip()
+    return (q or "").strip()
+
+
+# Cyrillic letters often typed instead of Latin lookalikes in serials (у→y, с→c…).
+_SEARCH_LOOKALIKE = str.maketrans({
+    "а": "a", "А": "a", "е": "e", "Е": "e", "ё": "e", "Ё": "e",
+    "о": "o", "О": "o", "р": "p", "Р": "p", "с": "c", "С": "c",
+    "у": "y", "У": "y", "х": "x", "Х": "x", "к": "k", "К": "k",
+    "м": "m", "М": "m", "т": "t", "Т": "t", "в": "b", "В": "b",
+    "н": "h", "Н": "h", "і": "i", "І": "i",
+})
+
+
+def fold_search_text(s: str) -> str:
+    return (s or "").translate(_SEARCH_LOOKALIKE).lower()
+
+
+def search_variants(q: str) -> list[str]:
+    """Original query plus Cyrillic→Latin folded form for LIKE matching."""
+    q = normalize_search_q(q)
+    if not q:
+        return []
+    folded = fold_search_text(q)
+    out: list[str] = []
+    for v in (q, folded, q.lower()):
+        if v and v.lower() not in {x.lower() for x in out}:
+            out.append(v)
+    return out
 
 
 def only_digits(s: str) -> str:
@@ -106,40 +150,65 @@ def is_code_query(q: str) -> bool:
     return len(d) >= 5 and len(d) == len(q.replace(" ", "").replace("-", ""))
 
 
+def is_serial_query(q: str) -> bool:
+    """Short alphanumeric serial — search all warehouses (like IMEI)."""
+    q = normalize_search_q(q)
+    if not q or " " in q:
+        return False
+    compact = re.sub(r"[\s\-_/]", "", fold_search_text(q))
+    if len(compact) < 3 or len(compact) > 25:
+        return False
+    if not re.fullmatch(r"[a-z0-9]+", compact):
+        return False
+    # "aw11" / short model tokens start with a letter — treat as name, not serial.
+    if compact[0].isalpha() and len(compact) <= 6 and sum(c.isdigit() for c in compact) <= 2:
+        return False
+    return True
+
+
 def product_search_sql(q: str) -> tuple[str, list[Any]]:
     q = normalize_search_q(q)
     if not q:
         return "", []
-    like = f"%{q}%"
+    variants = search_variants(q)
     fields = (
         "p.name", "p.brand", "p.sku", "p.barcode", "p.supplier_name",
         "p.model", "p.color", "p.memory", "p.specs_extra", "p.ram",
     )
-    text = " OR ".join(f"LOWER({f}) LIKE LOWER(?)" for f in fields)
-    params: list[Any] = [like] * len(fields)
+    parts: list[str] = []
+    params: list[Any] = []
+    compact = re.sub(r"\s+", "", fold_search_text(q))
+    for f in fields:
+        for v in variants:
+            parts.append(f"LOWER(COALESCE({f}, '')) LIKE LOWER(?)")
+            params.append(f"%{v}%")
+        if compact:
+            parts.append(f"REPLACE(LOWER(COALESCE({f}, '')), ' ', '') LIKE ?")
+            params.append(f"%{compact}%")
     d = only_digits(q)
     if len(d) >= 5 and re.fullmatch(r"[\d\s-]+", q):
         suffix = d[-min(len(d), 15):]
-        unit_sql = """
-            OR EXISTS (
+        parts.append(
+            """EXISTS (
                 SELECT 1 FROM product_units u
-                WHERE u.product_id = p.id AND u.status = 'in_stock'
+                WHERE u.product_id = p.id AND u.status IN ('in_stock', 'reserved')
                   AND (u.imei LIKE ? OR u.serial LIKE ? OR u.imei LIKE ? OR u.serial LIKE ?)
-            )
-        """
-        text = f"({text}{unit_sql})"
+            )"""
+        )
         params.extend([f"%{suffix}", f"%{suffix}", f"%{d}%", f"%{d}%"])
     else:
-        unit_sql = """
-            OR EXISTS (
-                SELECT 1 FROM product_units u
-                WHERE u.product_id = p.id AND u.status = 'in_stock'
-                  AND (u.imei LIKE ? OR u.serial LIKE ?)
+        for v in variants:
+            like = f"%{v}%"
+            parts.append(
+                """EXISTS (
+                    SELECT 1 FROM product_units u
+                    WHERE u.product_id = p.id AND u.status IN ('in_stock', 'reserved')
+                      AND (LOWER(COALESCE(u.imei,'')) LIKE LOWER(?)
+                           OR LOWER(COALESCE(u.serial,'')) LIKE LOWER(?))
+                )"""
             )
-        """
-        text = f"({text}{unit_sql})"
-        params.extend([like, like])
-    return f" AND {text}", params
+            params.extend([like, like])
+    return f" AND ({' OR '.join(parts)})", params
 
 
 def sale_search_sql(q: str) -> tuple[str, list[Any]]:
@@ -211,7 +280,13 @@ def imei_digits_expr(col: str) -> str:
     )
 
 
-def unit_search_sql(q: str, imei_col: str = "u.imei", serial_col: str = "u.serial") -> tuple[str, list[Any]]:
+def unit_search_sql(
+    q: str,
+    imei_col: str = "u.imei",
+    serial_col: str = "u.serial",
+    *,
+    with_product: bool = False,
+) -> tuple[str, list[Any]]:
     q = normalize_search_q(q)
     if not q:
         return "", []
@@ -231,8 +306,24 @@ def unit_search_sql(q: str, imei_col: str = "u.imei", serial_col: str = "u.seria
                 f"%{suffix}", f"%{suffix}", f"%{d}%", f"%{d}%",
             ],
         )
-    like = f"%{q}%"
-    return f" AND ({imei_col} LIKE ? OR {serial_col} LIKE ?)", [like, like]
+    parts: list[str] = []
+    params: list[Any] = []
+    for v in search_variants(q):
+        like = f"%{v}%"
+        parts.append(f"LOWER(COALESCE({imei_col}, '')) LIKE LOWER(?)")
+        params.append(like)
+        parts.append(f"LOWER(COALESCE({serial_col}, '')) LIKE LOWER(?)")
+        params.append(like)
+    if with_product:
+        compact = re.sub(r"\s+", "", fold_search_text(q))
+        for field in ("p.name", "p.model", "p.color", "p.memory", "p.brand"):
+            for v in search_variants(q):
+                parts.append(f"LOWER(COALESCE({field}, '')) LIKE LOWER(?)")
+                params.append(f"%{v}%")
+            if compact:
+                parts.append(f"REPLACE(LOWER(COALESCE({field}, '')), ' ', '') LIKE ?")
+                params.append(f"%{compact}%")
+    return f" AND ({' OR '.join(parts)})", params
 
 
 def transfer_product_units(
@@ -322,6 +413,13 @@ def _add_column(conn: sqlite3.Connection, table: str, column: str, definition: s
     cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
     if column not in cols:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def _has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    if not _table_exists(conn, table):
+        return False
+    cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    return column in cols
 
 
 def migrate_db(conn: sqlite3.Connection) -> None:
@@ -420,6 +518,7 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     _add_column(conn, "receivable_payments", "pay_currency_code", "TEXT DEFAULT ''")
     _add_column(conn, "receivable_payments", "fx_rate", "REAL")
     _add_column(conn, "cash_inflows", "mutual_entry_id", "INTEGER")
+    _add_column(conn, "cash_inflows", "meta_json", "TEXT DEFAULT ''")
     _add_column(conn, "payment_methods", "currency_code", "TEXT NOT NULL DEFAULT ''")
     _backfill_payment_method_currencies(conn)
     if _table_exists(conn, "product_units"):
@@ -5291,6 +5390,7 @@ class SaleIn(BaseModel):
     debtor_phone: str = ""
     pay_currency: str = ""  # alternate currency for FX payments
     fx_rate: float | None = Field(default=None, gt=0)  # 1 sale_currency = fx_rate pay_currency
+    sale_date: str = ""  # YYYY-MM-DD — дата продажи (пусто = сейчас)
 
 
 class CurrencySettingsIn(BaseModel):
@@ -5365,6 +5465,7 @@ class CashInflowIn(BaseModel):
     mutual_entry_id: int | None = None
     fx_rate: float | None = Field(default=None, gt=0)  # 1 USD = fx_rate TJS
     notes: str = ""
+    entry_date: str = ""  # YYYY-MM-DD — дата прихода (пусто = сейчас)
 
 
 class AccessoryInboundIn(BaseModel):
@@ -5956,6 +6057,68 @@ async def delete_cash_inflow(inflow_id: int, x_pin: str | None = Header(default=
     return {"ok": True, "deleted": row_to_dict(row)}
 
 
+@app.get("/api/pos/cash-inflows/{inflow_id}/explain")
+async def explain_cash_inflow(inflow_id: int, x_pin: str | None = Header(default=None, alias="X-Pin")):
+    """Детальный отчёт: откуда взялась сумма пересчёта смены."""
+    check_pin(x_pin)
+    with db() as conn:
+        if not _table_exists(conn, "cash_inflows"):
+            raise HTTPException(status_code=404, detail="Не найдено")
+        row = conn.execute("SELECT * FROM cash_inflows WHERE id = ?", (inflow_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Не найдено")
+        if (row["source_type"] or "") != "shift_close":
+            raise HTTPException(status_code=400, detail="Детализация доступна только для пересчёта смены")
+        meta_raw = ""
+        if _has_column(conn, "cash_inflows", "meta_json"):
+            meta_raw = (row["meta_json"] if "meta_json" in row.keys() else "") or ""
+        if meta_raw:
+            try:
+                data = json.loads(meta_raw)
+                if isinstance(data, dict) and data.get("ledger"):
+                    data["inflow_id"] = inflow_id
+                    return data
+            except Exception:
+                pass
+        notes = row["notes"] or ""
+        m = re.search(r"shift_close:(\d+)", notes)
+        shift_id = int(m.group(1)) if m else 0
+        delta = float(row["amount"] or 0)
+        method = row["payment_method_code"] or "cash"
+        cur = (row["currency_code"] or "TJS").upper()
+        closed_at = row["created_at"] or utc_now()
+        actual = None
+        ledger_before = None
+        m2 = re.search(
+            r"факт\s+([-\d.]+)\s*[−\-]\s*учёт\s+([-\d.]+)\s*=\s*([+\-]?\d[\d.]*)",
+            notes,
+            re.I,
+        )
+        if m2:
+            actual = float(m2.group(1))
+            ledger_before = float(m2.group(2))
+            delta = float(m2.group(3))
+        else:
+            bd = wallet_ledger_breakdown(
+                conn, method, cur, before_at=closed_at, exclude_shift_close_id=inflow_id,
+            )
+            ledger_before = float(bd.get("net") or 0)
+            actual = round(ledger_before + delta, 2)
+        if not shift_id:
+            raise HTTPException(status_code=400, detail="Не удалось определить номер смены")
+        return build_shift_close_explain(
+            conn,
+            shift_id=shift_id,
+            method_code=method,
+            currency_code=cur,
+            actual=actual,
+            ledger_before=ledger_before,
+            delta=delta,
+            closed_at=closed_at,
+            inflow_id=inflow_id,
+        )
+
+
 def _pos_lines_window(period: str) -> tuple[str, str, str, str]:
     """Return (period_key, date_from, date_to, label) for POS line lists."""
     today = utc_now()[:10]
@@ -5975,38 +6138,64 @@ def _pos_lines_window(period: str) -> tuple[str, str, str, str]:
 
 @app.get("/api/pos/cash-lines")
 async def pos_cash_lines(
-    period: str = Query(default="day", pattern="^(day|yesterday|week|month|all)$"),
+    period: str = Query(default=""),
+    q: str = Query(default=""),
     x_pin: str | None = Header(default=None, alias="X-Pin"),
 ):
     """Expenses + inflows for a selectable period (for delete / review of past days)."""
     check_pin(x_pin)
+    period = (period or "").strip() or "all"
+    if period not in ("day", "yesterday", "week", "month", "all"):
+        period = "all"
+    q = normalize_search_q(q)
     period_key, date_from, date_to, label = _pos_lines_window(period)
     with db() as conn:
         exp_clause, exp_params, _ = _report_period_clause(period_key, date_from, date_to, "e.expense_date")
+        exp_q = ""
+        exp_q_params: list[Any] = []
+        if q:
+            like = f"%{q}%"
+            exp_q = """ AND (
+                LOWER(COALESCE(e.category, '')) LIKE LOWER(?)
+                OR LOWER(COALESCE(e.payee, '')) LIKE LOWER(?)
+                OR LOWER(COALESCE(e.description, '')) LIKE LOWER(?)
+                OR LOWER(COALESCE(w.name, '')) LIKE LOWER(?)
+            )"""
+            exp_q_params = [like, like, like, like]
         exp_rows = conn.execute(
             f"""
             SELECT e.*, COALESCE(w.name, '') AS warehouse_name
             FROM expenses e
             LEFT JOIN warehouses w ON w.id = e.warehouse_id
-            WHERE COALESCE(e.affects_cash, 1) = 1 {exp_clause}
+            WHERE COALESCE(e.affects_cash, 1) = 1 {exp_clause}{exp_q}
             ORDER BY e.expense_date DESC, e.id DESC
             LIMIT 300
             """,
-            list(exp_params),
+            list(exp_params) + exp_q_params,
         ).fetchall()
         inflows: list[dict[str, Any]] = []
         if _table_exists(conn, "cash_inflows"):
             iclause, iparams, _ = _report_period_clause(period_key, date_from, date_to, "created_at")
+            in_q = ""
+            in_q_params: list[Any] = []
+            if q:
+                like = f"%{q}%"
+                in_q = """ AND (
+                    LOWER(COALESCE(counterparty_name, '')) LIKE LOWER(?)
+                    OR LOWER(COALESCE(notes, '')) LIKE LOWER(?)
+                    OR LOWER(COALESCE(source_type, '')) LIKE LOWER(?)
+                )"""
+                in_q_params = [like, like, like]
             inflows = [
                 row_to_dict(r)
                 for r in conn.execute(
                     f"""
                     SELECT * FROM cash_inflows
-                    WHERE 1=1 {iclause}
+                    WHERE 1=1 {iclause}{in_q}
                     ORDER BY created_at DESC
                     LIMIT 300
                     """,
-                    list(iparams),
+                    list(iparams) + in_q_params,
                 ).fetchall()
             ]
     return {
@@ -6014,6 +6203,7 @@ async def pos_cash_lines(
         "period_label": label,
         "date_from": date_from,
         "date_to": date_to,
+        "q": q,
         "expenses": [row_to_dict(r) for r in exp_rows],
         "cash_inflows": inflows,
     }
@@ -6064,7 +6254,7 @@ async def create_cash_inflow(body: CashInflowIn, x_pin: str | None = Header(defa
         pm = get_payment_method(conn, body.payment_method_code)
         if not pm:
             raise HTTPException(status_code=400, detail="Способ оплаты не найден")
-        now = utc_now()
+        now = normalize_entry_datetime(body.entry_date)
         currency = (body.currency_code or "TJS").upper().strip()
         base = get_setting(conn, "base_currency", "TJS").upper()
         amount = float(body.amount)
@@ -6798,6 +6988,316 @@ def balances_from_shift_expected(
     return sorted(result, key=lambda b: order.get(b["code"], 999))
 
 
+def wallet_ledger_breakdown(
+    conn: sqlite3.Connection,
+    method_code: str,
+    currency_code: str,
+    *,
+    before_at: str | None = None,
+    exclude_shift_close_id: int | None = None,
+) -> dict[str, Any]:
+    """Разбивка учётного остатка кошелька по источникам (+ крупные строки)."""
+    method = (method_code or "cash").strip()
+    cur = (currency_code or "TJS").strip().upper() or "TJS"
+    before = (before_at or "").strip()
+    parts: dict[str, float] = {
+        "sales": 0.0,
+        "debt_collections": 0.0,
+        "loans_in": 0.0,
+        "loans_out": 0.0,
+        "manual_inflows": 0.0,
+        "shift_opening": 0.0,
+        "shift_close_prev": 0.0,
+        "expenses": 0.0,
+        "supplier_payments": 0.0,
+    }
+    top: list[dict[str, Any]] = []
+
+    def push_top(at: str, side: str, source: str, who: str, amount: float, note: str = "") -> None:
+        top.append({
+            "at": at or "",
+            "side": side,
+            "source": source,
+            "who": who or "—",
+            "amount": round(float(amount or 0), 2),
+            "note": note or "",
+        })
+
+    sale_sql = """
+        SELECT s.created_at AS at, s.id AS sale_id,
+               COALESCE(NULLIF(sp.pay_amount, 0), sp.amount) AS amount,
+               COALESCE(NULLIF(s.user_name, ''), '—') AS who,
+               COALESCE(w.name, '') AS warehouse_name,
+               sp.method_code
+        FROM sale_payments sp
+        JOIN sales s ON s.id = sp.sale_id
+        LEFT JOIN warehouses w ON w.id = s.warehouse_id
+        WHERE s.status = 'completed' AND COALESCE(s.affects_cash, 1) = 1
+          AND UPPER(COALESCE(
+                NULLIF(TRIM(sp.pay_currency_code), ''),
+                NULLIF(TRIM(s.currency_code), ''),
+                'TJS'
+              )) = ?
+    """
+    sale_params: list[Any] = [cur]
+    if before:
+        sale_sql += " AND s.created_at < ?"
+        sale_params.append(before)
+    for r in conn.execute(sale_sql, sale_params).fetchall():
+        wcode = resolve_wallet_method_code(conn, r["method_code"] or "cash", cur)
+        if wcode != method:
+            continue
+        amt = float(r["amount"] or 0)
+        parts["sales"] += amt
+        push_top(r["at"], "+", "Продажа", r["who"], amt, f"#{r['sale_id']} · {r['warehouse_name'] or ''}".strip(" ·"))
+
+    if _table_exists(conn, "receivable_payments"):
+        recv_sql = """
+            SELECT rp.created_at AS at,
+                   COALESCE(NULLIF(rp.pay_amount, 0), rp.amount) AS amount,
+                   r.customer_name AS who, rp.payment_method_code
+            FROM receivable_payments rp
+            JOIN receivables r ON r.id = rp.receivable_id
+            LEFT JOIN sales s ON s.id = r.sale_id
+            WHERE COALESCE(s.affects_cash, 1) = 1
+              AND UPPER(COALESCE(
+                    NULLIF(TRIM(rp.pay_currency_code), ''),
+                    NULLIF(TRIM(s.currency_code), ''),
+                    'TJS'
+                  )) = ?
+        """
+        recv_params: list[Any] = [cur]
+        if before:
+            recv_sql += " AND rp.created_at < ?"
+            recv_params.append(before)
+        for r in conn.execute(recv_sql, recv_params).fetchall():
+            wcode = resolve_wallet_method_code(conn, r["payment_method_code"] or "cash", cur)
+            if wcode != method:
+                continue
+            amt = float(r["amount"] or 0)
+            parts["debt_collections"] += amt
+            push_top(r["at"], "+", "Погашение долга", r["who"] or "—", amt)
+
+    if _table_exists(conn, "mutual_payments"):
+        m_sql = """
+            SELECT mp.created_at AS at, me.direction,
+                   COALESCE(NULLIF(mp.pay_amount, 0), mp.amount) AS amount,
+                   me.person_name AS who, mp.payment_method_code,
+                   UPPER(COALESCE(
+                       NULLIF(TRIM(mp.pay_currency_code), ''),
+                       NULLIF(TRIM(me.currency_code), ''),
+                       'TJS'
+                   )) AS cur
+            FROM mutual_payments mp
+            JOIN mutual_entries me ON me.id = mp.entry_id
+            WHERE me.direction IN ('owe_us', 'we_owe')
+        """
+        m_params: list[Any] = []
+        if before:
+            m_sql += " AND mp.created_at < ?"
+            m_params.append(before)
+        for r in conn.execute(m_sql, m_params).fetchall():
+            if (r["cur"] or "TJS") != cur:
+                continue
+            wcode = resolve_wallet_method_code(conn, r["payment_method_code"] or "cash", cur)
+            if wcode != method:
+                continue
+            amt = float(r["amount"] or 0)
+            if r["direction"] == "owe_us":
+                parts["loans_in"] += amt
+                push_top(r["at"], "+", "Погашение займа", r["who"] or "—", amt)
+            else:
+                parts["loans_out"] += amt
+                push_top(r["at"], "−", "Оплата: мы должны", r["who"] or "—", amt)
+
+    if _table_exists(conn, "cash_inflows"):
+        c_sql = """
+            SELECT id, created_at AS at, amount, source_type, counterparty_name, notes,
+                   payment_method_code, currency_code
+            FROM cash_inflows
+            WHERE source_type IN ('counterparty', 'shift_close', 'shift_opening')
+              AND UPPER(COALESCE(NULLIF(TRIM(currency_code), ''), 'TJS')) = ?
+        """
+        c_params: list[Any] = [cur]
+        if before:
+            c_sql += " AND created_at < ?"
+            c_params.append(before)
+        for r in conn.execute(c_sql, c_params).fetchall():
+            if exclude_shift_close_id and int(r["id"]) == int(exclude_shift_close_id):
+                continue
+            wcode = resolve_wallet_method_code(conn, r["payment_method_code"] or "cash", cur)
+            if wcode != method:
+                continue
+            amt = float(r["amount"] or 0)
+            src = r["source_type"] or "counterparty"
+            if src == "shift_opening":
+                parts["shift_opening"] += amt
+                label = "Старт смены"
+            elif src == "shift_close":
+                parts["shift_close_prev"] += amt
+                label = "Пересчёт смены"
+            else:
+                parts["manual_inflows"] += amt
+                label = "Приход (контрагент)"
+            push_top(r["at"], "+" if amt >= 0 else "−", label, r["counterparty_name"] or "—", abs(amt), r["notes"] or "")
+
+    exp_sql = """
+        SELECT expense_date AS at, amount, category, description, payee, payment_method_code,
+               COALESCE(NULLIF(created_by, ''), '—') AS who,
+               created_at
+        FROM expenses
+        WHERE COALESCE(affects_cash, 1) = 1
+          AND UPPER(COALESCE(NULLIF(TRIM(currency_code), ''), 'TJS')) = ?
+    """
+    exp_params: list[Any] = [cur]
+    if before:
+        exp_sql += " AND (expense_date < ? OR (expense_date = ? AND (created_at IS NULL OR created_at < ?)))"
+        d = before[:10]
+        exp_params.extend([d, d, before])
+    for r in conn.execute(exp_sql, exp_params).fetchall():
+        wcode = resolve_wallet_method_code(conn, r["payment_method_code"] or "cash", cur)
+        if wcode != method:
+            continue
+        amt = float(r["amount"] or 0)
+        parts["expenses"] += amt
+        note = f"{r['category'] or ''} {r['payee'] or ''} {r['description'] or ''}".strip()
+        push_top(r["at"] or r["created_at"] or "", "−", "Расход / выплата", r["who"], amt, note)
+
+    if _table_exists(conn, "supplier_payments") and cur == "TJS":
+        s_sql = """
+            SELECT created_at AS at, amount, supplier_name, notes,
+                   COALESCE(payment_method_code, 'cash') AS payment_method_code
+            FROM supplier_payments WHERE 1=1
+        """
+        s_params: list[Any] = []
+        if before:
+            s_sql += " AND created_at < ?"
+            s_params.append(before)
+        for r in conn.execute(s_sql, s_params).fetchall():
+            wcode = resolve_wallet_method_code(conn, r["payment_method_code"] or "cash", "TJS")
+            if wcode != method:
+                continue
+            amt = float(r["amount"] or 0)
+            parts["supplier_payments"] += amt
+            push_top(r["at"], "−", "Оплата поставщику", r["supplier_name"] or "—", amt, r["notes"] or "")
+
+    net = (
+        parts["sales"] + parts["debt_collections"] + parts["loans_in"]
+        + parts["manual_inflows"] + parts["shift_opening"] + parts["shift_close_prev"]
+        - parts["expenses"] - parts["supplier_payments"] - parts["loans_out"]
+    )
+    plus = (
+        parts["sales"] + parts["debt_collections"] + parts["loans_in"]
+        + parts["manual_inflows"] + parts["shift_opening"] + max(0.0, parts["shift_close_prev"])
+    )
+    minus = (
+        parts["expenses"] + parts["supplier_payments"] + parts["loans_out"]
+        + abs(min(0.0, parts["shift_close_prev"]))
+    )
+    top_sorted = sorted(top, key=lambda x: -abs(float(x["amount"])))[:25]
+    labels = [
+        ("sales", "Продажи", "+"),
+        ("debt_collections", "Погашение долгов по продажам", "+"),
+        ("loans_in", "Погашение займов (нам должны)", "+"),
+        ("manual_inflows", "Приходы (контрагент)", "+"),
+        ("shift_opening", "Старты смен (в ledger)", "+"),
+        ("shift_close_prev", "Прошлые пересчёты смен", "±"),
+        ("expenses", "Расходы / выплаты", "−"),
+        ("loans_out", "Оплаты «мы должны»", "−"),
+        ("supplier_payments", "Оплаты поставщикам", "−"),
+    ]
+    parts_out = []
+    for key, label, side in labels:
+        amt = round(float(parts[key]), 2)
+        if abs(amt) < 0.005:
+            continue
+        parts_out.append({"key": key, "label": label, "side": side, "amount": amt})
+    return {
+        "method_code": method,
+        "currency_code": cur,
+        "before_at": before,
+        "parts": parts_out,
+        "parts_raw": {k: round(v, 2) for k, v in parts.items()},
+        "plus": round(plus, 2),
+        "minus": round(minus, 2),
+        "net": round(net, 2),
+        "top_lines": top_sorted,
+    }
+
+
+def build_shift_close_explain(
+    conn: sqlite3.Connection,
+    *,
+    shift_id: int,
+    method_code: str,
+    currency_code: str,
+    actual: float,
+    ledger_before: float,
+    delta: float,
+    closed_at: str,
+    inflow_id: int | None = None,
+) -> dict[str, Any]:
+    method = (method_code or "cash").strip()
+    cur = (currency_code or "TJS").strip().upper() or "TJS"
+    pm = get_payment_method(conn, method)
+    method_name = pm["name"] if pm else method
+    shift = conn.execute("SELECT * FROM shifts WHERE id = ?", (shift_id,)).fetchone()
+    shift_info: dict[str, Any] = {}
+    shift_wallet: dict[str, Any] | None = None
+    if shift:
+        shift_info = {
+            "id": shift["id"],
+            "opened_at": shift["opened_at"],
+            "closed_at": shift["closed_at"],
+            "user_name": shift["user_name"],
+            "opening_cash": float(shift["opening_cash"] or 0),
+            "actual_cash": float(shift["actual_cash"] or 0) if "actual_cash" in shift.keys() else None,
+        }
+        try:
+            expected = json.loads(shift["expected_payments_json"] or "[]")
+        except Exception:
+            expected = []
+        for e in expected:
+            if (e.get("method_code") or "") == method and (e.get("currency_code") or "TJS").upper() == cur:
+                shift_wallet = e
+                break
+    breakdown = wallet_ledger_breakdown(
+        conn, method, cur, before_at=closed_at or None, exclude_shift_close_id=inflow_id,
+    )
+    opening_in_shift = float((shift_wallet or {}).get("opening") or shift_info.get("opening_cash") or 0)
+    expected_in_shift = float((shift_wallet or {}).get("expected") or 0)
+    return {
+        "shift_id": shift_id,
+        "inflow_id": inflow_id,
+        "method_code": method,
+        "method_name": method_name,
+        "currency_code": cur,
+        "formula": "факт − учёт = пересчёт",
+        "actual": round(float(actual), 2),
+        "ledger_before": round(float(ledger_before), 2),
+        "delta": round(float(delta), 2),
+        "closed_at": closed_at,
+        "shift": shift_info,
+        "shift_wallet": shift_wallet,
+        "why": (
+            "Учёт — остаток кошелька по всем операциям в программе "
+            "(продажи, приходы, расходы, займы, прошлые пересчёты). "
+            "Стартовая сумма из формы «Открыть смену» в этот учёт не всегда входит отдельно — "
+            "поэтому факт при закрытии и учёт могут сильно различаться. "
+            "Пересчёт выравнивает кошелёк под фактический пересчёт кассы."
+        ),
+        "gap_hint": (
+            f"По смене #{shift_id}: старт {opening_in_shift:g} → ожидалось {expected_in_shift:g}, "
+            f"факт {float(actual):g}. "
+            f"В общем учёте кошелька на момент закрытия было {float(ledger_before):g}, "
+            f"поэтому записали корректировку {float(delta):+g}."
+            if shift_wallet or opening_in_shift
+            else ""
+        ),
+        "ledger": breakdown,
+    }
+
+
 def apply_shift_close_to_cash(
     conn: sqlite3.Connection,
     *,
@@ -6832,6 +7332,7 @@ def apply_shift_close_to_cash(
     base = get_setting(conn, "base_currency", "TJS").upper()
     now = utc_now()
     posted: list[dict[str, Any]] = []
+    has_meta = _has_column(conn, "cash_inflows", "meta_json")
     for aw in targets:
         code = (aw.get("method_code") or "").strip()
         cur = (aw.get("currency_code") or "TJS").strip().upper() or "TJS"
@@ -6849,34 +7350,64 @@ def apply_shift_close_to_cash(
             f"{marker} · пересчёт смены #{shift_id}: "
             f"{name} {cur} факт {actual:g} − учёт {current:g} = {delta:+g}"
         )
-        cur_ins = conn.execute(
-            """
-            INSERT INTO cash_inflows
-            (amount, currency_code, amount_base, payment_method_code, source_type,
-             counterparty_name, receivable_id, mutual_entry_id, notes, created_at, created_by)
-            VALUES (?, ?, ?, ?, 'shift_close', ?, NULL, NULL, ?, ?, ?)
-            """,
-            (
-                delta,
-                cur,
-                amount_base,
-                code,
-                f"Смена #{shift_id}",
-                note,
-                now,
-                (user_name or "").strip() or "Смена",
-            ),
+        explain = build_shift_close_explain(
+            conn,
+            shift_id=int(shift_id),
+            method_code=code,
+            currency_code=cur,
+            actual=actual,
+            ledger_before=current,
+            delta=delta,
+            closed_at=now,
         )
+        if has_meta:
+            cur_ins = conn.execute(
+                """
+                INSERT INTO cash_inflows
+                (amount, currency_code, amount_base, payment_method_code, source_type,
+                 counterparty_name, receivable_id, mutual_entry_id, notes, created_at, created_by, meta_json)
+                VALUES (?, ?, ?, ?, 'shift_close', ?, NULL, NULL, ?, ?, ?, ?)
+                """,
+                (
+                    delta, cur, amount_base, code,
+                    f"Смена #{shift_id}", note, now,
+                    (user_name or "").strip() or "Смена",
+                    json.dumps(explain, ensure_ascii=False),
+                ),
+            )
+        else:
+            cur_ins = conn.execute(
+                """
+                INSERT INTO cash_inflows
+                (amount, currency_code, amount_base, payment_method_code, source_type,
+                 counterparty_name, receivable_id, mutual_entry_id, notes, created_at, created_by)
+                VALUES (?, ?, ?, ?, 'shift_close', ?, NULL, NULL, ?, ?, ?)
+                """,
+                (
+                    delta, cur, amount_base, code,
+                    f"Смена #{shift_id}", note, now,
+                    (user_name or "").strip() or "Смена",
+                ),
+            )
+        inflow_id = int(cur_ins.lastrowid)
+        explain["inflow_id"] = inflow_id
+        if has_meta:
+            conn.execute(
+                "UPDATE cash_inflows SET meta_json = ? WHERE id = ?",
+                (json.dumps(explain, ensure_ascii=False), inflow_id),
+            )
         posted.append({
-            "id": int(cur_ins.lastrowid),
+            "id": inflow_id,
             "method_code": code,
             "currency_code": cur,
             "amount": delta,
             "actual": actual,
             "ledger_before": current,
+            "explain": explain,
         })
         ledger[(code, cur)] = actual
     return posted
+
 
 
 @app.get("/api/shifts/current")
@@ -7221,12 +7752,9 @@ async def list_units(
             sql += " AND u.status = ?"
             params.append(status)
         if q:
-            uclause, uparams = unit_search_sql(q)
+            uclause, uparams = unit_search_sql(q, with_product=True)
             sql += uclause
             params.extend(uparams)
-            like = f"%{q.strip()}%"
-            sql += " AND (p.name LIKE ? OR p.model LIKE ? OR p.color LIKE ?)"
-            params.extend([like, like, like])
         sql += " ORDER BY u.created_at DESC LIMIT 500"
         rows = conn.execute(sql, params).fetchall()
     return [enrich_unit_row(r) for r in rows]
@@ -7327,7 +7855,7 @@ async def lookup_unit(
     check_pin(x_pin)
     with db() as conn:
         expire_reservations(conn)
-        sql = """
+        base_sql = """
             SELECT u.*, p.name AS product_name, p.model, p.color AS product_color,
                    p.barcode, p.sale_price, p.track_units, p.category,
                    w.name AS warehouse_name
@@ -7336,18 +7864,37 @@ async def lookup_unit(
             JOIN warehouses w ON w.id = u.warehouse_id
             WHERE u.status IN ('in_stock', 'reserved')
         """
-        params: list[Any] = []
-        uclause, uparams = unit_search_sql(q)
-        sql += uclause
-        params.extend(uparams)
-        # IMEI / digit fragment: search all warehouses (last 5 digits etc.)
-        # Text/name search: keep selected warehouse filter.
-        if warehouse_id and not is_code_query(q):
+        # 1) IMEI / serial (incl. Cyrillic lookalikes). Serials & digit IMEI: all warehouses.
+        uclause, uparams = unit_search_sql(q, with_product=False)
+        params: list[Any] = list(uparams)
+        sql = base_sql + uclause
+        cross_wh = is_code_query(q) or is_serial_query(q)
+        if warehouse_id and not cross_wh:
             sql += " AND u.warehouse_id = ?"
             params.append(warehouse_id)
         order = " ORDER BY CASE WHEN u.warehouse_id = ? THEN 0 ELSE 1 END, u.created_at DESC LIMIT 20"
         order_params = [warehouse_id or 0]
         units = conn.execute(sql + order, params + order_params).fetchall()
+
+        # 2) Model / name → physical units (so "AW 11" / "aw11" shows devices, not product cards).
+        if not units and not is_code_query(q):
+            clause, sparams = product_search_sql(q)
+            sql2 = base_sql + f" AND u.product_id IN (SELECT p.id FROM products p WHERE 1=1 {clause})"
+            params2: list[Any] = list(sparams)
+            if warehouse_id and not cross_wh:
+                sql_local = sql2 + " AND u.warehouse_id = ?"
+                units = conn.execute(
+                    sql_local + order, params2 + [warehouse_id] + order_params
+                ).fetchall()
+                if not units:
+                    units = conn.execute(sql2 + order, params2 + order_params).fetchall()
+            else:
+                units = conn.execute(sql2 + order, params2 + order_params).fetchall()
+                if warehouse_id and units:
+                    local = [u for u in units if u["warehouse_id"] == warehouse_id]
+                    if local:
+                        units = local
+
         if units:
             matches = []
             for u in units:
@@ -7355,13 +7902,23 @@ async def lookup_unit(
                 d["is_reserved"] = u["status"] == "reserved"
                 matches.append(d)
             return {"match_type": "unit", "matches": matches}
+
         exact = conn.execute("SELECT * FROM products WHERE barcode = ?", (q.strip(),)).fetchone()
         if exact:
             return {"match_type": "product", "matches": [enrich_product(conn, exact)]}
         clause, sparams = product_search_sql(q)
         prows = conn.execute(f"SELECT p.* FROM products p WHERE 1=1 {clause} LIMIT 20", sparams).fetchall()
         if prows:
-            return {"match_type": "product", "matches": [enrich_product(conn, r) for r in prows]}
+            # Prefer products that actually have stock (esp. on selected warehouse).
+            enriched = [enrich_product(conn, r) for r in prows]
+            if warehouse_id:
+                enriched.sort(
+                    key=lambda p: (
+                        0 if (p.get("units_by_warehouse") or p.get("stock_by_warehouse") or {}).get(str(warehouse_id), 0) else 1,
+                        -(p.get("units_available") or p.get("stock") or 0),
+                    )
+                )
+            return {"match_type": "product", "matches": enriched}
     return {"match_type": "none", "matches": []}
 
 
@@ -8735,6 +9292,8 @@ async def pos_cash_register_detail(
             note: str = "",
             method_name: str = "",
             ref: str = "",
+            inflow_id: int | None = None,
+            clickable: bool = False,
         ) -> None:
             lines.append({
                 "at": at or "",
@@ -8746,6 +9305,8 @@ async def pos_cash_register_detail(
                 "note": note or "",
                 "method_name": method_name or "",
                 "ref": ref or "",
+                "inflow_id": inflow_id,
+                "clickable": bool(clickable),
             })
 
         want_in = kind in ("inflow", "net", "wallet")
@@ -8852,7 +9413,7 @@ async def pos_cash_register_detail(
 
             if _table_exists(conn, "cash_inflows"):
                 man_sql = f"""
-                    SELECT created_at AS at, amount, amount_base, currency_code,
+                    SELECT id, created_at AS at, amount, amount_base, currency_code,
                            payment_method_code, counterparty_name, source_type, notes
                     FROM cash_inflows
                     WHERE source_type IN ('counterparty', 'shift_close', 'shift_opening') {in_clause}
@@ -8880,6 +9441,8 @@ async def pos_cash_register_detail(
                         currency=r["currency_code"] or "TJS",
                         note=r["notes"] or "",
                         method_name=pm["name"] if pm else (r["payment_method_code"] or ""),
+                        inflow_id=int(r["id"]),
+                        clickable=(src == "shift_close"),
                     )
 
         if want_out:
@@ -10010,7 +10573,7 @@ async def create_sale(body: SaleIn, x_pin: str | None = Header(default=None, ali
             })
 
         total = max(0.0, subtotal - body.discount)
-        now = utc_now()
+        now = normalize_entry_datetime(body.sale_date)
         sale_currency = get_warehouse_currency(conn, warehouse_id)["code"]
         pay_currency = (body.pay_currency or sale_currency).upper().strip() or sale_currency
         fx_rate = float(body.fx_rate) if body.fx_rate and body.fx_rate > 0 else None
@@ -11163,6 +11726,548 @@ def _report_by_cashier(
     return {"period_label": label, "warehouse_id": warehouse_id, "warehouse_name": wh_name, "cashiers": cashiers}
 
 
+def _resolve_opiu_month(
+    period: str, date_from: str, date_to: str
+) -> tuple[int, int, str, str, str, str]:
+    """Return year, month, month_start, month_end, closing_as_of, period_label."""
+    month_names = [
+        "", "январь", "февраль", "март", "апрель", "май", "июнь",
+        "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь",
+    ]
+    today = datetime.now().date()
+    base = today
+    if date_from:
+        try:
+            base = datetime.strptime(date_from[:10], "%Y-%m-%d").date()
+        except ValueError:
+            base = today
+    elif date_to:
+        try:
+            base = datetime.strptime(date_to[:10], "%Y-%m-%d").date()
+        except ValueError:
+            base = today
+    elif period == "year":
+        base = today.replace(month=1, day=1)
+    year, month = base.year, base.month
+    month_start = f"{year:04d}-{month:02d}-01"
+    if month == 12:
+        month_end_d = date(year, 12, 31)
+    else:
+        month_end_d = date(year, month + 1, 1) - timedelta(days=1)
+    month_end = month_end_d.isoformat()
+    closing_as_of = min(month_end_d, today).isoformat()
+    label = f"{month_names[month]} {year}"
+    return year, month, month_start, month_end, closing_as_of, label
+
+
+def _unit_cost_from_row(row: sqlite3.Row | dict[str, Any]) -> float:
+    d = row_to_dict(row) if not isinstance(row, dict) else row
+    purchase = unit_purchase_price(
+        {"purchase_price": d.get("unit_purchase_price")},
+        {"purchase_price": d.get("product_purchase_price")},
+    )
+    return round(float(purchase or 0) + float(d.get("extra_cost") or 0), 2)
+
+
+def _warehouse_stock_value_as_of(
+    conn: sqlite3.Connection, warehouse_id: int, as_of: str, *, exclusive: bool = False
+) -> dict[str, Any]:
+    """IMEI stock value on warehouse as of date (approx. via arrivals + sales).
+
+    exclusive=True → units present strictly before as_of (opening on 1st).
+    exclusive=False → units present through end of as_of day (closing).
+    """
+    day = (as_of or "")[:10]
+    if exclusive:
+        cutoff = f"{day} 00:00:00"
+        arrived_op, sold_op = "<", ">="
+    else:
+        cutoff = f"{day} 23:59:59"
+        arrived_op, sold_op = "<=", ">"
+
+    rows = conn.execute(
+        f"""
+        SELECT u.id AS unit_id,
+               u.purchase_price AS unit_purchase_price,
+               p.purchase_price AS product_purchase_price,
+               COALESCE(u.customs_price, 0) AS extra_cost,
+               COALESCE(u.arrival_date, u.created_at) AS arrived_at,
+               u.status, u.imei, u.serial, p.name AS product_name
+        FROM product_units u
+        JOIN products p ON p.id = u.product_id
+        WHERE u.warehouse_id = ?
+          AND COALESCE(u.arrival_date, u.created_at) {arrived_op} ?
+          AND (
+            (u.status = 'in_stock')
+            OR u.id IN (
+              SELECT siu.unit_id
+              FROM sale_item_units siu
+              JOIN sale_items si ON si.id = siu.sale_item_id
+              JOIN sales s ON s.id = si.sale_id
+              WHERE s.status = 'completed'
+                AND s.warehouse_id = ?
+                AND s.created_at {sold_op} ?
+            )
+          )
+        """,
+        (warehouse_id, cutoff, warehouse_id, cutoff),
+    ).fetchall()
+
+    # Exclude units sold from this WH on/before closing cutoff (already out)
+    if not exclusive:
+        sold_before = {
+            int(r[0])
+            for r in conn.execute(
+                """
+                SELECT siu.unit_id
+                FROM sale_item_units siu
+                JOIN sale_items si ON si.id = siu.sale_item_id
+                JOIN sales s ON s.id = si.sale_id
+                WHERE s.status = 'completed'
+                  AND s.warehouse_id = ?
+                  AND s.created_at <= ?
+                """,
+                (warehouse_id, cutoff),
+            ).fetchall()
+        }
+    else:
+        sold_before = {
+            int(r[0])
+            for r in conn.execute(
+                """
+                SELECT siu.unit_id
+                FROM sale_item_units siu
+                JOIN sale_items si ON si.id = siu.sale_item_id
+                JOIN sales s ON s.id = si.sale_id
+                WHERE s.status = 'completed'
+                  AND s.warehouse_id = ?
+                  AND s.created_at < ?
+                """,
+                (warehouse_id, cutoff),
+            ).fetchall()
+        }
+
+    lines: list[dict[str, Any]] = []
+    total = 0.0
+    for r in rows:
+        uid = int(r["unit_id"])
+        if uid in sold_before:
+            continue
+        cost = _unit_cost_from_row(r)
+        total += cost
+        lines.append({
+            "unit_id": uid,
+            "product_name": r["product_name"] or "",
+            "imei": r["imei"] or r["serial"] or "",
+            "value": cost,
+        })
+
+    # Qty products (accessories) — current only when closing≈now; else skip (no history)
+    qty_val = 0.0
+    today = datetime.now().strftime("%Y-%m-%d")
+    if not exclusive and day >= today:
+        for r in conn.execute(
+            """
+            SELECT COALESCE(SUM(p.purchase_price * ws.quantity), 0) AS val
+            FROM warehouse_stock ws
+            JOIN products p ON p.id = ws.product_id
+            WHERE ws.warehouse_id = ? AND ws.quantity > 0 AND IFNULL(p.track_units, 0) = 0
+            """,
+            (warehouse_id,),
+        ).fetchall():
+            qty_val = float(r["val"] or 0)
+
+    value = round(total + qty_val, 2)
+    return {
+        "value": value,
+        "units_count": len(lines),
+        "qty_value": round(qty_val, 2),
+        "lines": lines[:80],
+        "as_of": day,
+        "exclusive": exclusive,
+        "approx": True,
+    }
+
+
+def _money_by_currency_as_of(conn: sqlite3.Connection, as_of: str | None) -> dict[str, dict[str, float]]:
+    """Cash + card (non-cash wallets) nets by currency through as_of (inclusive day)."""
+    kwargs: dict[str, Any] = {}
+    if as_of:
+        kwargs["date_to"] = as_of[:10]
+    cash = _period_cash_by_currency(conn, "all", **kwargs)
+    till = till_summary_from_balances(cash.get("balances") or [])
+    out: dict[str, dict[str, float]] = {
+        "TJS": {"cash": float(till.get("cash_tjs") or 0), "card": 0.0},
+        "USD": {"cash": float(till.get("cash_usd") or 0), "card": 0.0},
+    }
+    for bag in till.get("card") or []:
+        code = (bag.get("code") or "TJS").upper()
+        out.setdefault(code, {"cash": 0.0, "card": 0.0})
+        out[code]["card"] = round(out[code].get("card", 0.0) + float(bag.get("amount") or bag.get("net") or 0), 2)
+    for code, bag in out.items():
+        bag["cash"] = round(float(bag.get("cash") or 0), 2)
+        bag["card"] = round(float(bag.get("card") or 0), 2)
+        bag["total"] = round(bag["cash"] + bag["card"], 2)
+    return out
+
+
+def _debt_net_by_currency_as_of(
+    conn: sqlite3.Connection, as_of: str | None
+) -> dict[str, Any]:
+    """Дебиторка − кредиторка by currency as of date (or current if as_of empty/today+)."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    use_current = not as_of or as_of[:10] >= today
+    cutoff = f"{as_of[:10]} 23:59:59" if as_of else ""
+
+    recv: dict[str, float] = {}
+    owe_us: dict[str, float] = {}
+    we_owe: dict[str, float] = {}
+    creditors: dict[str, float] = {}
+    detail_recv: list[dict[str, Any]] = []
+    detail_owe_us: list[dict[str, Any]] = []
+    detail_we_owe: list[dict[str, Any]] = []
+    detail_cred: list[dict[str, Any]] = []
+
+    if use_current:
+        for r in conn.execute(
+            """
+            SELECT r.id, r.customer_name, r.amount_due,
+                   UPPER(COALESCE(NULLIF(TRIM(s.currency_code), ''), 'TJS')) AS cur
+            FROM receivables r
+            JOIN sales s ON s.id = r.sale_id
+            WHERE r.status = 'open' AND s.status = 'completed' AND r.amount_due > 0.001
+            """
+        ).fetchall():
+            code = (r["cur"] or "TJS").upper()
+            amt = float(r["amount_due"] or 0)
+            recv[code] = recv.get(code, 0.0) + amt
+            detail_recv.append({
+                "id": r["id"], "name": r["customer_name"] or "", "amount": amt, "currency_code": code,
+            })
+        if _table_exists(conn, "mutual_entries"):
+            for r in conn.execute(
+                """
+                SELECT id, person_name, direction, amount_due,
+                       UPPER(COALESCE(NULLIF(TRIM(currency_code), ''), 'TJS')) AS cur
+                FROM mutual_entries
+                WHERE status = 'open' AND amount_due > 0.001
+                  AND direction IN ('owe_us', 'we_owe')
+                """
+            ).fetchall():
+                code = (r["cur"] or "TJS").upper()
+                amt = float(r["amount_due"] or 0)
+                item = {"id": r["id"], "name": r["person_name"] or "", "amount": amt, "currency_code": code}
+                if r["direction"] == "owe_us":
+                    owe_us[code] = owe_us.get(code, 0.0) + amt
+                    detail_owe_us.append(item)
+                else:
+                    we_owe[code] = we_owe.get(code, 0.0) + amt
+                    detail_we_owe.append(item)
+        for c in _creditors_list(conn):
+            for bag in c.get("by_currency") or []:
+                code = bag["code"]
+                bal = float(bag.get("balance") or 0)
+                if bal <= 0.001:
+                    continue
+                creditors[code] = creditors.get(code, 0.0) + bal
+                detail_cred.append({
+                    "name": c.get("supplier_name") or "", "amount": bal, "currency_code": code,
+                })
+    else:
+        for r in conn.execute(
+            """
+            SELECT r.id, r.customer_name, r.total_amount AS amount,
+                   UPPER(COALESCE(NULLIF(TRIM(s.currency_code), ''), 'TJS')) AS cur,
+                   COALESCE((
+                     SELECT SUM(rp.amount) FROM receivable_payments rp
+                     WHERE rp.receivable_id = r.id AND rp.created_at <= ?
+                   ), 0) AS paid
+            FROM receivables r
+            JOIN sales s ON s.id = r.sale_id
+            WHERE s.status = 'completed' AND s.created_at <= ?
+            """,
+            (cutoff, cutoff),
+        ).fetchall():
+            code = (r["cur"] or "TJS").upper()
+            due = round(float(r["amount"] or 0) - float(r["paid"] or 0), 2)
+            if due <= 0.001:
+                continue
+            recv[code] = recv.get(code, 0.0) + due
+            detail_recv.append({
+                "id": r["id"], "name": r["customer_name"] or "", "amount": due, "currency_code": code,
+            })
+        if _table_exists(conn, "mutual_entries"):
+            for r in conn.execute(
+                """
+                SELECT me.id, me.person_name, me.direction, me.amount,
+                       UPPER(COALESCE(NULLIF(TRIM(me.currency_code), ''), 'TJS')) AS cur,
+                       COALESCE((
+                         SELECT SUM(COALESCE(NULLIF(mp.pay_amount, 0), mp.amount))
+                         FROM mutual_payments mp
+                         WHERE mp.entry_id = me.id AND mp.created_at <= ?
+                       ), 0) AS paid
+                FROM mutual_entries me
+                WHERE me.direction IN ('owe_us', 'we_owe') AND me.created_at <= ?
+                """,
+                (cutoff, cutoff),
+            ).fetchall():
+                code = (r["cur"] or "TJS").upper()
+                due = round(float(r["amount"] or 0) - float(r["paid"] or 0), 2)
+                if due <= 0.001:
+                    continue
+                item = {"id": r["id"], "name": r["person_name"] or "", "amount": due, "currency_code": code}
+                if r["direction"] == "owe_us":
+                    owe_us[code] = owe_us.get(code, 0.0) + due
+                    detail_owe_us.append(item)
+                else:
+                    we_owe[code] = we_owe.get(code, 0.0) + due
+                    detail_we_owe.append(item)
+        for r in conn.execute(
+            """
+            SELECT si.supplier_name AS name,
+                   UPPER(COALESCE(NULLIF(TRIM(s.currency_code), ''), 'TJS')) AS cur,
+                   COALESCE(SUM(si.supplier_due), 0) AS accrued
+            FROM sale_items si
+            JOIN sales s ON s.id = si.sale_id
+            WHERE s.status = 'completed' AND si.ownership_type = 'consignment'
+              AND s.created_at <= ? AND COALESCE(si.supplier_name, '') != ''
+            GROUP BY 1, 2
+            """,
+            (cutoff,),
+        ).fetchall():
+            code = (r["cur"] or "TJS").upper()
+            paid = 0.0
+            if _table_exists(conn, "supplier_payments"):
+                paid_row = conn.execute(
+                    """
+                    SELECT COALESCE(SUM(amount), 0) FROM supplier_payments
+                    WHERE supplier_name = ? AND created_at <= ?
+                    """,
+                    (r["name"], cutoff),
+                ).fetchone()
+                paid = float(paid_row[0] if paid_row else 0)
+            bal = round(max(0.0, float(r["accrued"] or 0) - paid), 2)
+            if bal <= 0.001:
+                continue
+            creditors[code] = creditors.get(code, 0.0) + bal
+            detail_cred.append({"name": r["name"] or "", "amount": bal, "currency_code": code})
+
+    codes = sorted(set(recv) | set(owe_us) | set(we_owe) | set(creditors) | {"TJS", "USD"},
+                   key=lambda c: (0 if c == "USD" else 1, c))
+    by_currency: dict[str, dict[str, float]] = {}
+    for code in codes:
+        debtors = round(recv.get(code, 0.0) + owe_us.get(code, 0.0), 2)
+        cred = round(we_owe.get(code, 0.0) + creditors.get(code, 0.0), 2)
+        by_currency[code] = {
+            "receivables": round(recv.get(code, 0.0), 2),
+            "owe_us": round(owe_us.get(code, 0.0), 2),
+            "we_owe": round(we_owe.get(code, 0.0), 2),
+            "suppliers": round(creditors.get(code, 0.0), 2),
+            "debtors": debtors,
+            "creditors": cred,
+            "net": round(debtors - cred, 2),
+        }
+    return {
+        "by_currency": by_currency,
+        "detail": {
+            "receivables": detail_recv[:60],
+            "owe_us": detail_owe_us[:40],
+            "we_owe": detail_we_owe[:40],
+            "suppliers": detail_cred[:40],
+        },
+        "as_of": as_of[:10] if as_of else today,
+        "current": use_current,
+    }
+
+
+def _opiu_column_snapshot(
+    conn: sqlite3.Connection,
+    *,
+    warehouse_id: int,
+    currency_code: str,
+    year: int,
+    month: int,
+    month_start: str,
+    closing_as_of: str,
+) -> dict[str, Any]:
+    wh = conn.execute(
+        "SELECT id, name, currency_code FROM warehouses WHERE id = ?", (warehouse_id,)
+    ).fetchone()
+    cur = (currency_code or (wh["currency_code"] if wh else "TJS") or "TJS").upper()
+
+    # Opening = snapshot strictly before month_start (остатки на 1-е)
+    stock_open = _warehouse_stock_value_as_of(conn, warehouse_id, month_start, exclusive=True)
+    # Closing money/debt as of day before month → opening money/debt
+    prev_day = (datetime.strptime(month_start, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+    money_open_all = _money_by_currency_as_of(conn, prev_day)
+    debt_open_all = _debt_net_by_currency_as_of(conn, prev_day)
+    money_open = money_open_all.get(cur) or {"cash": 0.0, "card": 0.0, "total": 0.0}
+    debt_open = (debt_open_all.get("by_currency") or {}).get(cur) or {"net": 0.0}
+
+    opening = round(
+        float(stock_open["value"]) + float(debt_open.get("net") or 0) + float(money_open.get("total") or 0),
+        2,
+    )
+
+    z = _z_register_lines(conn, warehouse_id, year, month)
+    z_profit = round(float(z.get("profit") or 0), 2)
+    should = round(opening + z_profit, 2)
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    if closing_as_of[:10] >= today:
+        wh_money = warehouse_stock_money(conn, warehouse_id)
+        stock_close = {
+            "value": float(wh_money["value"]),
+            "units_count": int(wh_money["units_count"]),
+            "lines": (z.get("stock_lines") or [])[:80],
+            "as_of": today,
+            "exclusive": False,
+            "approx": False,
+        }
+    else:
+        stock_close = _warehouse_stock_value_as_of(conn, warehouse_id, closing_as_of, exclusive=False)
+
+    money_close_all = _money_by_currency_as_of(conn, closing_as_of)
+    debt_close_all = _debt_net_by_currency_as_of(conn, closing_as_of)
+    money_close = money_close_all.get(cur) or {"cash": 0.0, "card": 0.0, "total": 0.0}
+    debt_close = (debt_close_all.get("by_currency") or {}).get(cur) or {
+        "net": 0.0, "debtors": 0.0, "creditors": 0.0,
+    }
+
+    stock_v = round(float(stock_close["value"]), 2)
+    debt_net = round(float(debt_close.get("net") or 0), 2)
+    money_v = round(float(money_close.get("total") or 0), 2)
+    closing = round(stock_v + debt_net + money_v, 2)
+    diff = round(closing - should, 2)
+
+    return {
+        "warehouse_id": warehouse_id,
+        "warehouse_name": wh["name"] if wh else f"#{warehouse_id}",
+        "currency_code": cur,
+        "currency": currency_meta(cur),
+        "opening": opening,
+        "z_profit": z_profit,
+        "z_revenue": round(float(z.get("revenue") or 0), 2),
+        "z_sold_count": int(z.get("sold_count") or 0),
+        "should": should,
+        "stock": stock_v,
+        "debt_net": debt_net,
+        "money": money_v,
+        "money_cash": round(float(money_close.get("cash") or 0), 2),
+        "money_card": round(float(money_close.get("card") or 0), 2),
+        "closing": closing,
+        "diff": diff,
+        "breakdown": {
+            "opening": {
+                "stock": round(float(stock_open["value"]), 2),
+                "debt_net": round(float(debt_open.get("net") or 0), 2),
+                "money": round(float(money_open.get("total") or 0), 2),
+                "money_cash": round(float(money_open.get("cash") or 0), 2),
+                "money_card": round(float(money_open.get("card") or 0), 2),
+            },
+            "stock_open": stock_open,
+            "stock_close": stock_close,
+            "debt": {
+                "net": debt_net,
+                "debtors": round(float(debt_close.get("debtors") or 0), 2),
+                "creditors": round(float(debt_close.get("creditors") or 0), 2),
+                "parts": debt_close,
+                "detail": {
+                    k: [x for x in (debt_close_all.get("detail") or {}).get(k) or [] if x.get("currency_code") == cur]
+                    for k in ("receivables", "owe_us", "we_owe", "suppliers")
+                },
+            },
+            "money": money_close,
+            "z_sold_sample": (z.get("sold_lines") or [])[:40],
+        },
+    }
+
+
+def _report_opiu_summary(
+    conn: sqlite3.Connection,
+    period: str,
+    date_from: str,
+    date_to: str,
+) -> dict[str, Any]:
+    year, month, month_start, month_end, closing_as_of, label = _resolve_opiu_month(
+        period, date_from, date_to
+    )
+    bu_id = resolve_bu_warehouse_id(conn)
+    main_id = get_default_warehouse_id(conn)
+
+    bu = _opiu_column_snapshot(
+        conn,
+        warehouse_id=bu_id,
+        currency_code="TJS",
+        year=year,
+        month=month,
+        month_start=month_start,
+        closing_as_of=closing_as_of,
+    )
+    main = _opiu_column_snapshot(
+        conn,
+        warehouse_id=main_id,
+        currency_code="USD",
+        year=year,
+        month=month,
+        month_start=month_start,
+        closing_as_of=closing_as_of,
+    )
+
+    rate_at = f"{closing_as_of} 23:59:59"
+    usd_rate = float(get_exchange_rate_at(conn, "USD", rate_at) or 0)
+    try:
+        bu_diff_usd = round(convert_amount(conn, bu["diff"], "TJS", "USD", at=rate_at), 2)
+    except HTTPException:
+        bu_diff_usd = round(float(bu["diff"]) / usd_rate, 2) if usd_rate > 0 else 0.0
+    try:
+        bu_closing_usd = round(convert_amount(conn, bu["closing"], "TJS", "USD", at=rate_at), 2)
+    except HTTPException:
+        bu_closing_usd = round(float(bu["closing"]) / usd_rate, 2) if usd_rate > 0 else 0.0
+
+    compare = round(bu_closing_usd - float(main["closing"]), 2)
+    bu["diff_usd"] = bu_diff_usd
+    bu["closing_usd"] = bu_closing_usd
+    main["compare_vs_bu"] = compare
+
+    return {
+        "period_label": label,
+        "year": year,
+        "month": month,
+        "date_from": month_start,
+        "date_to": month_end,
+        "closing_as_of": closing_as_of,
+        "exchange_rate_usd": usd_rate,
+        "exchange_rate_at": rate_at,
+        "formula": {
+            "should": "сальдо_начало + Z-прибыль",
+            "closing": "склад + (дебиторка − кредиторка) + (нал + карты)",
+            "diff": "сальдо_конец − должно",
+            "diff_usd": "разница_БУ_смн → $ по курсу на конец месяца",
+            "compare": "остаток_БУ_$ − остаток_Основной_$",
+        },
+        "bu": bu,
+        "main": main,
+        "rows": [
+            {"key": "opening", "label": "Сальдо на начало", "bu": bu["opening"], "main": main["opening"]},
+            {"key": "z_profit", "label": "Z-прибыль склада", "bu": bu["z_profit"], "main": main["z_profit"]},
+            {"key": "should", "label": "Итого «должно»", "bu": bu["should"], "main": main["should"], "total": True},
+            {"key": "stock", "label": "Товары на складе", "bu": bu["stock"], "main": main["stock"]},
+            {"key": "debt_net", "label": "Дебиторка − кредиторка", "bu": bu["debt_net"], "main": main["debt_net"]},
+            {"key": "money", "label": "Наличные + карты", "bu": bu["money"], "main": main["money"]},
+            {"key": "closing", "label": "Сальдо на конец", "bu": bu["closing"], "main": main["closing"], "total": True},
+            {"key": "diff", "label": "Разница (есть − должно)", "bu": bu["diff"], "main": main["diff"], "emph": True},
+            {
+                "key": "footer",
+                "label": "Разница БУ в $ / сравнение остатков",
+                "bu": bu_diff_usd,
+                "main": compare,
+                "emph": True,
+            },
+        ],
+    }
+
+
 @app.get("/api/reports/opiu")
 async def report_opiu(
     period: str = Query(default="month", pattern="^(day|week|month|quarter|year|all)$"),
@@ -11174,6 +12279,19 @@ async def report_opiu(
     check_pin(x_pin, min_role="owner")
     with db() as conn:
         return _report_opiu(conn, period, date_from, date_to, warehouse_id)
+
+
+@app.get("/api/reports/opiu-summary")
+async def report_opiu_summary(
+    period: str = Query(default="month", pattern="^(day|week|month|quarter|year|all)$"),
+    date_from: str = "",
+    date_to: str = "",
+    x_pin: str | None = Header(default=None, alias="X-Pin"),
+):
+    """Сводка месяца ОПиУ: Б/У (смн) | Основной ($) — сальдо, Z, склад, долги, касса."""
+    check_pin(x_pin, min_role="owner")
+    with db() as conn:
+        return _report_opiu_summary(conn, period, date_from, date_to)
 
 
 @app.get("/api/reports/dds")

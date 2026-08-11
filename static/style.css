@@ -1408,6 +1408,98 @@ button.pos-balance-btn:hover {
 .report-box .lbl { font-size: 0.68rem; color: var(--muted); text-transform: uppercase; font-weight: 700; letter-spacing: 0.05em; }
 .report-box .val { font-size: 1.25rem; font-weight: 800; margin-top: 0.3rem; letter-spacing: -0.02em; }
 
+.opiu-saldo-bar {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.75rem;
+  margin-bottom: 1rem;
+}
+.opiu-saldo-item {
+  background: linear-gradient(135deg, rgba(15, 23, 42, 0.04), rgba(37, 99, 235, 0.06));
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.85rem 1rem;
+}
+.opiu-saldo-item span {
+  display: block;
+  font-size: 0.72rem;
+  color: var(--muted);
+  font-weight: 600;
+  margin-bottom: 0.35rem;
+}
+.opiu-saldo-item strong {
+  font-size: 1.05rem;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+}
+.opiu-summary-table th:nth-child(2),
+.opiu-summary-table th:nth-child(3),
+.opiu-summary-table td.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.opiu-summary-table .opiu-label { font-weight: 600; }
+.opiu-summary-table tr.opiu-total td {
+  border-top: 2px solid var(--border);
+  font-weight: 800;
+  background: rgba(15, 23, 42, 0.03);
+}
+.opiu-summary-table tr.opiu-emph td {
+  font-weight: 800;
+  font-size: 1.02em;
+}
+.opiu-summary-table .opiu-neg { color: var(--danger, #c44); }
+.opiu-summary-table .opiu-pos { color: var(--success, #16803d); }
+.opiu-detail-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+  margin-top: 1rem;
+}
+.opiu-detail-col {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  padding: 1rem;
+}
+.opiu-detail-col h4 {
+  margin: 0 0 0.75rem;
+  font-size: 0.95rem;
+  font-weight: 800;
+}
+.opiu-mini-kpi {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 0.5rem;
+  margin-bottom: 0.85rem;
+}
+.opiu-mini-kpi div {
+  background: rgba(15, 23, 42, 0.03);
+  border-radius: 8px;
+  padding: 0.45rem 0.55rem;
+}
+.opiu-mini-kpi span {
+  display: block;
+  font-size: 0.65rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  font-weight: 700;
+}
+.opiu-mini-kpi strong { font-size: 0.88rem; font-weight: 800; }
+.opiu-detail-col details { margin-top: 0.55rem; }
+.opiu-detail-col summary {
+  cursor: pointer;
+  font-weight: 700;
+  font-size: 0.82rem;
+  margin-bottom: 0.35rem;
+}
+@media (max-width: 900px) {
+  .opiu-saldo-bar,
+  .opiu-detail-grid,
+  .opiu-mini-kpi { grid-template-columns: 1fr; }
+}
+
 .compare-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1.25rem; }
 .compare-card {
   border: 1px solid var(--border);

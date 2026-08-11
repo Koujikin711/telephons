@@ -187,6 +187,10 @@
                     <div id="cart-items" class="cart-items"></div>
                     <div class="cart-empty" id="cart-empty">Найдите товар поиском и добавьте в чек</div>
                     <div class="cart-totals">
+                      <label class="total-line" style="display:flex;justify-content:space-between;align-items:center;gap:.5rem">
+                        <span>Дата продажи</span>
+                        <input type="date" id="pos-sale-date" class="input sm" style="width:auto;max-width:11rem">
+                      </label>
                       <div class="total-line"><span>Подытог</span><span id="cart-subtotal">0</span></div>
                       <div class="total-line">
                         <label>Скидка</label>
@@ -229,6 +233,9 @@
                 <div class="card-header"><h3>Приход</h3></div>
                 <div class="card-body pos-col-body">
                   <form id="pos-inflow-form" class="form-stack">
+                    <label>Дата
+                      <input type="date" id="pos-in-date" class="input">
+                    </label>
                     <div class="form-row">
                       <label>Сумма<input type="number" id="pos-in-amount" class="input" min="0.01" step="0.01" required placeholder="0.00"></label>
                       <label>Валюта
@@ -266,19 +273,23 @@
                     <button type="submit" class="btn btn-primary btn-block">Принять приход</button>
                   </form>
                   <div class="pos-col-records">
-                  <div class="form-row" style="margin-top:.75rem;align-items:center">
-                    <label style="margin:0;flex:1">Записи
-                      <select id="pos-in-lines-period" class="select sm-select" onchange="loadPosCashLines(this.id)">
-                        <option value="week" selected>Неделя</option>
+                  <div class="form-row" style="margin-top:.75rem;align-items:flex-end;gap:.5rem;flex-wrap:wrap">
+                    <label style="margin:0;flex:1;min-width:7rem">Период
+                      <select id="pos-in-lines-period" class="select sm-select">
+                        <option value="" selected>Выберите…</option>
                         <option value="day">Сегодня</option>
                         <option value="yesterday">Вчера</option>
+                        <option value="week">Неделя</option>
                         <option value="month">Месяц</option>
                         <option value="all">Все</option>
                       </select>
                     </label>
+                    <label style="margin:0;flex:2;min-width:8rem">Поиск
+                      <input type="search" id="pos-in-lines-search" class="input sm" placeholder="Имя, комментарий…" autocomplete="off">
+                    </label>
                   </div>
-                  <p class="hint muted" id="pos-in-lines-label" style="margin:.35rem 0 0"></p>
-                  <div class="table-wrap pos-lines-table" style="margin-top:.5rem">
+                  <p class="hint muted" id="pos-in-lines-label" style="margin:.35rem 0 0">Выберите период или введите поиск</p>
+                  <div id="pos-in-lines-wrap" class="table-wrap pos-lines-table hidden" style="margin-top:.5rem">
                     <table class="data-table">
                       <thead><tr><th>Дата</th><th>Источник</th><th>Сумма</th><th></th></tr></thead>
                       <tbody id="pos-inflows-tbody"></tbody>
@@ -297,6 +308,9 @@
                     <button type="button" class="seg" data-exp-type="payout">Выплаты</button>
                   </div>
                   <form id="pos-expense-form" class="form-stack">
+                    <label>Дата
+                      <input type="date" id="pos-exp-date" class="input">
+                    </label>
                     <div id="pos-exp-expense-fields">
                       <label>Категория<input id="pos-exp-category" class="input" required placeholder="Аренда"></label>
                     </div>
@@ -322,19 +336,23 @@
                     <button type="submit" class="btn btn-primary btn-block" id="pos-exp-submit">Добавить расход</button>
                   </form>
                   <div class="pos-col-records">
-                  <div class="form-row" style="margin-top:.75rem;align-items:center">
-                    <label style="margin:0;flex:1">Записи
-                      <select id="pos-exp-lines-period" class="select sm-select" onchange="loadPosCashLines(this.id)">
-                        <option value="week" selected>Неделя</option>
+                  <div class="form-row" style="margin-top:.75rem;align-items:flex-end;gap:.5rem;flex-wrap:wrap">
+                    <label style="margin:0;flex:1;min-width:7rem">Период
+                      <select id="pos-exp-lines-period" class="select sm-select">
+                        <option value="" selected>Выберите…</option>
                         <option value="day">Сегодня</option>
                         <option value="yesterday">Вчера</option>
+                        <option value="week">Неделя</option>
                         <option value="month">Месяц</option>
                         <option value="all">Все</option>
                       </select>
                     </label>
+                    <label style="margin:0;flex:2;min-width:8rem">Поиск
+                      <input type="search" id="pos-exp-lines-search" class="input sm" placeholder="Категория, кому…" autocomplete="off">
+                    </label>
                   </div>
-                  <p class="hint muted" id="pos-exp-lines-label" style="margin:.35rem 0 0"></p>
-                  <div class="table-wrap pos-lines-table" style="margin-top:.5rem">
+                  <p class="hint muted" id="pos-exp-lines-label" style="margin:.35rem 0 0">Выберите период или введите поиск</p>
+                  <div id="pos-exp-lines-wrap" class="table-wrap pos-lines-table hidden" style="margin-top:.5rem">
                     <table class="data-table">
                       <thead><tr><th>Дата</th><th>Кому / категория</th><th>Склад</th><th>Сумма</th><th></th></tr></thead>
                       <tbody id="pos-expenses-tbody"></tbody>
@@ -1118,7 +1136,6 @@
       <div id="inbound-panel-new" class="inbound-panel">
         <input type="hidden" id="ib-receipt-kind" value="new">
         <div id="ib-new-fields">
-          <label>Дата прихода<input type="date" id="ib-arrival" class="input"></label>
           <label>Модель<input id="ib-name" class="input" required placeholder="iPhone 15 Pro"></label>
           <div class="form-row">
             <label>Цвет<input id="ib-color" class="input"></label>
@@ -1148,10 +1165,12 @@
           <p class="hint muted" style="margin:0">Прибыль при продаже = цена − себестоимость − расходы.</p>
           <label>Клиент<input id="ib-client" class="input" placeholder="От кого приняли"></label>
         </div>
+        <label>Дата принятия<input type="date" id="ib-arrival" class="input"></label>
         <input type="hidden" id="ib-category" value="phone">
         <input type="hidden" id="ib-condition-used" value="used">
       </div>
       <div id="inbound-panel-existing" class="inbound-panel hidden">
+        <label>Дата принятия<input type="date" id="ib-arrival-existing" class="input"></label>
         <label>Товар<select id="ib-existing-product" class="select"></select></label>
         <div id="ib-existing-meta" class="inbound-product-meta"></div>
         <div class="form-row">
@@ -1512,7 +1531,7 @@
   </dialog>
 
   <div id="toast" class="toast"></div>
-  <script src="/static/app.js?v=85"></script>
+  <script src="/static/app.js?v=89"></script>
   <script>
     if ("serviceWorker" in navigator) {
       navigator.serviceWorker.register("/sw.js").then((reg) => {
