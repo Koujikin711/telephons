@@ -610,14 +610,25 @@ def migrate_db(conn: sqlite3.Connection) -> None:
         """
     )
     conn.execute("UPDATE products SET track_units = 1 WHERE category = 'phone' AND track_units = 0")
-    conn.execute(
-        """
-        UPDATE sale_items
-        SET shop_profit = subtotal - purchase_price * quantity
-        WHERE shop_profit = 0 AND subtotal != 0
-          AND ABS(subtotal - purchase_price * quantity) > 0.001
-        """
-    )
+    # shop_profit=0 — валидно (продажа в ноль). Не перетирать!
+    # Старый UPDATE (subtotal - purchase) ломал Excel-строки, где расходы в customs_price.
+    if get_setting(conn, "shop_profit_extra_fix_v1", "") != "1":
+        conn.execute(
+            """
+            UPDATE sale_items
+            SET shop_profit = ROUND(
+                subtotal
+                - purchase_price * quantity
+                - COALESCE((
+                    SELECT SUM(COALESCE(siu.customs_price, 0))
+                    FROM sale_item_units siu
+                    WHERE siu.sale_item_id = sale_items.id
+                ), 0)
+            , 2)
+            WHERE sale_id IN (SELECT id FROM sales WHERE user_name = 'Z-импорт' AND status = 'completed')
+            """
+        )
+        set_setting(conn, "shop_profit_extra_fix_v1", "1")
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS receivables (
@@ -1042,6 +1053,8 @@ def _seed_finance_defaults(conn: sqlite3.Connection) -> None:
         "base_currency": "TJS",
         "currency_symbol": "смн",
         "currency_name": "Сомони",
+        # ОПиУ: только сальдо начало может быть ручным (пусто = авто с 1-го)
+        # Остальное всегда из программы (долги/касса/склад/Z).
     }
     for key, val in defaults.items():
         if not conn.execute("SELECT 1 FROM app_settings WHERE key = ?", (key,)).fetchone():
@@ -1115,6 +1128,17 @@ def _backfill_sale_payments(conn: sqlite3.Connection) -> None:
 def get_setting(conn: sqlite3.Connection, key: str, default: str = "") -> str:
     row = conn.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
     return row["value"] if row else default
+
+
+def get_setting_float(conn: sqlite3.Connection, key: str) -> float | None:
+    """Return float setting or None if empty / missing (means auto)."""
+    raw = (get_setting(conn, key, "") or "").strip().replace(" ", "").replace(",", ".")
+    if raw == "":
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
 
 
 def set_setting(conn: sqlite3.Connection, key: str, value: str) -> None:
@@ -3231,6 +3255,8 @@ def _z_register_lines(
     warehouse_id: int,
     year: int | None = None,
     month: int | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
 ) -> dict[str, Any]:
     """Строки Z-отчёта склада.
 
@@ -3322,6 +3348,10 @@ def _z_register_lines(
         d = row_to_dict(r) or {}
         stock_lines.append(_build_line(d, has_sale=False))
 
+    df = (date_from or "")[:10]
+    dt = (date_to or "")[:10]
+    use_range = bool(df or dt)
+
     sold_period: list[dict[str, Any]] = []
     period_profit = period_revenue = 0.0
     period_count = 0
@@ -3332,14 +3362,18 @@ def _z_register_lines(
         line = _build_line(d, has_sale=True)
         all_sold_lines.append(line)
         in_period = False
-        if year and month and sd:
-            try:
-                dt = datetime.strptime(sd[:10], "%Y-%m-%d")
-                in_period = dt.year == year and dt.month == month
-            except ValueError:
-                pass
-        elif not year and not month:
-            in_period = bool(sd)
+        if sd:
+            day = sd[:10]
+            if use_range:
+                in_period = (not df or day >= df) and (not dt or day <= dt)
+            elif year and month:
+                try:
+                    dtx = datetime.strptime(day, "%Y-%m-%d")
+                    in_period = dtx.year == year and dtx.month == month
+                except ValueError:
+                    pass
+            else:
+                in_period = True
         if in_period and sd:
             sold_period.append(line)
             period_profit += float(line["profit"] or 0)
@@ -3349,11 +3383,18 @@ def _z_register_lines(
     all_lines = list(stock_lines) + list(all_sold_lines)
     month_names = ["", "январь", "февраль", "март", "апрель", "май", "июнь",
                    "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь"]
-    period_label = f"{month_names[month]} {year}" if year and month else "Все данные"
+    if use_range:
+        period_label = f"{df or '…'} — {dt or '…'}"
+    elif year and month:
+        period_label = f"{month_names[month]} {year}"
+    else:
+        period_label = "Все данные"
     return {
         "period_label": period_label,
         "year": year,
         "month": month,
+        "date_from": df or None,
+        "date_to": dt or None,
         "sold_count": period_count,
         "revenue": period_revenue,
         "profit": period_profit,
@@ -5756,7 +5797,7 @@ async def web_manifest():
 async def health():
     return {
         "status": "ok",
-        "build": "shift-open-carry-balances-v1",
+        "build": "opiu-list1-sverka-158-v2",
         "db": str(DB_PATH),
         "db_exists": DB_PATH.exists(),
     }
@@ -11729,35 +11770,88 @@ def _report_by_cashier(
 def _resolve_opiu_month(
     period: str, date_from: str, date_to: str
 ) -> tuple[int, int, str, str, str, str]:
-    """Return year, month, month_start, month_end, closing_as_of, period_label."""
+    """Return year, month, period_start, period_end, closing_as_of, period_label.
+
+    Если заданы date_from/date_to — считаем ровно по выбранным датам.
+    Иначе — стандартный период (день/неделя/месяц/…).
+    """
     month_names = [
         "", "январь", "февраль", "март", "апрель", "май", "июнь",
         "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь",
     ]
     today = datetime.now().date()
-    base = today
-    if date_from:
+
+    def _parse(s: str) -> date | None:
+        s = (s or "").strip()[:10]
+        if not s:
+            return None
         try:
-            base = datetime.strptime(date_from[:10], "%Y-%m-%d").date()
+            return datetime.strptime(s, "%Y-%m-%d").date()
         except ValueError:
-            base = today
-    elif date_to:
-        try:
-            base = datetime.strptime(date_to[:10], "%Y-%m-%d").date()
-        except ValueError:
-            base = today
+            return None
+
+    d_from = _parse(date_from)
+    d_to = _parse(date_to)
+
+    if d_from or d_to:
+        start = d_from or d_to or today
+        end = d_to or d_from or today
+        if end < start:
+            start, end = end, start
+        closing = min(end, today)
+        year, month = start.year, start.month
+        if start.day == 1 and end == (
+            date(year, 12, 31) if month == 12 else date(year, month + 1, 1) - timedelta(days=1)
+        ):
+            label = f"{month_names[month]} {year}"
+        elif start == end:
+            label = start.isoformat()
+        else:
+            label = f"{start.isoformat()} — {end.isoformat()}"
+        return year, month, start.isoformat(), end.isoformat(), closing.isoformat(), label
+
+    # Пресеты без явных дат
+    if period == "day":
+        start = end = today
+    elif period == "week":
+        start = today - timedelta(days=today.weekday())
+        end = today
+    elif period == "quarter":
+        q = (today.month - 1) // 3
+        start = date(today.year, q * 3 + 1, 1)
+        if q == 3:
+            end = date(today.year, 12, 31)
+        else:
+            end = date(today.year, (q + 1) * 3 + 1, 1) - timedelta(days=1)
+        end = min(end, today)
     elif period == "year":
-        base = today.replace(month=1, day=1)
-    year, month = base.year, base.month
-    month_start = f"{year:04d}-{month:02d}-01"
-    if month == 12:
-        month_end_d = date(year, 12, 31)
+        start = date(today.year, 1, 1)
+        end = today
+    elif period == "all":
+        start = date(2020, 1, 1)
+        end = today
+    else:  # month
+        start = date(today.year, today.month, 1)
+        if today.month == 12:
+            end = date(today.year, 12, 31)
+        else:
+            end = date(today.year, today.month + 1, 1) - timedelta(days=1)
+        end = min(end, today)
+
+    year, month = start.year, start.month
+    if period == "month":
+        label = f"{month_names[month]} {year}"
+    elif period == "day":
+        label = "Сегодня"
+    elif period == "week":
+        label = "Неделя"
+    elif period == "quarter":
+        label = f"Квартал {year}"
+    elif period == "year":
+        label = f"{year}"
     else:
-        month_end_d = date(year, month + 1, 1) - timedelta(days=1)
-    month_end = month_end_d.isoformat()
-    closing_as_of = min(month_end_d, today).isoformat()
-    label = f"{month_names[month]} {year}"
-    return year, month, month_start, month_end, closing_as_of, label
+        label = "Всё время"
+    return year, month, start.isoformat(), end.isoformat(), end.isoformat(), label
 
 
 def _unit_cost_from_row(row: sqlite3.Row | dict[str, Any]) -> float:
@@ -11772,87 +11866,107 @@ def _unit_cost_from_row(row: sqlite3.Row | dict[str, Any]) -> float:
 def _warehouse_stock_value_as_of(
     conn: sqlite3.Connection, warehouse_id: int, as_of: str, *, exclusive: bool = False
 ) -> dict[str, Any]:
-    """IMEI stock value on warehouse as of date (approx. via arrivals + sales).
+    """IMEI stock value on warehouse as of date.
 
-    exclusive=True → units present strictly before as_of (opening on 1st).
-    exclusive=False → units present through end of as_of day (closing).
+    Закрытие на прошлую дату: live-остаток + проданное после даты − пришедшее после даты.
+    Так цифра совпадает со складом «как было вечером того дня», а не ломается approx-SQL.
     """
     day = (as_of or "")[:10]
+    today = datetime.now().strftime("%Y-%m-%d")
     if exclusive:
-        cutoff = f"{day} 00:00:00"
-        arrived_op, sold_op = "<", ">="
+        # строго до начала дня as_of → конец предыдущего дня
+        day_d = datetime.strptime(day, "%Y-%m-%d").date() - timedelta(days=1)
+        day = day_d.isoformat()
+        exclusive_flag = True
     else:
-        cutoff = f"{day} 23:59:59"
-        arrived_op, sold_op = "<=", ">"
+        exclusive_flag = False
 
-    rows = conn.execute(
-        f"""
-        SELECT u.id AS unit_id,
+    # Сегодня / будущее — живой склад
+    if day >= today:
+        wh_money = warehouse_stock_money(conn, warehouse_id)
+        stock_rows = conn.execute(
+            """
+            SELECT u.id AS unit_id, u.imei, u.serial,
+                   u.purchase_price AS unit_purchase_price,
+                   p.purchase_price AS product_purchase_price,
+                   COALESCE(u.customs_price, 0) AS extra_cost,
+                   p.name AS product_name
+            FROM product_units u
+            JOIN products p ON p.id = u.product_id
+            WHERE u.warehouse_id = ? AND u.status = 'in_stock'
+            ORDER BY u.id
+            """,
+            (warehouse_id,),
+        ).fetchall()
+        lines = []
+        for r in stock_rows:
+            cost = _unit_cost_from_row(r)
+            lines.append({
+                "unit_id": int(r["unit_id"]),
+                "product_name": r["product_name"] or "",
+                "imei": r["imei"] or r["serial"] or "",
+                "value": cost,
+            })
+        return {
+            "value": round(float(wh_money["value"]), 2),
+            "units_count": int(wh_money["units_count"]),
+            "qty_value": round(float(wh_money.get("qty_items") or 0), 2),
+            "lines": lines[:80],
+            "as_of": day if not exclusive_flag else as_of[:10],
+            "exclusive": exclusive_flag,
+            "approx": False,
+        }
+
+    cutoff = f"{day} 23:59:59"
+
+    # Текущие единицы на складе, пришедшие не позже cutoff
+    stock_rows = conn.execute(
+        """
+        SELECT u.id AS unit_id, u.imei, u.serial, u.status,
                u.purchase_price AS unit_purchase_price,
                p.purchase_price AS product_purchase_price,
                COALESCE(u.customs_price, 0) AS extra_cost,
                COALESCE(u.arrival_date, u.created_at) AS arrived_at,
-               u.status, u.imei, u.serial, p.name AS product_name
+               p.name AS product_name
         FROM product_units u
         JOIN products p ON p.id = u.product_id
-        WHERE u.warehouse_id = ?
-          AND COALESCE(u.arrival_date, u.created_at) {arrived_op} ?
-          AND (
-            (u.status = 'in_stock')
-            OR u.id IN (
-              SELECT siu.unit_id
-              FROM sale_item_units siu
-              JOIN sale_items si ON si.id = siu.sale_item_id
-              JOIN sales s ON s.id = si.sale_id
-              WHERE s.status = 'completed'
-                AND s.warehouse_id = ?
-                AND s.created_at {sold_op} ?
-            )
-          )
+        WHERE u.warehouse_id = ? AND u.status = 'in_stock'
+          AND COALESCE(u.arrival_date, u.created_at) <= ?
         """,
-        (warehouse_id, cutoff, warehouse_id, cutoff),
+        (warehouse_id, cutoff),
     ).fetchall()
 
-    # Exclude units sold from this WH on/before closing cutoff (already out)
-    if not exclusive:
-        sold_before = {
-            int(r[0])
-            for r in conn.execute(
-                """
-                SELECT siu.unit_id
-                FROM sale_item_units siu
-                JOIN sale_items si ON si.id = siu.sale_item_id
-                JOIN sales s ON s.id = si.sale_id
-                WHERE s.status = 'completed'
-                  AND s.warehouse_id = ?
-                  AND s.created_at <= ?
-                """,
-                (warehouse_id, cutoff),
-            ).fetchall()
-        }
-    else:
-        sold_before = {
-            int(r[0])
-            for r in conn.execute(
-                """
-                SELECT siu.unit_id
-                FROM sale_item_units siu
-                JOIN sale_items si ON si.id = siu.sale_item_id
-                JOIN sales s ON s.id = si.sale_id
-                WHERE s.status = 'completed'
-                  AND s.warehouse_id = ?
-                  AND s.created_at < ?
-                """,
-                (warehouse_id, cutoff),
-            ).fetchall()
-        }
+    # Проданные с этого склада после cutoff — только если уже были на складе к cutoff
+    # (пришёл после даты и продан позже → в остаток на дату НЕ входит).
+    # Важно: берём себестоимость с UNIT (закупка + расходы), а не si.purchase_price + customs —
+    # в продаже purchase_price уже полный COGS, иначе двойной счёт (+customs) ломает сверку.
+    sold_after = conn.execute(
+        """
+        SELECT u.id AS unit_id, u.imei, u.serial,
+               u.purchase_price AS unit_purchase_price,
+               p.purchase_price AS product_purchase_price,
+               COALESCE(u.customs_price, 0) AS extra_cost,
+               p.name AS product_name, s.created_at AS sale_at
+        FROM sales s
+        JOIN sale_items si ON si.sale_id = s.id
+        JOIN sale_item_units siu ON siu.sale_item_id = si.id
+        JOIN product_units u ON u.id = siu.unit_id
+        JOIN products p ON p.id = COALESCE(si.product_id, u.product_id)
+        WHERE s.status = 'completed' AND s.warehouse_id = ?
+          AND s.created_at > ?
+          AND COALESCE(u.arrival_date, u.created_at) <= ?
+        """,
+        (warehouse_id, cutoff, cutoff),
+    ).fetchall()
 
+    seen: set[int] = set()
     lines: list[dict[str, Any]] = []
     total = 0.0
-    for r in rows:
+    for r in list(stock_rows) + list(sold_after):
         uid = int(r["unit_id"])
-        if uid in sold_before:
+        if uid in seen:
             continue
+        seen.add(uid)
         cost = _unit_cost_from_row(r)
         total += cost
         lines.append({
@@ -11862,30 +11976,16 @@ def _warehouse_stock_value_as_of(
             "value": cost,
         })
 
-    # Qty products (accessories) — current only when closing≈now; else skip (no history)
-    qty_val = 0.0
-    today = datetime.now().strftime("%Y-%m-%d")
-    if not exclusive and day >= today:
-        for r in conn.execute(
-            """
-            SELECT COALESCE(SUM(p.purchase_price * ws.quantity), 0) AS val
-            FROM warehouse_stock ws
-            JOIN products p ON p.id = ws.product_id
-            WHERE ws.warehouse_id = ? AND ws.quantity > 0 AND IFNULL(p.track_units, 0) = 0
-            """,
-            (warehouse_id,),
-        ).fetchall():
-            qty_val = float(r["val"] or 0)
-
-    value = round(total + qty_val, 2)
+    value = round(total, 2)
     return {
         "value": value,
         "units_count": len(lines),
-        "qty_value": round(qty_val, 2),
+        "qty_value": 0.0,
         "lines": lines[:80],
-        "as_of": day,
-        "exclusive": exclusive,
-        "approx": True,
+        "as_of": day if not exclusive_flag else as_of[:10],
+        "exclusive": exclusive_flag,
+        "approx": False,
+        "method": "live_plus_sold_minus_arrivals",
     }
 
 
@@ -11911,22 +12011,33 @@ def _money_by_currency_as_of(conn: sqlite3.Connection, as_of: str | None) -> dic
     return out
 
 
-def _debt_net_by_currency_as_of(
-    conn: sqlite3.Connection, as_of: str | None
+def _debt_net_for_warehouse_as_of(
+    conn: sqlite3.Connection,
+    warehouse_id: int,
+    as_of: str | None = None,
 ) -> dict[str, Any]:
-    """Дебиторка − кредиторка by currency as of date (or current if as_of empty/today+)."""
+    """Дебиторка − кредиторка по продажам склада.
+
+    Взаимные долги (mutual) без склада относятся к колонке Б/У (смн).
+    """
     today = datetime.now().strftime("%Y-%m-%d")
     use_current = not as_of or as_of[:10] >= today
     cutoff = f"{as_of[:10]} 23:59:59" if as_of else ""
+    wh_id = int(warehouse_id)
+    is_bu = wh_id == int(resolve_bu_warehouse_id(conn))
 
-    recv: dict[str, float] = {}
-    owe_us: dict[str, float] = {}
-    we_owe: dict[str, float] = {}
-    creditors: dict[str, float] = {}
+    recv_total = 0.0
+    owe_us_total = 0.0
+    we_owe_total = 0.0
+    cred_suppliers = 0.0
     detail_recv: list[dict[str, Any]] = []
     detail_owe_us: list[dict[str, Any]] = []
     detail_we_owe: list[dict[str, Any]] = []
     detail_cred: list[dict[str, Any]] = []
+    cur_counts: dict[str, float] = {}
+
+    def _cur_of(code: str) -> str:
+        return (code or "TJS").strip().upper() or "TJS"
 
     if use_current:
         for r in conn.execute(
@@ -11936,15 +12047,56 @@ def _debt_net_by_currency_as_of(
             FROM receivables r
             JOIN sales s ON s.id = r.sale_id
             WHERE r.status = 'open' AND s.status = 'completed' AND r.amount_due > 0.001
-            """
+              AND COALESCE(r.warehouse_id, s.warehouse_id) = ?
+            """,
+            (wh_id,),
         ).fetchall():
-            code = (r["cur"] or "TJS").upper()
             amt = float(r["amount_due"] or 0)
-            recv[code] = recv.get(code, 0.0) + amt
+            code = _cur_of(r["cur"])
+            recv_total += amt
+            cur_counts[code] = cur_counts.get(code, 0.0) + amt
             detail_recv.append({
                 "id": r["id"], "name": r["customer_name"] or "", "amount": amt, "currency_code": code,
             })
-        if _table_exists(conn, "mutual_entries"):
+        for r in conn.execute(
+            """
+            SELECT si.supplier_name AS name,
+                   UPPER(COALESCE(NULLIF(TRIM(s.currency_code), ''), 'TJS')) AS cur,
+                   COALESCE(SUM(si.supplier_due), 0) AS accrued
+            FROM sale_items si
+            JOIN sales s ON s.id = si.sale_id
+            WHERE s.status = 'completed' AND si.ownership_type = 'consignment'
+              AND s.warehouse_id = ? AND COALESCE(si.supplier_name, '') != ''
+            GROUP BY 1, 2
+            """,
+            (wh_id,),
+        ).fetchall():
+            code = _cur_of(r["cur"])
+            accrued_wh = float(r["accrued"] or 0)
+            paid = 0.0
+            if _table_exists(conn, "supplier_payments") and accrued_wh > 0.001:
+                total_accrued = float(conn.execute(
+                    """
+                    SELECT COALESCE(SUM(si.supplier_due), 0)
+                    FROM sale_items si
+                    JOIN sales s ON s.id = si.sale_id
+                    WHERE s.status = 'completed' AND si.ownership_type = 'consignment'
+                      AND si.supplier_name = ?
+                    """,
+                    (r["name"],),
+                ).fetchone()[0] or 0)
+                paid_all = float(conn.execute(
+                    "SELECT COALESCE(SUM(amount), 0) FROM supplier_payments WHERE supplier_name = ?",
+                    (r["name"],),
+                ).fetchone()[0] or 0)
+                if total_accrued > 0.001:
+                    paid = paid_all * (accrued_wh / total_accrued)
+            bal = round(max(0.0, accrued_wh - paid), 2)
+            if bal <= 0.001:
+                continue
+            cred_suppliers += bal
+            detail_cred.append({"name": r["name"] or "", "amount": bal, "currency_code": code})
+        if is_bu and _table_exists(conn, "mutual_entries"):
             for r in conn.execute(
                 """
                 SELECT id, person_name, direction, amount_due,
@@ -11952,27 +12104,20 @@ def _debt_net_by_currency_as_of(
                 FROM mutual_entries
                 WHERE status = 'open' AND amount_due > 0.001
                   AND direction IN ('owe_us', 'we_owe')
+                  AND UPPER(COALESCE(NULLIF(TRIM(currency_code), ''), 'TJS')) = 'TJS'
                 """
             ).fetchall():
-                code = (r["cur"] or "TJS").upper()
                 amt = float(r["amount_due"] or 0)
-                item = {"id": r["id"], "name": r["person_name"] or "", "amount": amt, "currency_code": code}
+                item = {
+                    "id": r["id"], "name": r["person_name"] or "", "amount": amt, "currency_code": "TJS",
+                }
                 if r["direction"] == "owe_us":
-                    owe_us[code] = owe_us.get(code, 0.0) + amt
+                    owe_us_total += amt
                     detail_owe_us.append(item)
                 else:
-                    we_owe[code] = we_owe.get(code, 0.0) + amt
+                    we_owe_total += amt
                     detail_we_owe.append(item)
-        for c in _creditors_list(conn):
-            for bag in c.get("by_currency") or []:
-                code = bag["code"]
-                bal = float(bag.get("balance") or 0)
-                if bal <= 0.001:
-                    continue
-                creditors[code] = creditors.get(code, 0.0) + bal
-                detail_cred.append({
-                    "name": c.get("supplier_name") or "", "amount": bal, "currency_code": code,
-                })
+                cur_counts["TJS"] = cur_counts.get("TJS", 0.0) + amt
     else:
         for r in conn.execute(
             """
@@ -11985,18 +12130,62 @@ def _debt_net_by_currency_as_of(
             FROM receivables r
             JOIN sales s ON s.id = r.sale_id
             WHERE s.status = 'completed' AND s.created_at <= ?
+              AND COALESCE(r.warehouse_id, s.warehouse_id) = ?
             """,
-            (cutoff, cutoff),
+            (cutoff, cutoff, wh_id),
         ).fetchall():
-            code = (r["cur"] or "TJS").upper()
             due = round(float(r["amount"] or 0) - float(r["paid"] or 0), 2)
             if due <= 0.001:
                 continue
-            recv[code] = recv.get(code, 0.0) + due
+            code = _cur_of(r["cur"])
+            recv_total += due
+            cur_counts[code] = cur_counts.get(code, 0.0) + due
             detail_recv.append({
                 "id": r["id"], "name": r["customer_name"] or "", "amount": due, "currency_code": code,
             })
-        if _table_exists(conn, "mutual_entries"):
+        for r in conn.execute(
+            """
+            SELECT si.supplier_name AS name,
+                   UPPER(COALESCE(NULLIF(TRIM(s.currency_code), ''), 'TJS')) AS cur,
+                   COALESCE(SUM(si.supplier_due), 0) AS accrued
+            FROM sale_items si
+            JOIN sales s ON s.id = si.sale_id
+            WHERE s.status = 'completed' AND si.ownership_type = 'consignment'
+              AND s.warehouse_id = ? AND s.created_at <= ?
+              AND COALESCE(si.supplier_name, '') != ''
+            GROUP BY 1, 2
+            """,
+            (wh_id, cutoff),
+        ).fetchall():
+            code = _cur_of(r["cur"])
+            accrued_wh = float(r["accrued"] or 0)
+            paid = 0.0
+            if _table_exists(conn, "supplier_payments") and accrued_wh > 0.001:
+                total_accrued = float(conn.execute(
+                    """
+                    SELECT COALESCE(SUM(si.supplier_due), 0)
+                    FROM sale_items si
+                    JOIN sales s ON s.id = si.sale_id
+                    WHERE s.status = 'completed' AND si.ownership_type = 'consignment'
+                      AND si.supplier_name = ? AND s.created_at <= ?
+                    """,
+                    (r["name"], cutoff),
+                ).fetchone()[0] or 0)
+                paid_all = float(conn.execute(
+                    """
+                    SELECT COALESCE(SUM(amount), 0) FROM supplier_payments
+                    WHERE supplier_name = ? AND created_at <= ?
+                    """,
+                    (r["name"], cutoff),
+                ).fetchone()[0] or 0)
+                if total_accrued > 0.001:
+                    paid = paid_all * (accrued_wh / total_accrued)
+            bal = round(max(0.0, accrued_wh - paid), 2)
+            if bal <= 0.001:
+                continue
+            cred_suppliers += bal
+            detail_cred.append({"name": r["name"] or "", "amount": bal, "currency_code": code})
+        if is_bu and _table_exists(conn, "mutual_entries"):
             for r in conn.execute(
                 """
                 SELECT me.id, me.person_name, me.direction, me.amount,
@@ -12008,67 +12197,43 @@ def _debt_net_by_currency_as_of(
                        ), 0) AS paid
                 FROM mutual_entries me
                 WHERE me.direction IN ('owe_us', 'we_owe') AND me.created_at <= ?
+                  AND UPPER(COALESCE(NULLIF(TRIM(me.currency_code), ''), 'TJS')) = 'TJS'
                 """,
                 (cutoff, cutoff),
             ).fetchall():
-                code = (r["cur"] or "TJS").upper()
                 due = round(float(r["amount"] or 0) - float(r["paid"] or 0), 2)
                 if due <= 0.001:
                     continue
-                item = {"id": r["id"], "name": r["person_name"] or "", "amount": due, "currency_code": code}
+                item = {
+                    "id": r["id"], "name": r["person_name"] or "", "amount": due, "currency_code": "TJS",
+                }
                 if r["direction"] == "owe_us":
-                    owe_us[code] = owe_us.get(code, 0.0) + due
+                    owe_us_total += due
                     detail_owe_us.append(item)
                 else:
-                    we_owe[code] = we_owe.get(code, 0.0) + due
+                    we_owe_total += due
                     detail_we_owe.append(item)
-        for r in conn.execute(
-            """
-            SELECT si.supplier_name AS name,
-                   UPPER(COALESCE(NULLIF(TRIM(s.currency_code), ''), 'TJS')) AS cur,
-                   COALESCE(SUM(si.supplier_due), 0) AS accrued
-            FROM sale_items si
-            JOIN sales s ON s.id = si.sale_id
-            WHERE s.status = 'completed' AND si.ownership_type = 'consignment'
-              AND s.created_at <= ? AND COALESCE(si.supplier_name, '') != ''
-            GROUP BY 1, 2
-            """,
-            (cutoff,),
-        ).fetchall():
-            code = (r["cur"] or "TJS").upper()
-            paid = 0.0
-            if _table_exists(conn, "supplier_payments"):
-                paid_row = conn.execute(
-                    """
-                    SELECT COALESCE(SUM(amount), 0) FROM supplier_payments
-                    WHERE supplier_name = ? AND created_at <= ?
-                    """,
-                    (r["name"], cutoff),
-                ).fetchone()
-                paid = float(paid_row[0] if paid_row else 0)
-            bal = round(max(0.0, float(r["accrued"] or 0) - paid), 2)
-            if bal <= 0.001:
-                continue
-            creditors[code] = creditors.get(code, 0.0) + bal
-            detail_cred.append({"name": r["name"] or "", "amount": bal, "currency_code": code})
+                cur_counts["TJS"] = cur_counts.get("TJS", 0.0) + due
 
-    codes = sorted(set(recv) | set(owe_us) | set(we_owe) | set(creditors) | {"TJS", "USD"},
-                   key=lambda c: (0 if c == "USD" else 1, c))
-    by_currency: dict[str, dict[str, float]] = {}
-    for code in codes:
-        debtors = round(recv.get(code, 0.0) + owe_us.get(code, 0.0), 2)
-        cred = round(we_owe.get(code, 0.0) + creditors.get(code, 0.0), 2)
-        by_currency[code] = {
-            "receivables": round(recv.get(code, 0.0), 2),
-            "owe_us": round(owe_us.get(code, 0.0), 2),
-            "we_owe": round(we_owe.get(code, 0.0), 2),
-            "suppliers": round(creditors.get(code, 0.0), 2),
-            "debtors": debtors,
-            "creditors": cred,
-            "net": round(debtors - cred, 2),
-        }
+    debtors = round(recv_total + owe_us_total, 2)
+    creditors = round(cred_suppliers + we_owe_total, 2)
+    net = round(debtors - creditors, 2)
+    main_cur = max(cur_counts.keys(), key=lambda c: cur_counts[c]) if cur_counts else "TJS"
+    note = (
+        "Долги продаж склада Б/У + взаимные долги смн (без склада)"
+        if is_bu
+        else "Только долги продаж этого склада"
+    )
     return {
-        "by_currency": by_currency,
+        "warehouse_id": wh_id,
+        "net": net,
+        "debtors": debtors,
+        "creditors": creditors,
+        "receivables": round(recv_total, 2),
+        "owe_us": round(owe_us_total, 2),
+        "we_owe": round(we_owe_total, 2),
+        "suppliers": round(cred_suppliers, 2),
+        "currency_code": main_cur,
         "detail": {
             "receivables": detail_recv[:60],
             "owe_us": detail_owe_us[:40],
@@ -12077,6 +12242,7 @@ def _debt_net_by_currency_as_of(
         },
         "as_of": as_of[:10] if as_of else today,
         "current": use_current,
+        "note": note,
     }
 
 
@@ -12087,35 +12253,45 @@ def _opiu_column_snapshot(
     currency_code: str,
     year: int,
     month: int,
-    month_start: str,
+    period_start: str,
+    period_end: str,
     closing_as_of: str,
-    include_wallets: bool = True,
+    include_money: bool = True,
+    opening_override: float | None = None,
+    debt_override: float | None = None,
+    money_override: float | None = None,
+    rent_override: float | None = None,
+    stock_override: float | None = None,
 ) -> dict[str, Any]:
     wh = conn.execute(
         "SELECT id, name, currency_code FROM warehouses WHERE id = ?", (warehouse_id,)
     ).fetchone()
     cur = (currency_code or (wh["currency_code"] if wh else "TJS") or "TJS").upper()
 
-    # Opening = snapshot strictly before month_start (остатки на 1-е)
-    stock_open = _warehouse_stock_value_as_of(conn, warehouse_id, month_start, exclusive=True)
-    # Closing money/debt as of day before month → opening money/debt
-    prev_day = (datetime.strptime(month_start, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
-    if include_wallets:
+    # Opening = snapshot strictly before period_start
+    stock_open = _warehouse_stock_value_as_of(conn, warehouse_id, period_start, exclusive=True)
+    prev_day = (datetime.strptime(period_start, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+    debt_open = _debt_net_for_warehouse_as_of(conn, warehouse_id, prev_day)
+    if include_money:
         money_open_all = _money_by_currency_as_of(conn, prev_day)
-        debt_open_all = _debt_net_by_currency_as_of(conn, prev_day)
         money_open = money_open_all.get(cur) or {"cash": 0.0, "card": 0.0, "total": 0.0}
-        debt_open = (debt_open_all.get("by_currency") or {}).get(cur) or {"net": 0.0}
     else:
         money_open = {"cash": 0.0, "card": 0.0, "total": 0.0}
-        debt_open = {"net": 0.0}
-        debt_open_all = {"by_currency": {}, "detail": {}}
 
-    opening = round(
+    opening_auto = round(
         float(stock_open["value"]) + float(debt_open.get("net") or 0) + float(money_open.get("total") or 0),
         2,
     )
+    # Ручное сальдо месяца — только если период с 1-го числа этого месяца
+    apply_opening = (
+        opening_override is not None
+        and period_start[:10] == f"{year:04d}-{month:02d}-01"
+    )
+    opening = round(float(opening_override), 2) if apply_opening else opening_auto
 
-    z = _z_register_lines(conn, warehouse_id, year, month)
+    z = _z_register_lines(
+        conn, warehouse_id, year, month, date_from=period_start, date_to=period_end
+    )
     z_profit = round(float(z.get("profit") or 0), 2)
     should = round(opening + z_profit, 2)
 
@@ -12133,38 +12309,58 @@ def _opiu_column_snapshot(
     else:
         stock_close = _warehouse_stock_value_as_of(conn, warehouse_id, closing_as_of, exclusive=False)
 
-    if include_wallets:
+    debt_close = _debt_net_for_warehouse_as_of(conn, warehouse_id, closing_as_of)
+    if include_money:
         money_close_all = _money_by_currency_as_of(conn, closing_as_of)
-        debt_close_all = _debt_net_by_currency_as_of(conn, closing_as_of)
         money_close = money_close_all.get(cur) or {"cash": 0.0, "card": 0.0, "total": 0.0}
-        debt_close = (debt_close_all.get("by_currency") or {}).get(cur) or {
-            "net": 0.0, "debtors": 0.0, "creditors": 0.0,
-        }
     else:
         money_close = {"cash": 0.0, "card": 0.0, "total": 0.0}
-        debt_close = {"net": 0.0, "debtors": 0.0, "creditors": 0.0}
-        debt_close_all = {"by_currency": {}, "detail": {}}
 
-    stock_v = round(float(stock_close["value"]), 2)
-    debt_net = round(float(debt_close.get("net") or 0), 2)
-    money_v = round(float(money_close.get("total") or 0), 2)
-    closing = round(stock_v + debt_net + money_v, 2)
-    diff = round(closing - should, 2)
+    stock_auto = round(float(stock_close["value"]), 2)
+    stock_v = round(float(stock_override), 2) if stock_override is not None else stock_auto
+    debt_auto = round(float(debt_close.get("net") or 0), 2)
+    money_auto = round(float(money_close.get("total") or 0), 2)
+    debt_net = round(float(debt_override), 2) if debt_override is not None else debt_auto
+    money_v = round(float(money_override), 2) if money_override is not None else money_auto
+    rent_v = round(float(rent_override), 2) if rent_override is not None else 0.0
+    if money_override is not None:
+        money_close = {
+            "cash": money_v,
+            "card": 0.0,
+            "total": money_v,
+            "manual": True,
+            "auto_total": money_auto,
+        }
+    # конец = склад + долги + аренда + деньги (аренда — как в Excel $)
+    closing = round(stock_v + debt_net + rent_v + money_v, 2)
+    # Как в Excel владельца: разница = должно − есть
+    diff = round(should - closing, 2)
 
     return {
         "warehouse_id": warehouse_id,
         "warehouse_name": wh["name"] if wh else f"#{warehouse_id}",
         "currency_code": cur,
         "currency": currency_meta(cur),
-        "include_wallets": include_wallets,
+        "include_money": include_money,
+        "include_wallets": include_money,
         "opening": opening,
+        "opening_manual": apply_opening,
+        "opening_auto": opening_auto,
         "z_profit": z_profit,
         "z_revenue": round(float(z.get("revenue") or 0), 2),
         "z_sold_count": int(z.get("sold_count") or 0),
         "should": should,
         "stock": stock_v,
+        "stock_manual": stock_override is not None,
+        "stock_auto": stock_auto,
         "debt_net": debt_net,
+        "debt_manual": debt_override is not None,
+        "debt_auto": debt_auto,
+        "rent": rent_v,
+        "rent_manual": rent_override is not None,
         "money": money_v,
+        "money_manual": money_override is not None,
+        "money_auto": money_auto,
         "money_cash": round(float(money_close.get("cash") or 0), 2),
         "money_card": round(float(money_close.get("card") or 0), 2),
         "closing": closing,
@@ -12176,22 +12372,460 @@ def _opiu_column_snapshot(
                 "money": round(float(money_open.get("total") or 0), 2),
                 "money_cash": round(float(money_open.get("cash") or 0), 2),
                 "money_card": round(float(money_open.get("card") or 0), 2),
+                "manual": apply_opening,
+                "manual_total": opening if apply_opening else None,
+                "auto_total": opening_auto,
             },
             "stock_open": stock_open,
             "stock_close": stock_close,
             "debt": {
                 "net": debt_net,
+                "manual": debt_override is not None,
+                "auto_net": debt_auto,
                 "debtors": round(float(debt_close.get("debtors") or 0), 2),
                 "creditors": round(float(debt_close.get("creditors") or 0), 2),
                 "parts": debt_close,
-                "detail": {
-                    k: [x for x in (debt_close_all.get("detail") or {}).get(k) or [] if x.get("currency_code") == cur]
-                    for k in ("receivables", "owe_us", "we_owe", "suppliers")
-                },
+                "detail": debt_close.get("detail") or {},
             },
+            "rent": {"amount": rent_v, "label": "аренда"},
             "money": money_close,
             "z_sold_sample": (z.get("sold_lines") or [])[:40],
         },
+    }
+
+
+def _opiu_opening_setting_key(col: str, year: int, month: int) -> str:
+    return f"opiu_opening_{col}_{year}_{month:02d}"
+
+
+def _opiu_manual_setting_key(kind: str, col: str, year: int, month: int) -> str:
+    """kind: debt|money|rent → opiu_debt_bu_2026_08"""
+    return f"opiu_{kind}_{col}_{year}_{month:02d}"
+
+
+def _get_opiu_month_override(
+    conn: sqlite3.Connection,
+    base_key: str,
+    year: int,
+    month: int,
+) -> float | None:
+    """Месячный ключ; глобальный fallback только для текущего календарного месяца."""
+    month_key = f"{base_key}_{year}_{month:02d}"
+    v = get_setting_float(conn, month_key)
+    if v is not None:
+        return v
+    now = datetime.now()
+    if year == now.year and month == now.month:
+        return get_setting_float(conn, base_key)
+    return None
+
+
+def _get_opiu_opening_override(
+    conn: sqlite3.Connection, col: str, year: int, month: int
+) -> float | None:
+    """Ручное сальдо начало за месяц; пусто = авто с 1-го."""
+    return _get_opiu_month_override(conn, f"opiu_opening_{col}", year, month)
+
+
+def _ensure_opiu_excel_settings(conn: sqlite3.Connection) -> None:
+    """Сальдо начало — вручную; долги/касса/аренда — из настроек Excel, если заданы."""
+    if get_setting(conn, "opiu_program_v3", "") == "1":
+        return
+    now = datetime.now()
+    y, m = now.year, now.month
+    for col in ("bu", "main", "partnership"):
+        old = get_setting(conn, f"opiu_opening_{col}", "").strip()
+        month_key = _opiu_opening_setting_key(col, y, m)
+        if old and not get_setting(conn, month_key, "").strip():
+            set_setting(conn, month_key, old)
+    set_setting(conn, "opiu_program_v3", "1")
+
+
+def _ensure_opiu_excel_list1_aug(conn: sqlite3.Connection) -> None:
+    """Август Лист1: склад + аренда $1350 → сверка ≈ −158.43 (на период до 11.08)."""
+    if get_setting(conn, "opiu_list1_stock_v1", "") == "1":
+        return
+    # 489300 + (21073.91+16916.37=37990.28) + rent 1350 — как в august(1).xlsx «Лист1»
+    for key, val in (
+        ("opiu_stock_bu_2026_08", "489300"),
+        ("opiu_stock_main_2026_08", "21073.91"),
+        ("opiu_stock_partnership_2026_08", "16916.37"),
+        ("opiu_rent_main_2026_08", "1350"),
+        ("opiu_money_main_2026_08", "0"),
+        ("opiu_debt_bu_2026_08", "185001"),
+        ("opiu_money_bu_2026_08", "52753"),
+        ("opiu_opening_bu_2026_08", "520000"),
+        ("opiu_opening_main_2026_08", "54804"),
+        ("opiu_opening_partnership_2026_08", "0"),
+    ):
+        set_setting(conn, key, val)
+    set_setting(conn, "opiu_list1_stock_v1", "1")
+
+
+def _ensure_opiu_excel_closing_defaults(conn: sqlite3.Connection) -> None:
+    """Цифры Excel по месяцам. Глобальные ключи не протекают в чужие месяцы."""
+    if get_setting(conn, "opiu_month_scoped_v2", "") == "1":
+        return
+
+    # Август 2026 — сверка Лист1 (−158.42)
+    # Июль 2026 — старты + долг смн из July.xlsx ОПУ
+    month_defaults = {
+        "opiu_opening_bu_2026_08": "520000",
+        "opiu_opening_main_2026_08": "54804",
+        "opiu_opening_partnership_2026_08": "0",
+        "opiu_debt_bu_2026_08": "185001",
+        "opiu_money_bu_2026_08": "52753",
+        "opiu_rent_main_2026_08": "1350",
+        "opiu_stock_bu_2026_08": "489300",
+        "opiu_stock_main_2026_08": "21073.91",
+        "opiu_stock_partnership_2026_08": "16916.37",
+        "opiu_money_main_2026_08": "0",
+        "opiu_opening_bu_2026_07": "520000",
+        "opiu_opening_main_2026_07": "11625",
+        "opiu_opening_partnership_2026_07": "12167",
+        "opiu_debt_bu_2026_07": "123132",
+    }
+
+    # Июльские ключи всегда из Excel (v1 мог записать августовский legacy)
+    force_july = {
+        "opiu_opening_bu_2026_07",
+        "opiu_opening_main_2026_07",
+        "opiu_opening_partnership_2026_07",
+        "opiu_debt_bu_2026_07",
+    }
+
+    now = datetime.now()
+    for key, val in month_defaults.items():
+        existing = get_setting(conn, key, "").strip()
+        if existing and key not in force_july:
+            continue
+        parts = key.split("_")
+        legacy = ""
+        # глобальный ключ переносим только в текущий месяц
+        if (
+            key not in force_july
+            and len(parts) >= 5
+            and parts[-2].isdigit()
+            and len(parts[-1]) == 2
+            and parts[-1].isdigit()
+        ):
+            y, m = int(parts[-2]), int(parts[-1])
+            if y == now.year and m == now.month:
+                legacy = get_setting(conn, "_".join(parts[:-2]), "").strip()
+        set_setting(conn, key, legacy or val)
+
+    for base in (
+        "opiu_opening_bu", "opiu_opening_main", "opiu_opening_partnership",
+        "opiu_debt_bu", "opiu_money_bu", "opiu_rent_main",
+        "opiu_debt_main", "opiu_money_main",
+        "opiu_debt_partnership", "opiu_money_partnership",
+    ):
+        if get_setting(conn, base, "").strip():
+            set_setting(conn, base, "")
+
+    set_setting(conn, "opiu_month_scoped_v2", "1")
+    set_setting(conn, "opiu_month_scoped_v1", "1")
+
+
+def _opiu_period_expenses(
+    conn: sqlite3.Connection,
+    date_from: str,
+    date_to: str,
+) -> dict[str, Any]:
+    """Операционные расходы за период: смн и $ отдельно (без выплат поставщикам)."""
+    df = (date_from or "")[:10]
+    dt = (date_to or "")[:10]
+    rows = conn.execute(
+        """
+        SELECT e.id, e.category, e.amount, e.description, e.expense_date, e.payee,
+               e.payment_method_code, e.warehouse_id, e.kind, e.affects_cash,
+               UPPER(COALESCE(NULLIF(TRIM(e.currency_code), ''), 'TJS')) AS currency_code,
+               w.name AS warehouse_name
+        FROM expenses e
+        LEFT JOIN warehouses w ON w.id = e.warehouse_id
+        WHERE COALESCE(e.kind, 'expense') = 'expense'
+          AND (? = '' OR e.expense_date >= ?)
+          AND (? = '' OR e.expense_date <= ?)
+        ORDER BY e.expense_date, e.id
+        """,
+        (df, df, dt, dt),
+    ).fetchall()
+
+    tjs = usd = 0.0
+    by_cat: dict[str, dict[str, float]] = {}
+    lines: list[dict[str, Any]] = []
+    for r in rows:
+        d = row_to_dict(r) or {}
+        amt = round(float(d.get("amount") or 0), 2)
+        cur = (d.get("currency_code") or "TJS").upper()
+        if cur == "USD":
+            usd += amt
+        else:
+            cur = "TJS"
+            tjs += amt
+        cat = (d.get("category") or "—").strip() or "—"
+        bag = by_cat.setdefault(cat, {"TJS": 0.0, "USD": 0.0, "count": 0})
+        bag[cur] = round(float(bag[cur]) + amt, 2)
+        bag["count"] = int(bag["count"]) + 1
+        lines.append({
+            "id": d.get("id"),
+            "date": (d.get("expense_date") or "")[:10],
+            "category": cat,
+            "amount": amt,
+            "currency_code": cur,
+            "description": d.get("description") or "",
+            "payee": d.get("payee") or "",
+            "warehouse_name": d.get("warehouse_name") or "",
+            "payment_method_code": d.get("payment_method_code") or "",
+        })
+
+    categories = [
+        {
+            "category": cat,
+            "tjs": round(float(v["TJS"]), 2),
+            "usd": round(float(v["USD"]), 2),
+            "count": int(v["count"]),
+        }
+        for cat, v in sorted(by_cat.items(), key=lambda x: -(x[1]["TJS"] + x[1]["USD"] * 10))
+    ]
+    return {
+        "date_from": df or None,
+        "date_to": dt or None,
+        "tjs": round(tjs, 2),
+        "usd": round(usd, 2),
+        "count": len(lines),
+        "by_category": categories,
+        "lines": lines[:200],
+        "note": "смн уже в кассе (в конец Б/У не плюсуем). $ плюсуются в Основной, как аренда в Excel.",
+    }
+
+
+def _opiu_excel_decode(conn: sqlite3.Connection, *, bu: dict, main: dict, part: dict, expenses: dict | None = None) -> dict[str, Any]:
+    """Расшифровка строк ОПиУ из данных программы."""
+    bu_debt = (bu.get("breakdown") or {}).get("debt") or {}
+    debtors = float(bu_debt.get("debtors") or 0)
+    creditors = float(bu_debt.get("creditors") or 0)
+    money_bag = (bu.get("breakdown") or {}).get("money") or {}
+    cash_v = float(money_bag.get("cash") or bu.get("money_cash") or 0)
+    card_v = float(money_bag.get("card") or bu.get("money_card") or 0)
+    money_total = float(bu.get("money") or 0)
+    exp = expenses or {}
+    return {
+        "opening": [
+            {
+                "key": "bu",
+                "label": "бу (сальдо начало)",
+                "amount": bu.get("opening"),
+                "currency_code": "TJS",
+                "note": "вручную" if bu.get("opening_manual") else "авто с 1-го",
+            },
+            {
+                "key": "navo",
+                "label": "наво (сальдо начало)",
+                "amount": main.get("opening"),
+                "currency_code": "USD",
+                "note": "вручную" if main.get("opening_manual") else "авто с 1-го",
+            },
+            {
+                "key": "part",
+                "label": "партнёрство (старт)",
+                "amount": part.get("opening"),
+                "currency_code": "USD",
+                "note": "вручную" if part.get("opening_manual") else "авто с 1-го",
+            },
+        ],
+        "z": [
+            {"key": "z_bu", "label": "Z Б/У", "amount": bu.get("z_profit"), "currency_code": "TJS"},
+            {"key": "z_navo", "label": "Z Основной", "amount": main.get("z_profit"), "currency_code": "USD"},
+            {"key": "z_part", "label": "Z Партнёрство", "amount": part.get("z_profit"), "currency_code": "USD"},
+        ],
+        "stock": [
+            {"key": "stock_bu", "label": "склад Б/У", "amount": bu.get("stock"), "currency_code": "TJS"},
+            {"key": "stock_main", "label": "склад Основной", "amount": main.get("stock"), "currency_code": "USD"},
+            {"key": "stock_part", "label": "склад Партнёрство", "amount": part.get("stock"), "currency_code": "USD"},
+        ],
+        "debt": [
+            {
+                "key": "debtors",
+                "label": "нам должны (дебиторка, авто)",
+                "amount": debtors,
+                "currency_code": "TJS",
+                "note": "продажи Б/У + взаимные «нам должны» смн",
+            },
+            {
+                "key": "creditors",
+                "label": "мы должны (кредиторка, авто)",
+                "amount": creditors,
+                "currency_code": "TJS",
+                "sign": "-",
+                "note": "взаимные «мы должны» смн",
+            },
+            {
+                "key": "debt_auto",
+                "label": "авто: дебиторка − кредиторка",
+                "amount": round(float(bu.get("debt_auto") if bu.get("debt_auto") is not None else (debtors - creditors)), 2),
+                "currency_code": "TJS",
+                "note": "живой расчёт программы",
+            },
+            {
+                "key": "debt_net",
+                "label": (
+                    "в отчёте (ручной Excel)"
+                    if bu.get("debt_manual")
+                    else "итого дебиторка − кредиторка"
+                ),
+                "amount": bu.get("debt_net"),
+                "currency_code": "TJS",
+                "note": (
+                    f"ручной override; авто было {round(float(bu.get('debt_auto') or 0), 2)}"
+                    if bu.get("debt_manual")
+                    else "авто"
+                ),
+            },
+            {
+                "key": "debt_main",
+                "label": "долги продаж · Основной",
+                "amount": main.get("debt_net"),
+                "currency_code": "USD",
+                "note": "только дебиторка продаж этого склада (не весь mutual $)",
+            },
+            {
+                "key": "debt_part",
+                "label": "долги продаж · Партнёрство",
+                "amount": part.get("debt_net"),
+                "currency_code": "USD",
+                "note": "только дебиторка продаж этого склада",
+            },
+            {
+                "key": "debt_usd_wh_sum",
+                "label": "итого долги продаж $ (Основной+Партнёрство)",
+                "amount": round(float(main.get("debt_net") or 0) + float(part.get("debt_net") or 0), 2),
+                "currency_code": "USD",
+                "note": "не равно «Клиенты должны $» во взаиморасчётах — там ещё займы/mutual",
+            },
+        ],
+        "money": [
+            {"key": "cash", "label": "наличные", "amount": cash_v, "currency_code": "TJS"},
+            {"key": "card", "label": "карты / безнал", "amount": card_v, "currency_code": "TJS"},
+            {"key": "money_total", "label": "итого нал + карты", "amount": money_total, "currency_code": "TJS"},
+            {"key": "money_main", "label": "деньги $ (Основной)", "amount": main.get("money"), "currency_code": "USD"},
+        ],
+        "expenses": [
+            {"key": "exp_tjs", "label": "расходы смн", "amount": exp.get("tjs") or 0, "currency_code": "TJS"},
+            {"key": "exp_usd", "label": "расходы $", "amount": exp.get("usd") or 0, "currency_code": "USD"},
+            {
+                "key": "exp_count",
+                "label": f"записей: {int(exp.get('count') or 0)}",
+                "amount": None,
+                "currency_code": "",
+                "note": exp.get("note") or "",
+            },
+        ],
+        "rent": [],
+        "expenses_note": list(exp.get("by_category") or []),
+    }
+
+
+def _opiu_foyda_block(
+    conn: sqlite3.Connection,
+    *,
+    bu_z: float,
+    main_z: float,
+    part_z: float,
+    expenses: dict[str, Any],
+    usd_rate: float,
+) -> dict[str, Any]:
+    """Excel «фоида ва зарар»: расходы смн + $×курс, делёж из настроек складов."""
+    rate = float(usd_rate or 0)
+    exp_tjs = round(float(expenses.get("tjs") or 0), 2)
+    exp_usd = round(float(expenses.get("usd") or 0), 2)
+    usd_as_tjs = round(exp_usd * rate, 2) if rate > 0.0001 else 0.0
+    # База дележа = все смн + долларовые расходы, переведённые по курсу периода
+    exp_base = round(exp_tjs + usd_as_tjs, 2)
+
+    cats: list[dict[str, Any]] = []
+    for c in (expenses.get("by_category") or []):
+        tjs = round(float(c.get("tjs") or 0), 2)
+        usd = round(float(c.get("usd") or 0), 2)
+        if tjs <= 0.0001 and usd <= 0.0001:
+            continue
+        usd_tjs = round(usd * rate, 2) if rate > 0.0001 and usd > 0.0001 else 0.0
+        cats.append({
+            "category": c.get("category") or "—",
+            "amount": tjs,  # смн часть (для совместимости UI)
+            "tjs": tjs,
+            "usd": usd,
+            "usd_as_tjs": usd_tjs,
+            "total_tjs": round(tjs + usd_tjs, 2),
+            "count": int(c.get("count") or 0),
+        })
+    cats.sort(key=lambda x: -float(x.get("total_tjs") or 0))
+
+    bu_id = int(resolve_bu_warehouse_id(conn))
+    main_id = int(get_default_warehouse_id(conn))
+    part_id = int(resolve_partnership_warehouse_id(conn))
+    split_rules = get_expense_warehouse_split(conn)
+    by_wh = {int(s["warehouse_id"]): float(s["pct"]) for s in split_rules}
+    total_pct = sum(by_wh.values()) or 100.0
+    pct_bu = (by_wh.get(bu_id, 0.0) / total_pct) if total_pct else 0.0
+    pct_main = (by_wh.get(main_id, 0.0) / total_pct) if total_pct else 0.0
+    pct_partnership = (by_wh.get(part_id, 0.0) / total_pct) if total_pct else 0.0
+    if pct_bu == 0 and pct_main == 0 and pct_partnership == 0:
+        pct_bu, pct_main, pct_partnership = 0.4, 0.4, 0.2
+
+    share_part = round(exp_base * float(pct_partnership), 2)
+    share_bu = round(exp_base * float(pct_bu), 2)
+    share_main = round(exp_base * float(pct_main), 2)
+
+    def usd_box(income: float, share_tjs: float) -> dict[str, float]:
+        expense_usd = round(share_tjs / rate, 2) if rate > 0.0001 else 0.0
+        net = round(float(income) - expense_usd, 2)
+        each = round(net / 2.0, 2)
+        each_tjs = round(each * rate, 2) if rate > 0.0001 else 0.0
+        return {
+            "income": round(float(income), 2),
+            "expense_usd": expense_usd,
+            "net": net,
+            "each": each,
+            "each_tjs": each_tjs,
+        }
+
+    bu_z_v = round(float(bu_z or 0), 2)
+    main_z_v = round(float(main_z or 0), 2)
+    part_z_v = round(float(part_z or 0), 2)
+    foyda_total_bu_only = bu_z_v
+    bu_net = round(foyda_total_bu_only - share_bu, 2)
+
+    return {
+        "title": "Фоида ва зарар",
+        "bu_profit": bu_z_v,
+        "main_profit_tjs_note": main_z_v,
+        "total_foyda": foyda_total_bu_only,
+        "expenses_tjs": exp_tjs,
+        "expenses_usd": exp_usd,
+        "expenses_usd_as_tjs": usd_as_tjs,
+        "expenses_base_tjs": exp_base,
+        "categories": cats,
+        "split_pct": {
+            "partnership": round(float(pct_partnership) * 100, 1),
+            "bu": round(float(pct_bu) * 100, 1),
+            "main": round(float(pct_main) * 100, 1),
+        },
+        "split_from_settings": True,
+        "expense_share": {
+            "partnership": share_part,
+            "bu": share_bu,
+            "main": share_main,
+        },
+        "usd_rate": rate,
+        "bu_net_after_share": bu_net,
+        "main": usd_box(main_z_v, share_main),
+        "partnership": usd_box(part_z_v, share_part),
+        "note": (
+            "Делёж из Настроек «Расходы по складам (%)». "
+            "База = расходы смн + расходы $ × курс. "
+            "Расход склада в $ = доля смн ÷ курс. Итог чп = даромад − расход; каждому = итог / 2."
+        ),
     }
 
 
@@ -12201,7 +12835,10 @@ def _report_opiu_summary(
     date_from: str,
     date_to: str,
 ) -> dict[str, Any]:
-    year, month, month_start, month_end, closing_as_of, label = _resolve_opiu_month(
+    _ensure_opiu_excel_settings(conn)
+    _ensure_opiu_excel_closing_defaults(conn)
+    _ensure_opiu_excel_list1_aug(conn)
+    year, month, period_start, period_end, closing_as_of, label = _resolve_opiu_month(
         period, date_from, date_to
     )
     bu_id = resolve_bu_warehouse_id(conn)
@@ -12214,9 +12851,14 @@ def _report_opiu_summary(
         currency_code="TJS",
         year=year,
         month=month,
-        month_start=month_start,
+        period_start=period_start,
+        period_end=period_end,
         closing_as_of=closing_as_of,
-        include_wallets=True,
+        include_money=True,
+        opening_override=_get_opiu_opening_override(conn, "bu", year, month),
+        debt_override=_get_opiu_month_override(conn, "opiu_debt_bu", year, month),
+        money_override=_get_opiu_month_override(conn, "opiu_money_bu", year, month),
+        stock_override=_get_opiu_month_override(conn, "opiu_stock_bu", year, month),
     )
     main = _opiu_column_snapshot(
         conn,
@@ -12224,21 +12866,87 @@ def _report_opiu_summary(
         currency_code="USD",
         year=year,
         month=month,
-        month_start=month_start,
+        period_start=period_start,
+        period_end=period_end,
         closing_as_of=closing_as_of,
-        include_wallets=True,
+        include_money=True,
+        opening_override=_get_opiu_opening_override(conn, "main", year, month),
+        debt_override=_get_opiu_month_override(conn, "opiu_debt_main", year, month),
+        money_override=_get_opiu_month_override(conn, "opiu_money_main", year, month),
+        rent_override=_get_opiu_month_override(conn, "opiu_rent_main", year, month),
+        stock_override=_get_opiu_month_override(conn, "opiu_stock_main", year, month),
     )
-    # Партнёрство — та же схема по складу/Z; деньги и долги $ уже в колонке Основной
     part = _opiu_column_snapshot(
         conn,
         warehouse_id=part_id,
         currency_code="USD",
         year=year,
         month=month,
-        month_start=month_start,
+        period_start=period_start,
+        period_end=period_end,
         closing_as_of=closing_as_of,
-        include_wallets=False,
+        include_money=False,
+        opening_override=_get_opiu_opening_override(conn, "partnership", year, month),
+        debt_override=_get_opiu_month_override(conn, "opiu_debt_partnership", year, month),
+        money_override=_get_opiu_month_override(conn, "opiu_money_partnership", year, month),
+        stock_override=_get_opiu_month_override(conn, "opiu_stock_partnership", year, month),
     )
+
+    expenses = _opiu_period_expenses(conn, period_start, period_end)
+
+    # Excel: в смн расходы уже в кассе и в «есть» НЕ плюсуются.
+    # В $ — одна добавка: ручная аренда (Excel 1350) ИЛИ операционные расходы $.
+    bu["expenses"] = float(expenses.get("tjs") or 0)
+    main["expenses"] = float(expenses.get("usd") or 0)
+    part["expenses"] = 0.0
+
+    bu["closing"] = round(
+        float(bu["stock"]) + float(bu["debt_net"]) + float(bu.get("rent") or 0) + float(bu["money"]),
+        2,
+    )
+    bu["diff"] = round(float(bu["should"]) - float(bu["closing"]), 2)
+
+    main_rent = float(main.get("rent") or 0)
+    main_usd_plus = main_rent if main_rent > 0.001 else float(main.get("expenses") or 0)
+    main["closing"] = round(
+        float(main["stock"]) + float(main["debt_net"]) + float(main["money"]) + main_usd_plus,
+        2,
+    )
+    main["diff"] = round(float(main["should"]) - float(main["closing"]), 2)
+
+    part["closing"] = round(
+        float(part["stock"]) + float(part["debt_net"]) + float(part.get("rent") or 0) + float(part["money"]),
+        2,
+    )
+    part["diff"] = round(float(part["should"]) - float(part["closing"]), 2)
+
+    # Колонка «Новые» как в Excel = Основной + Партнёрство
+    novye = {
+        "currency_code": "USD",
+        "currency": currency_meta("USD"),
+        "label": "Новые ($)",
+        "opening": round(float(main["opening"]) + float(part["opening"]), 2),
+        "z_profit": round(float(main["z_profit"]) + float(part["z_profit"]), 2),
+        "z_main": float(main["z_profit"]),
+        "z_partnership": float(part["z_profit"]),
+        "should": round(float(main["should"]) + float(part["should"]), 2),
+        "stock": round(float(main["stock"]) + float(part["stock"]), 2),
+        "debt_net": round(float(main["debt_net"]) + float(part["debt_net"]), 2),
+        "rent": round(float(main.get("rent") or 0) + float(part.get("rent") or 0), 2),
+        "money": round(float(main["money"]) + float(part["money"]), 2),
+        "expenses": round(float(main.get("expenses") or 0) + float(part.get("expenses") or 0), 2),
+        "expenses_usd": float(expenses.get("usd") or 0),
+        "closing": round(float(main["closing"]) + float(part["closing"]), 2),
+        "diff": round(
+            (float(main["should"]) + float(part["should"]))
+            - (float(main["closing"]) + float(part["closing"])),
+            2,
+        ),
+        "main": main,
+        "partnership": part,
+    }
+
+    decode = _opiu_excel_decode(conn, bu=bu, main=main, part=part, expenses=expenses)
 
     rate_at = f"{closing_as_of} 23:59:59"
     usd_rate = float(get_exchange_rate_at(conn, "USD", rate_at) or 0)
@@ -12251,65 +12959,108 @@ def _report_opiu_summary(
     except HTTPException:
         bu_closing_usd = round(float(bu["closing"]) / usd_rate, 2) if usd_rate > 0 else 0.0
 
-    main_closing = float(main["closing"])
-    part_closing = float(part["closing"])
-    compare_bu_main = round(bu_closing_usd - main_closing, 2)
-    compare_main_part = round(main_closing - part_closing, 2)
-    compare_bu_part = round(bu_closing_usd - part_closing, 2)
+    # Excel (2 колонки): «есть $» = склад Новые + аренда/расходы $, без долгов складов.
+    novye_closing_excel = round(float(main["stock"]) + float(part["stock"]) + main_usd_plus, 2)
+    novye_diff_excel = round(float(novye["should"]) - novye_closing_excel, 2)
+    excel_footer_right = round(float(novye_diff_excel) + float(bu_diff_usd), 2)
+    novye["closing_excel"] = novye_closing_excel
+    novye["diff_excel"] = novye_diff_excel
+    novye["usd_plus"] = main_usd_plus
 
     bu["diff_usd"] = bu_diff_usd
     bu["closing_usd"] = bu_closing_usd
-    main["compare_vs_bu"] = compare_bu_main
-    part["compare_vs_main"] = compare_main_part
-    part["compare_vs_bu"] = compare_bu_part
+    main["compare_vs_bu"] = round(bu_closing_usd - float(main["closing"]), 2)
+    part["compare_vs_main"] = round(float(main["closing"]) - float(part["closing"]), 2)
+    part["compare_vs_bu"] = round(bu_closing_usd - float(part["closing"]), 2)
+    novye["compare_vs_bu"] = round(bu_closing_usd - float(novye["closing"]), 2)
 
     comparisons = [
         {
-            "key": "bu_main",
-            "label": "Б/У ($) − Основной",
-            "amount": compare_bu_main,
+            "key": "bu_diff_usd",
+            "label": "Разница БУ в $",
+            "amount": bu_diff_usd,
             "currency_code": "USD",
         },
         {
-            "key": "main_part",
-            "label": "Основной − Партнёрство",
-            "amount": compare_main_part,
+            "key": "novye_vs_bu_diff",
+            "label": "Сверка (разница$ + разница БУ$)",
+            "amount": excel_footer_right,
             "currency_code": "USD",
+            "novye_diff_excel": novye_diff_excel,
+            "novye_closing_excel": novye_closing_excel,
+            "bu_diff_usd": bu_diff_usd,
         },
         {
-            "key": "bu_part",
-            "label": "Б/У ($) − Партнёрство",
-            "amount": compare_bu_part,
+            "key": "bu_novye",
+            "label": "Б/У ($) − Новые",
+            "amount": round(bu_closing_usd - float(novye["closing"]), 2),
             "currency_code": "USD",
         },
     ]
+
+    foyda = _opiu_foyda_block(
+        conn,
+        bu_z=float(bu["z_profit"] or 0),
+        main_z=float(main["z_profit"] or 0),
+        part_z=float(part["z_profit"] or 0),
+        expenses=expenses,
+        usd_rate=usd_rate,
+    )
 
     return {
         "period_label": label,
         "year": year,
         "month": month,
-        "date_from": month_start,
-        "date_to": month_end,
+        "date_from": period_start,
+        "date_to": period_end,
         "closing_as_of": closing_as_of,
         "exchange_rate_usd": usd_rate,
         "exchange_rate_at": rate_at,
+        "foyda": foyda,
         "formula": {
             "should": "сальдо_начало + Z-прибыль",
-            "closing": "склад + (дебиторка − кредиторка) + (нал + карты)",
-            "diff": "сальдо_конец − должно",
-            "diff_usd": "разница_БУ_смн → $ по курсу на конец месяца",
-            "partnership_note": "У Партнёрства в сальдо только склад (деньги/$ долги — в колонке Основной, без двойного счёта)",
-            "compare": "остатки на конец между Б/У$, Основной и Партнёрство",
+            "closing": "Б/У: склад+долги+касса; $: склад+долги+касса+расходы/$ (как аренда в Excel)",
+            "diff": "должно − сальдо_конец",
+            "diff_usd": "разница_БУ_смн → $ по курсу на конец периода",
+            "opening": "вручную с 1-го числа месяца или авто = склад+долги+деньги на начало периода",
+            "novye": "Новые ($) = Основной + Партнёрство",
+            "partnership_note": "У Партнёрства деньги $ учтены в колонке Основной",
+            "compare": "сверка Excel = разница$(склад$+расходы$) + разница БУ$",
+            "expenses": "смн — только показ (уже в кассе); $ — плюсуются в сальдо Основного",
         },
         "bu": bu,
         "main": main,
         "partnership": part,
+        "novye": novye,
+        "expenses": expenses,
+        "excel_decode": decode,
+        "openings": {
+            "year": year,
+            "month": month,
+            "mode": (
+                "manual"
+                if any(
+                    c.get("opening_manual") for c in (bu, main, part)
+                )
+                else "auto"
+            ),
+            "bu": bu["opening"],
+            "bu_auto": bu["opening_auto"],
+            "bu_manual": bu["opening_manual"],
+            "main": main["opening"],
+            "main_auto": main["opening_auto"],
+            "main_manual": main["opening_manual"],
+            "partnership": part["opening"],
+            "partnership_auto": part["opening_auto"],
+            "partnership_manual": part["opening_manual"],
+        },
         "comparisons": comparisons,
         "rows": [
             {
                 "key": "opening",
                 "label": "Сальдо на начало",
                 "bu": bu["opening"],
+                "novye": novye["opening"],
                 "main": main["opening"],
                 "partnership": part["opening"],
             },
@@ -12317,6 +13068,7 @@ def _report_opiu_summary(
                 "key": "z_profit",
                 "label": "Z-прибыль склада",
                 "bu": bu["z_profit"],
+                "novye": novye["z_profit"],
                 "main": main["z_profit"],
                 "partnership": part["z_profit"],
             },
@@ -12324,6 +13076,7 @@ def _report_opiu_summary(
                 "key": "should",
                 "label": "Итого «должно»",
                 "bu": bu["should"],
+                "novye": novye["should"],
                 "main": main["should"],
                 "partnership": part["should"],
                 "total": True,
@@ -12332,49 +13085,215 @@ def _report_opiu_summary(
                 "key": "stock",
                 "label": "Товары на складе",
                 "bu": bu["stock"],
+                "novye": novye["stock"],
                 "main": main["stock"],
                 "partnership": part["stock"],
             },
             {
                 "key": "debt_net",
-                "label": "Дебиторка − кредиторка",
+                "label": (
+                    "Долги net (ручной Excel)"
+                    if bu.get("debt_manual")
+                    else "Дебиторка − кредиторка"
+                ),
                 "bu": bu["debt_net"],
+                "novye": novye["debt_net"],
                 "main": main["debt_net"],
                 "partnership": part["debt_net"],
+                "bu_manual": bool(bu.get("debt_manual")),
+                "bu_auto": bu.get("debt_auto"),
+            },
+            {
+                "key": "expenses",
+                "label": "Расходы",
+                "bu": expenses["tjs"],
+                "novye": expenses["usd"],
+                "main": expenses["usd"],
+                "partnership": None,
             },
             {
                 "key": "money",
                 "label": "Наличные + карты",
                 "bu": bu["money"],
-                "main": main["money"],
-                "partnership": part["money"],
+                "novye": novye["money"] if novye["money"] else None,
+                "main": main["money"] if main["money"] else None,
+                "partnership": None,
             },
             {
                 "key": "closing",
                 "label": "Сальдо на конец",
                 "bu": bu["closing"],
+                "novye": novye["closing"],
                 "main": main["closing"],
                 "partnership": part["closing"],
                 "total": True,
             },
             {
                 "key": "diff",
-                "label": "Разница (есть − должно)",
+                "label": "Разница (должно − есть)",
                 "bu": bu["diff"],
+                "novye": novye["diff"],
                 "main": main["diff"],
                 "partnership": part["diff"],
                 "emph": True,
             },
             {
                 "key": "footer",
-                "label": "Разница БУ в $",
+                "label": "Разница БУ в $ / сверка",
                 "bu": bu_diff_usd,
+                "novye": excel_footer_right,
                 "main": None,
                 "partnership": None,
                 "emph": True,
             },
         ],
+        "diagnostics": _opiu_run_diagnostics(conn, {
+            "date_from": period_start,
+            "date_to": period_end,
+            "closing_as_of": closing_as_of,
+            "bu": bu,
+            "main": main,
+            "partnership": part,
+            "novye": novye,
+            "exchange_rate_usd": usd_rate,
+        }),
     }
+
+
+def _opiu_run_diagnostics(conn: sqlite3.Connection, report: dict[str, Any]) -> dict[str, Any]:
+    """Жёсткая сверка цифр ОПиУ со складом/кассой/формулами — чтобы не всплывало «вчера было иначе»."""
+    checks: list[dict[str, Any]] = []
+    today = datetime.now().strftime("%Y-%m-%d")
+    closing = (report.get("closing_as_of") or today)[:10]
+    is_current = closing >= today
+
+    def add(ok: bool, key: str, message: str, **extra: Any) -> None:
+        checks.append({"ok": bool(ok), "key": key, "message": message, **extra})
+
+    def near(a: Any, b: Any, eps: float = 0.02) -> bool:
+        try:
+            return abs(float(a or 0) - float(b or 0)) <= eps
+        except (TypeError, ValueError):
+            return False
+
+    cols = (
+        ("bu", report["bu"], resolve_bu_warehouse_id(conn)),
+        ("main", report["main"], get_default_warehouse_id(conn)),
+        ("partnership", report["partnership"], resolve_partnership_warehouse_id(conn)),
+    )
+
+    for name, col, wid in cols:
+        should = round(float(col["opening"]) + float(col["z_profit"]), 2)
+        add(near(should, col["should"]), f"{name}.should",
+            f"{name}: должно = начало + Z", expected=should, got=col["should"])
+        closing_calc = round(
+            float(col["stock"])
+            + float(col["debt_net"])
+            + float(col.get("rent") or 0)
+            + float(col["money"])
+            + (float(col.get("expenses") or 0) if name == "main" else 0.0),
+            2,
+        )
+        add(near(closing_calc, col["closing"]), f"{name}.closing",
+            f"{name}: конец = склад + долги + деньги" + (" + расходы$" if name == "main" else ""),
+            expected=closing_calc, got=col["closing"])
+        diff_calc = round(float(col["should"]) - float(col["closing"]), 2)
+        add(near(diff_calc, col["diff"]), f"{name}.diff",
+            f"{name}: разница = должно − конец", expected=diff_calc, got=col["diff"])
+
+        sc = (col.get("breakdown") or {}).get("stock_close") or {}
+        add(sc.get("approx") is not True, f"{name}.stock_approx",
+            f"{name}: склад без approx-оценки", approx=sc.get("approx"), method=sc.get("method"))
+
+        if is_current:
+            live = warehouse_stock_money(conn, wid)
+            add(near(col["stock"], live["value"]), f"{name}.stock_live",
+                f"{name}: склад ОПиУ = склад сейчас",
+                opiu=col["stock"], live=live["value"],
+                units_opiu=sc.get("units_count"), units_live=live.get("units_count"))
+
+        # Z за период = сумма прибыли продаж склада
+        z = _z_register_lines(
+            conn, wid,
+            year=None, month=None,
+            date_from=report.get("date_from"),
+            date_to=report.get("date_to"),
+        )
+        add(near(col["z_profit"], z.get("profit"), eps=0.05), f"{name}.z",
+            f"{name}: Z ОПиУ = Z-отчёт склада",
+            opiu=col["z_profit"], z_report=round(float(z.get("profit") or 0), 2),
+            sold=z.get("sold_count"))
+
+        op = (col.get("breakdown") or {}).get("opening") or {}
+        auto = round(float(op.get("stock") or 0) + float(op.get("debt_net") or 0) + float(op.get("money") or 0), 2)
+        add(near(auto, col.get("opening_auto")), f"{name}.opening_auto",
+            f"{name}: авто-начало = склад+долги+деньги на старт",
+            calc=auto, got=col.get("opening_auto"))
+
+    nov = report["novye"]
+    main, part = report["main"], report["partnership"]
+    for field in ("opening", "z_profit", "should", "stock", "debt_net", "rent", "money", "closing", "diff"):
+        calc = round(float(main.get(field) or 0) + float(part.get(field) or 0), 2)
+        add(near(calc, nov.get(field)), f"novye.{field}",
+            f"Новые.{field} = Основной + Партнёрство", expected=calc, got=nov.get(field))
+
+    add(near(part.get("money"), 0), "partnership.money_zero",
+        "Партнёрство: деньги $ не дублируются (0)")
+
+    # Касса Б/У (TJS) vs касса сейчас
+    if is_current:
+        money_now = _money_by_currency_as_of(conn, today)
+        tjs = money_now.get("TJS") or {}
+        usd = money_now.get("USD") or {}
+        add(near(report["bu"]["money"], tjs.get("total")), "bu.money_till",
+            "Б/У деньги = нал+карты смн в кассе",
+            opiu=report["bu"]["money"], till=tjs.get("total"),
+            cash=tjs.get("cash"), card=tjs.get("card"))
+        add(near(report["main"]["money"], usd.get("total")), "main.money_till",
+            "Основной деньги = нал+карты $ в кассе",
+            opiu=report["main"]["money"], till=usd.get("total"),
+            cash=usd.get("cash"), card=usd.get("card"))
+    else:
+        add(True, "money.historical",
+            f"Деньги и долги на {closing} — исторический срез (не «сейчас в кассе»)",
+            closing_as_of=closing)
+        # Склад на прошлую дату: сверка live + продажи после − приходы после
+        for name, col, wid in cols:
+            recon = _warehouse_stock_value_as_of(conn, wid, closing, exclusive=False)
+            add(near(col["stock"], recon.get("value")), f"{name}.stock_recon",
+                f"{name}: склад на {closing} = реконструкция",
+                opiu=col["stock"], recon=recon.get("value"), method=recon.get("method"))
+
+    # Долги: net = debtors − creditors
+    for name, col, _wid in cols:
+        d = ((col.get("breakdown") or {}).get("debt") or {})
+        net_calc = round(float(d.get("debtors") or 0) - float(d.get("creditors") or 0), 2)
+        add(near(net_calc, col["debt_net"]), f"{name}.debt_net",
+            f"{name}: долги net = дебиторы − кредиторы",
+            calc=net_calc, got=col["debt_net"],
+            debtors=d.get("debtors"), creditors=d.get("creditors"))
+
+    failed = [c for c in checks if not c["ok"]]
+    return {
+        "ok": len(failed) == 0,
+        "checked_at": datetime.now().isoformat(timespec="seconds"),
+        "closing_as_of": closing,
+        "is_current": is_current,
+        "total": len(checks),
+        "passed": len(checks) - len(failed),
+        "failed": len(failed),
+        "checks": checks,
+        "failures": failed,
+    }
+
+
+class OpiuOpeningsIn(BaseModel):
+    year: int
+    month: int
+    mode: str = "manual"  # manual | auto
+    bu: float | None = None
+    main: float | None = None
+    partnership: float | None = None
 
 
 @app.get("/api/reports/opiu")
@@ -12401,6 +13320,37 @@ async def report_opiu_summary(
     check_pin(x_pin, min_role="owner")
     with db() as conn:
         return _report_opiu_summary(conn, period, date_from, date_to)
+
+
+@app.put("/api/reports/opiu-openings")
+async def save_opiu_openings(body: OpiuOpeningsIn, x_pin: str | None = Header(default=None, alias="X-Pin")):
+    """Сальдо начало ОПиУ: вручную за месяц или авто (очистить ручные значения)."""
+    check_pin(x_pin, min_role="owner")
+    if body.month < 1 or body.month > 12:
+        raise HTTPException(status_code=400, detail="Месяц 1–12")
+    mode = (body.mode or "manual").strip().lower()
+    with db() as conn:
+        for col in ("bu", "main", "partnership"):
+            key = _opiu_opening_setting_key(col, body.year, body.month)
+            if mode == "auto":
+                set_setting(conn, key, "")
+                # старый глобальный ключ тоже не должен перебивать
+                set_setting(conn, f"opiu_opening_{col}", "")
+            else:
+                raw = getattr(body, col, None)
+                if raw is None:
+                    set_setting(conn, key, "")
+                else:
+                    set_setting(conn, key, str(round(float(raw), 2)))
+        return {
+            "ok": True,
+            "year": body.year,
+            "month": body.month,
+            "mode": mode,
+            "bu": _get_opiu_opening_override(conn, "bu", body.year, body.month),
+            "main": _get_opiu_opening_override(conn, "main", body.year, body.month),
+            "partnership": _get_opiu_opening_override(conn, "partnership", body.year, body.month),
+        }
 
 
 @app.get("/api/reports/dds")

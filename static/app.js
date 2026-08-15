@@ -10,7 +10,8 @@ let cart = [];
 let paymentMethod = "cash";
 let storeConfig = { currency: { code: "TJS", symbol: "смн", name: "Сомони" }, payment_methods: [], exchange_rates: { TJS: 1 } };
 let reportType = "finance";
-let opiuViewMode = "summary"; // summary | detail | classic
+let opiuViewMode = "summary"; // summary | detail
+let lastOpiuSummary = null;
 let authRequired = false;
 let currentPage = "dashboard";
 let reportScope = "all";
@@ -6110,8 +6111,10 @@ function bindReports() {
       document.querySelectorAll("#report-type .seg").forEach((x) => x.classList.remove("active"));
       b.classList.add("active");
       reportType = b.dataset.rtype;
-      document.getElementById("report-scope").style.display = (reportType === "finance" || reportType === "cashiers") ? "" : "none";
+      document.getElementById("report-scope").style.display = reportType === "finance" ? "" : "none";
       document.getElementById("report-period").closest(".toolbar") && (document.getElementById("report-period").style.display = reportType === "balance" ? "none" : "");
+      const detailBtn = document.getElementById("report-detail-btn");
+      if (detailBtn) detailBtn.style.display = reportType === "expenses" ? "none" : "";
       loadReport();
     };
   });
@@ -6129,6 +6132,8 @@ function bindReports() {
   document.getElementById("expense-lines-close")?.addEventListener("click", () => document.getElementById("expense-lines-modal")?.close());
   document.getElementById("report-detail-wh")?.addEventListener("change", openReportDetail);
   document.getElementById("report-period").onchange = loadReport;
+  document.getElementById("report-from")?.addEventListener("change", loadReport);
+  document.getElementById("report-to")?.addEventListener("change", loadReport);
   document.getElementById("report-warehouse")?.addEventListener("change", loadReport);
   document.getElementById("print-report").onclick = () => {
     const w = window.open("", "_blank");
@@ -6292,9 +6297,9 @@ function renderOpiuDetailBlocks(r) {
         ${items.map((x) => `<tr><td>${esc(x[nameKey] || x.product_name || x.imei || "—")}</td><td>${opiuMoney(x.amount ?? x.value, col.currency_code)}</td></tr>`).join("")}
       </tbody></table>`;
     };
-    const walletHint = col.include_wallets === false
-      ? `<p class="hint">Деньги и долги $ учтены в колонке Основной</p>`
-      : "";
+    const walletHint = col.include_money === false || col.include_wallets === false
+      ? `<p class="hint">Деньги $ учтены в колонке Основной; долги — только продажи этого склада</p>`
+      : `<p class="hint">Дебиторка/кредиторка — только продажи этого склада</p>`;
     return `<div class="opiu-detail-col">
       <h4>${esc(title)} · ${esc(col.warehouse_name || "")}</h4>
       ${walletHint}
@@ -6320,7 +6325,16 @@ function renderOpiuDetailBlocks(r) {
       </details>
     </div>`;
   };
-  return `<div class="opiu-detail-grid opiu-detail-grid-3">${block(bu, "Б/У (смн)")}${block(main, "Основной ($)")}${block(part, "Партнёрство ($)")}</div>`;
+  const filter = opiuSelectedCol(r);
+  const parts = [];
+  if (filter === "all" || filter === "bu") parts.push(block(bu, "Б/У (смн)"));
+  if (filter === "all" || filter === "main") parts.push(block(main, "Основной ($)"));
+  if (filter === "all" || filter === "partnership") parts.push(block(part, "Партнёрство ($)"));
+  if (!parts.length) {
+    return `<p class="hint">Разбивка ОПиУ доступна для Б/У, Основной и Партнёрство.</p>`;
+  }
+  const gridCls = parts.length === 1 ? "opiu-detail-grid" : "opiu-detail-grid opiu-detail-grid-3";
+  return `<div class="${gridCls}">${parts.join("")}</div>`;
 }
 
 function renderOpiuComparisons(r) {
@@ -6335,111 +6349,617 @@ function renderOpiuComparisons(r) {
   </div>`;
 }
 
+function opiuDateShort(iso) {
+  const s = (iso || "").slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return s || "—";
+  const [y, m, d] = s.split("-");
+  return `${+d}.${m}`;
+}
+
+function opiuColMeta(r, colKey) {
+  const map = {
+    bu: { col: r.bu, title: "Б/У" },
+    main: { col: r.main, title: "Основной" },
+    partnership: { col: r.partnership, title: "Партнёрство" },
+    novye: { col: r.novye, title: "Новые ($)" },
+  };
+  return map[colKey] || map.bu;
+}
+
+/** Разбивка сальдо на конец */
+function opiuDecodeTable(items) {
+  if (!items?.length) return `<p class="hint">Нет строк</p>`;
+  return `<table class="data-table"><thead><tr><th>Откуда</th><th>Сумма</th></tr></thead><tbody>
+    ${items.map((x) => {
+      const amt = x.sign === "-" ? -(+x.amount || 0) : (+x.amount || 0);
+      return `<tr>
+        <td>${esc(x.label || "—")}${x.note ? ` <span class="hint">· ${esc(x.note)}</span>` : ""}</td>
+        <td class="num ${opiuSignedClass(amt)}">${opiuMoney(amt, x.currency_code || "TJS")}</td>
+      </tr>`;
+    }).join("")}
+  </tbody></table>`;
+}
+
+function opiuClosingExcelHtml(r) {
+  const bu = r.bu || {};
+  const main = r.main || {};
+  const part = r.partnership || {};
+  const asOf = opiuDateShort(r.closing_as_of || r.date_to);
+  const col = (title, c, cur, opts = {}) => `
+    <div class="opiu-break-col">
+      <h4>${esc(title)}</h4>
+      <table class="data-table">
+        <thead><tr><th>Из чего</th><th>Сумма</th></tr></thead>
+        <tbody>
+          <tr><td>Склад на ${esc(asOf)}</td><td class="num">${opiuMoney(c.stock, cur)}</td></tr>
+          <tr><td>${c.debt_manual ? "Долги net (ручной Excel)" : "Дебиторка − кредиторка"}</td><td class="num">${opiuMoney(c.debt_net, cur)}</td></tr>
+          <tr><td>Нал + карты</td><td class="num">${opts.noMoney ? "—" : opiuMoney(c.money, cur)}</td></tr>
+          <tr class="opiu-total"><td><strong>Сальдо конец</strong></td><td class="num"><strong>${opiuMoney(c.closing, cur)}</strong></td></tr>
+        </tbody>
+      </table>
+    </div>`;
+  return `<div class="opiu-break-grid">${col("Б/У", bu, "TJS")}${col("Основной", main, "USD")}${col("Партнёрство", part, "USD", { noMoney: true })}</div>
+    <p class="hint" style="margin-top:.75rem">Всё из программы. Вместе $: <strong>${opiuMoney(r.novye?.closing, "USD")}</strong></p>`;
+}
+
+function opiuDebtExcelHtml(r) {
+  const d = r.excel_decode?.debt || [];
+  const manual = !!r.bu?.debt_manual;
+  const auto = r.bu?.debt_auto;
+  return `
+    <div class="opiu-break-col" style="max-width:780px">
+      <h4>Долги в ОПиУ</h4>
+      ${manual ? `<p class="hint" style="margin:0 0 .5rem">В строке отчёта стоит <strong>ручной Excel</strong> ${opiuMoney(r.bu?.debt_net, "TJS")}. Авто программы: <strong>${opiuMoney(auto, "TJS")}</strong> (= дебиторка − кредиторка).</p>` : `<p class="hint" style="margin:0 0 .5rem">Авто: дебиторка − кредиторка.</p>`}
+      <p class="hint">Долги $ по колонкам — только продажи склада. «Клиенты должны $» во взаиморасчётах может быть больше (займы/mutual).</p>
+      ${opiuDecodeTable(d)}
+    </div>`;
+}
+
+function opiuMoneyExcelHtml(r) {
+  return `
+    <div class="opiu-break-col" style="max-width:720px">
+      <h4>Наличные + карты (из программы)</h4>
+      ${opiuDecodeTable(r.excel_decode?.money || [])}
+    </div>`;
+}
+
+function opiuStockExcelHtml(r) {
+  return `
+    <div class="opiu-break-col" style="max-width:640px">
+      <h4>Хози — товары на складе</h4>
+      ${opiuDecodeTable(r.excel_decode?.stock || [])}
+    </div>`;
+}
+
+function opiuZExcelHtml(r) {
+  return `
+    <div class="opiu-break-col" style="max-width:640px">
+      <h4>Даромад (Z-прибыль)</h4>
+      ${opiuDecodeTable(r.excel_decode?.z || [])}
+    </div>`;
+}
+
+function opiuExpensesExcelHtml(r) {
+  const exp = r.expenses || {};
+  const cats = exp.by_category || [];
+  const lines = exp.lines || [];
+  const catRows = cats.length
+    ? `<table class="data-table"><thead><tr><th>Категория</th><th>смн</th><th>$</th><th>шт</th></tr></thead><tbody>
+        ${cats.map((c) => `<tr>
+          <td>${esc(c.category)}</td>
+          <td class="num">${c.tjs ? opiuMoney(c.tjs, "TJS") : "—"}</td>
+          <td class="num">${c.usd ? opiuMoney(c.usd, "USD") : "—"}</td>
+          <td class="num">${esc(String(c.count || 0))}</td>
+        </tr>`).join("")}
+        <tr class="opiu-total"><td><strong>Итого</strong></td>
+          <td class="num"><strong>${opiuMoney(exp.tjs || 0, "TJS")}</strong></td>
+          <td class="num"><strong>${opiuMoney(exp.usd || 0, "USD")}</strong></td>
+          <td class="num">${esc(String(exp.count || 0))}</td></tr>
+      </tbody></table>`
+    : "<p class=\"hint\">Нет расходов за период</p>";
+  const lineRows = lines.length
+    ? `<details style="margin-top:.75rem"><summary>Все записи (${lines.length})</summary>
+        <div class="table-wrap"><table class="data-table"><thead><tr><th>Дата</th><th>Категория</th><th>Сумма</th><th>Коммент</th></tr></thead><tbody>
+        ${lines.map((L) => `<tr>
+          <td>${esc(L.date || "")}</td>
+          <td>${esc(L.category || "")}</td>
+          <td class="num">${opiuMoney(L.amount, L.currency_code || "TJS")}</td>
+          <td>${esc(L.description || L.payee || "")}</td>
+        </tr>`).join("")}
+      </tbody></table></div></details>`
+    : "";
+  return `
+    <div class="opiu-break-col" style="max-width:820px">
+      <h4>Расходы за период</h4>
+      <p class="hint">${esc(exp.note || "")} · ${esc(exp.date_from || "")} — ${esc(exp.date_to || "")}</p>
+      <div class="opiu-mini-kpi" style="margin-bottom:.75rem">
+        <div><span>Сомони</span><strong>${opiuMoney(exp.tjs || 0, "TJS")}</strong></div>
+        <div><span>Доллары</span><strong>${opiuMoney(exp.usd || 0, "USD")}</strong></div>
+      </div>
+      ${catRows}
+      ${lineRows}
+    </div>`;
+}
+
+function openOpiuBreakdownModal(kind, colKey) {
+  const r = lastOpiuSummary;
+  if (!r) return;
+  const titleEl = document.getElementById("kpi-detail-title");
+  const sumEl = document.getElementById("kpi-detail-summary");
+  const byWh = document.getElementById("kpi-detail-by-wh");
+  const thead = document.getElementById("kpi-detail-thead");
+  const tbody = document.getElementById("kpi-detail-tbody");
+
+  const titles = {
+    opening: "Сальдо на начало — расшифровка",
+    closing: "Сальдо на конец — расшифровка",
+    debt: "Долги (дебиторка / кредиторка)",
+    rent: "Аренда",
+    money: "Наличные + карты",
+    stock: "Товары на складе (хози)",
+    z: "Z / даромад",
+    expenses: "Расходы",
+  };
+
+  if (titleEl) titleEl.textContent = titles[kind] || "Расшифровка";
+  if (sumEl) {
+    sumEl.innerHTML = `<p class="hint">Откуда цифра в программе. Дата конца: <strong>${esc(r.closing_as_of || r.date_to || "")}</strong></p>`;
+  }
+  if (byWh) {
+    byWh.classList.remove("hidden");
+    if (kind === "opening") byWh.innerHTML = opiuOpeningExcelHtml(r);
+    else if (kind === "closing") byWh.innerHTML = opiuClosingExcelHtml(r);
+    else if (kind === "debt") byWh.innerHTML = opiuDebtExcelHtml(r);
+    else if (kind === "money") byWh.innerHTML = opiuMoneyExcelHtml(r);
+    else if (kind === "stock") byWh.innerHTML = opiuStockExcelHtml(r);
+    else if (kind === "z") byWh.innerHTML = opiuZExcelHtml(r);
+    else if (kind === "expenses") byWh.innerHTML = opiuExpensesExcelHtml(r);
+    else byWh.innerHTML = opiuClosingExcelHtml(r);
+  }
+
+  if (thead) thead.innerHTML = "";
+  if (tbody) tbody.innerHTML = "";
+  document.getElementById("kpi-detail-modal")?.showModal();
+}
+
+function roundMoney(n) {
+  return Math.round((+n || 0) * 100) / 100;
+}
+
+function bindOpiuRowClicks(r) {
+  lastOpiuSummary = r;
+
+  const titles = {
+    opening: "Расшифровка сальдо на начало",
+    closing: "Расшифровка сальдо на конец",
+    debt: "Дебиторка / кредиторка",
+    rent: "Аренда",
+    money: "Нал + карты",
+    stock: "Склад (хози)",
+    z: "Z / даромад",
+    expenses: "Расходы",
+  };
+  const bindRow = (key, kind) => {
+    document.querySelectorAll(`#report-content tr[data-opiu-key='${key}'] td`).forEach((td) => {
+      td.style.cursor = "pointer";
+      td.title = titles[kind] || "Расшифровка";
+      td.addEventListener("click", () => {
+        openOpiuBreakdownModal(kind, null);
+      });
+    });
+  };
+  bindRow("opening", "opening");
+  bindRow("closing", "closing");
+  bindRow("debt_net", "debt");
+  bindRow("money", "money");
+  bindRow("stock", "stock");
+  bindRow("z_profit", "z");
+  bindRow("expenses", "expenses");
+
+  const firstSaldo = document.querySelector(".opiu-saldo-bar .opiu-opening-saldo");
+  if (firstSaldo) {
+    firstSaldo.style.cursor = "pointer";
+    firstSaldo.title = "Расшифровка сальдо на начало";
+    firstSaldo.addEventListener("click", () => openOpiuBreakdownModal("opening", null));
+  }
+  const closeSaldo = document.querySelector(".opiu-saldo-bar .opiu-closing-saldo");
+  if (closeSaldo) {
+    closeSaldo.style.cursor = "pointer";
+    closeSaldo.title = "Расшифровка сальдо на конец";
+    closeSaldo.addEventListener("click", () => openOpiuBreakdownModal("closing", null));
+  }
+}
+
+function opiuOpeningExcelHtml(r) {
+  const bu = r.bu || {};
+  const main = r.main || {};
+  const part = r.partnership || {};
+  const asOf = opiuDateShort(r.date_from);
+  const col = (title, c, cur) => {
+    const op = c.breakdown?.opening || {};
+    const mode = c.opening_manual ? "вручную" : "авто";
+    return `
+    <div class="opiu-break-col">
+      <h4>${esc(title)} <span class="hint">(${mode})</span></h4>
+      <table class="data-table">
+        <thead><tr><th>Из чего</th><th>Сумма</th></tr></thead>
+        <tbody>
+          <tr class="opiu-total"><td><strong>Сальдо начало</strong></td><td class="num"><strong>${opiuMoney(c.opening, cur)}</strong></td></tr>
+          <tr><td>Склад на ${esc(asOf)}</td><td class="num">${opiuMoney(op.stock, cur)}</td></tr>
+          <tr><td>Долги</td><td class="num">${opiuMoney(op.debt_net, cur)}</td></tr>
+          <tr><td>Нал + карты</td><td class="num">${opiuMoney(op.money, cur)}</td></tr>
+          <tr><td>Авто-сумма на 1-е</td><td class="num">${opiuMoney(c.opening_auto, cur)}</td></tr>
+        </tbody>
+      </table>
+    </div>`;
+  };
+  return `<div class="opiu-break-grid">${col("Б/У", bu, "TJS")}${col("Основной", main, "USD")}${col("Партнёрство", part, "USD")}</div>
+    <p class="hint" style="margin-top:.75rem">Авто = склад + долги + деньги на 1-е число. Можно задать вручную в блоке выше таблицы.</p>`;
+}
+
+async function saveOpiuOpenings(mode) {
+  const r = lastOpiuSummary;
+  if (!r?.openings) return;
+  const year = r.openings.year || r.year;
+  const month = r.openings.month || r.month;
+  const body = { year, month, mode };
+  if (mode === "manual") {
+    body.bu = +document.getElementById("opiu-open-bu")?.value;
+    body.main = +document.getElementById("opiu-open-main")?.value;
+    body.partnership = +document.getElementById("opiu-open-part")?.value;
+    if ([body.bu, body.main, body.partnership].some((x) => Number.isNaN(x))) {
+      toast("Введите числа для сальдо начала", "error");
+      return;
+    }
+  }
+  try {
+    await api("/api/reports/opiu-openings", { method: "PUT", body });
+    toast(mode === "auto" ? "Сальдо начало — авто с 1-го" : "Сальдо начало сохранено");
+    loadReport();
+  } catch (e) {
+    toast(e.message, "error");
+  }
+}
+
+function renderOpiuOpeningsPanel(r) {
+  const o = r.openings || {};
+  const mode = o.mode || "auto";
+  return `
+    <div class="card" style="margin-bottom:1rem">
+      <div class="card-header"><h3>Сальдо на начало · ${esc(String(o.month || r.month || "").padStart(2, "0"))}.${esc(String(o.year || r.year || ""))}</h3></div>
+      <div class="card-body">
+        <p class="hint" style="margin-top:0">Остальное (Z, склад, долги, касса) всегда из программы. Здесь только старт месяца.</p>
+        <div class="form-row" style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.75rem;align-items:end">
+          <label>Б/У, смн
+            <input id="opiu-open-bu" class="input" type="number" step="0.01" value="${o.bu ?? o.bu_auto ?? 0}">
+            <span class="hint">авто ${opiuMoney(o.bu_auto, "TJS")}</span>
+          </label>
+          <label>Основной, $
+            <input id="opiu-open-main" class="input" type="number" step="0.01" value="${o.main ?? o.main_auto ?? 0}">
+            <span class="hint">авто ${opiuMoney(o.main_auto, "USD")}</span>
+          </label>
+          <label>Партнёрство, $
+            <input id="opiu-open-part" class="input" type="number" step="0.01" value="${o.partnership ?? o.partnership_auto ?? 0}">
+            <span class="hint">авто ${opiuMoney(o.partnership_auto, "USD")}</span>
+          </label>
+        </div>
+        <div style="display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.75rem">
+          <button type="button" class="btn btn-primary" id="opiu-open-save">Сохранить вручную</button>
+          <button type="button" class="btn btn-secondary" id="opiu-open-auto">Авто с 1-го числа</button>
+          <span class="hint" style="align-self:center">Сейчас: <strong>${mode === "manual" ? "вручную" : "авто"}</strong></span>
+        </div>
+      </div>
+    </div>`;
+}
+
+function bindOpiuOpeningsPanel() {
+  document.getElementById("opiu-open-save")?.addEventListener("click", () => saveOpiuOpenings("manual"));
+  document.getElementById("opiu-open-auto")?.addEventListener("click", () => {
+    if (!confirm("Поставить сальдо начало автоматически (склад + долги + деньги на 1-е)?")) return;
+    saveOpiuOpenings("auto");
+  });
+}
+
+function renderOpiuDiagnostics(r) {
+  const d = r.diagnostics;
+  if (!d) return "";
+  const ok = !!d.ok;
+  const fails = d.failures || [];
+  const failHtml = fails.length
+    ? `<details class="opiu-diag-details"><summary>${fails.length} расхождений</summary><ul>${
+        fails.map((c) => `<li><code>${esc(c.key)}</code> — ${esc(c.message)}${
+          c.expected != null || c.got != null || c.opiu != null
+            ? ` <span class="hint">(${esc(String(c.expected ?? c.opiu ?? ""))} ≠ ${esc(String(c.got ?? c.live ?? c.z_report ?? ""))})</span>`
+            : ""
+        }</li>`).join("")
+      }</ul></details>`
+    : "";
+  return `
+    <div class="opiu-diag ${ok ? "ok" : "bad"}" title="Автосверка со складом, Z и кассой">
+      <strong>${ok ? "Сверка ОК" : "Сверка: есть ошибки"}</strong>
+      <span class="hint">${d.passed || 0}/${d.total || 0} · на ${esc(d.closing_as_of || "")}${d.is_current ? " (сейчас)" : ""}</span>
+      ${failHtml}
+    </div>`;
+}
+
+function opiuSelectedCol(r) {
+  const whId = +(document.getElementById("report-warehouse")?.value || 0);
+  if (!whId) return "all";
+  if (whId === +(r.bu?.warehouse_id || 0)) return "bu";
+  if (whId === +(r.main?.warehouse_id || 0)) return "main";
+  if (whId === +(r.partnership?.warehouse_id || 0)) return "partnership";
+  return "other";
+}
+
+function renderOpiuFoydaHtml(r) {
+  const f = r.foyda || {};
+  const rate = f.usd_rate || r.exchange_rate_usd || 0;
+  const cats = f.categories || [];
+  const share = f.expense_share || {};
+  const pct = f.split_pct || {};
+  const main = f.main || {};
+  const part = f.partnership || {};
+  const col = opiuSelectedCol(r);
+  if (col === "other") {
+    return `<div class="card opiu-foyda-card"><div class="card-body">
+      <p class="hint">Фоида ва зарар считается для складов <strong>Б/У</strong>, <strong>Основной</strong> и <strong>Партнёрство</strong>. Выберите один из них или «Все склады».</p>
+    </div></div>`;
+  }
+  const catRows = cats.length
+    ? cats.map((c) => {
+        const tjs = +c.tjs || +c.amount || 0;
+        const usd = +c.usd || 0;
+        const usdTjs = +c.usd_as_tjs || 0;
+        let label = esc(c.category);
+        if (usd > 0.0001) {
+          label += ` <span class="hint">(+ ${opiuMoney(usd, "USD")} → ${opiuMoney(usdTjs, "TJS")})</span>`;
+        }
+        return `<tr>
+          <td>${label}</td>
+          <td class="num">${opiuMoney(c.total_tjs != null ? c.total_tjs : tjs + usdTjs, "TJS")}</td>
+        </tr>`;
+      }).join("")
+    : `<tr><td colspan="2" class="hint">Нет расходов за период</td></tr>`;
+
+  const baseTjs = f.expenses_base_tjs != null ? f.expenses_base_tjs : f.expenses_tjs;
+  const usdAsTjs = f.expenses_usd_as_tjs || 0;
+  const expensesBlock = `
+    <tr><td colspan="2" class="opiu-foyda-sep">Расходы (смн + $×курс)</td></tr>
+    ${catRows}
+    ${usdAsTjs > 0.001 ? `<tr><td class="hint">в т.ч. расходы $ × курс (${opiuMoney(f.expenses_usd, "USD")} × ${fmt(rate)})</td><td class="num hint">${opiuMoney(usdAsTjs, "TJS")}</td></tr>` : ""}
+    <tr class="opiu-total"><td><strong>Итого база для дележа</strong></td><td class="num"><strong>${opiuMoney(baseTjs, "TJS")}</strong></td></tr>`;
+
+  const splitAll = `
+    <table class="data-table opiu-foyda-split" style="margin-top:.75rem">
+      <thead><tr><th>Делёж расходов</th><th class="num">%</th><th class="num">смн</th></tr></thead>
+      <tbody>
+        <tr><td>Отчёт 3 (партнёрство)</td><td class="num">${esc(String(pct.partnership ?? 20))}%</td><td class="num">${opiuMoney(share.partnership, "TJS")}</td></tr>
+        <tr><td>Б/У</td><td class="num">${esc(String(pct.bu ?? 40))}%</td><td class="num">${opiuMoney(share.bu, "TJS")}</td></tr>
+        <tr><td>Нав (основной)</td><td class="num">${esc(String(pct.main ?? 40))}%</td><td class="num">${opiuMoney(share.main, "TJS")}</td></tr>
+      </tbody>
+    </table>`;
+
+  const buLeft = `
+    <div class="opiu-foyda-left">
+      <table class="data-table opiu-foyda-table">
+        <thead><tr><th>Фоида / расходы · Б/У</th><th class="num">смн</th></tr></thead>
+        <tbody>
+          <tr class="opiu-emph"><td>Фоида Б/У (Z)</td><td class="num ${opiuSignedClass(f.bu_profit)}">${opiuMoney(f.bu_profit, "TJS")}</td></tr>
+          <tr><td class="hint">Итого фоида</td><td class="num">${opiuMoney(f.total_foyda, "TJS")}</td></tr>
+          ${expensesBlock}
+          <tr><td>Доля Б/У (${esc(String(pct.bu ?? 40))}%)</td><td class="num">${opiuMoney(share.bu, "TJS")}</td></tr>
+          <tr class="opiu-emph"><td>ЧП склада (фоида − доля)</td>
+            <td class="num ${opiuSignedClass(f.bu_net_after_share)}"><strong>${opiuMoney(f.bu_net_after_share, "TJS")}</strong></td></tr>
+        </tbody>
+      </table>
+      ${col === "all" ? splitAll : ""}
+    </div>`;
+
+  const mainBox = `
+    <div class="opiu-foyda-box">
+      <h4>Нав · Основной ($)</h4>
+      <table class="data-table">
+        <tbody>
+          <tr><td>Даромад нав (Z)</td><td class="num">${opiuMoney(main.income, "USD")}</td></tr>
+          <tr><td>Расход нав (доля ${esc(String(pct.main ?? 40))}% от базы ÷ курс)</td><td class="num">${opiuMoney(main.expense_usd, "USD")}</td></tr>
+          <tr class="opiu-total"><td>Итог чп</td><td class="num ${opiuSignedClass(main.net)}"><strong>${opiuMoney(main.net, "USD")}</strong></td></tr>
+          <tr><td>Каждому (/2)</td><td class="num">${opiuMoney(main.each, "USD")}</td></tr>
+          <tr><td class="hint">Каждому в смн</td><td class="num hint">${opiuMoney(main.each_tjs, "TJS")}</td></tr>
+        </tbody>
+      </table>
+    </div>`;
+
+  const partBox = `
+    <div class="opiu-foyda-box">
+      <h4>Отчёт 3 · Партнёрство ($)</h4>
+      <table class="data-table">
+        <tbody>
+          <tr><td>Даромад (Z)</td><td class="num">${opiuMoney(part.income, "USD")}</td></tr>
+          <tr><td>Расход (доля ${esc(String(pct.partnership ?? 20))}% от базы ÷ курс)</td><td class="num">${opiuMoney(part.expense_usd, "USD")}</td></tr>
+          <tr class="opiu-total"><td>Итог чп</td><td class="num ${opiuSignedClass(part.net)}"><strong>${opiuMoney(part.net, "USD")}</strong></td></tr>
+          <tr><td>Каждому (/2)</td><td class="num">${opiuMoney(part.each, "USD")}</td></tr>
+          <tr><td class="hint">Каждому в смн</td><td class="num hint">${opiuMoney(part.each_tjs, "TJS")}</td></tr>
+        </tbody>
+      </table>
+    </div>`;
+
+  let bodyHtml = "";
+  if (col === "all") {
+    bodyHtml = `<div class="opiu-foyda-grid">${buLeft}<div class="opiu-foyda-right">${mainBox}${partBox}</div></div>`;
+  } else if (col === "bu") {
+    bodyHtml = `<div class="opiu-foyda-grid opiu-foyda-grid-one">${buLeft}</div>`;
+  } else if (col === "main") {
+    bodyHtml = `<div class="opiu-foyda-grid opiu-foyda-grid-one">
+      <div class="opiu-foyda-left">
+        <table class="data-table opiu-foyda-table">
+          <thead><tr><th>Расходы (база для доли)</th><th class="num">смн</th></tr></thead>
+          <tbody>${expensesBlock}
+            <tr><td>Доля Основной (${esc(String(pct.main ?? 40))}%)</td><td class="num">${opiuMoney(share.main, "TJS")}</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="opiu-foyda-right">${mainBox}</div>
+    </div>`;
+  } else if (col === "partnership") {
+    bodyHtml = `<div class="opiu-foyda-grid opiu-foyda-grid-one">
+      <div class="opiu-foyda-left">
+        <table class="data-table opiu-foyda-table">
+          <thead><tr><th>Расходы (база для доли)</th><th class="num">смн</th></tr></thead>
+          <tbody>${expensesBlock}
+            <tr><td>Доля Партнёрство (${esc(String(pct.partnership ?? 20))}%)</td><td class="num">${opiuMoney(share.partnership, "TJS")}</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="opiu-foyda-right">${partBox}</div>
+    </div>`;
+  }
+
+  const filterHint = col === "all" ? "" : ` · фильтр: ${esc(col === "bu" ? "Б/У" : col === "main" ? "Основной" : "Партнёрство")}`;
+  return `
+    <div class="card opiu-foyda-card">
+      <div class="card-header"><h3>Фоида ва зарар</h3>
+        <p class="hint" style="margin:0">${esc(r.period_label || "")} · курс 1$ = ${fmt(rate)}${filterHint}</p>
+      </div>
+      <div class="card-body">
+        ${bodyHtml}
+        <p class="hint" style="margin-top:.75rem">${esc(f.note || "")}${f.split_from_settings ? " · % из настроек." : ""}</p>
+      </div>
+    </div>`;
+}
+
 function renderOpiuSummaryTable(r) {
+  const filter = opiuSelectedCol(r);
   const buCur = r.bu?.currency_code || "TJS";
   const mainCur = r.main?.currency_code || "USD";
   const partCur = r.partnership?.currency_code || "USD";
   const cell = (v, code) => (v == null ? "—" : opiuMoney(v, code));
-  const rows = (r.rows || []).map((row) => {
+  const clickableKeys = new Set(["opening", "closing", "debt_net", "money", "stock", "z_profit", "expenses"]);
+  const displayRows = (r.rows || []).filter((row) => row.key !== "z_partnership" && row.key !== "rent");
+  const showBu = filter === "all" || filter === "bu";
+  const showMain = filter === "all" || filter === "main";
+  const showPart = filter === "all" || filter === "partnership";
+  const rowsHtml = [];
+
+  if (filter === "other") {
+    return `
+      ${renderOpiuFoydaHtml(r)}
+      <p class="hint" style="margin-top:1rem">Сальдо / сверка — для складов Б/У, Основной и Партнёрство. Выберите один из них или «Все склады».</p>`;
+  }
+
+  for (const row of displayRows) {
+    const clickable = clickableKeys.has(row.key);
     const cls = [
       row.total ? "opiu-total" : "",
       row.emph ? "opiu-emph" : "",
       "opiu-row",
+      clickable ? "row-clickable" : "",
     ].filter(Boolean).join(" ");
-    return `<tr class="${cls}" data-opiu-key="${esc(row.key || "")}">
-      <td class="opiu-label">${esc(row.label)}</td>
-      <td class="num ${opiuSignedClass(row.bu)}">${cell(row.bu, buCur)}</td>
-      <td class="num ${opiuSignedClass(row.main)}">${cell(row.main, mainCur)}</td>
-      <td class="num ${opiuSignedClass(row.partnership)}">${cell(row.partnership, partCur)}</td>
-    </tr>`;
-  }).join("");
+    const hint = clickable ? ' title="Нажмите — расшифровка"' : "";
+    const mark = clickable ? ' <span class="hint">↗</span>' : "";
+    if (row.key === "footer") {
+      if (filter !== "all") continue;
+      rowsHtml.push(`<tr class="${cls}" data-opiu-key="footer">
+        <td class="opiu-label">${esc(row.label)}</td>
+        <td class="num ${opiuSignedClass(row.bu)}">${cell(row.bu, "USD")}</td>
+        <td class="num" colspan="2">${cell(row.novye, "USD")} <span class="hint">($ вместе − БУ$)</span></td>
+      </tr>`);
+      continue;
+    }
+    const partVal = row.key === "money" ? null : row.partnership;
+    const cells = [`<td class="opiu-label">${esc(row.label)}${mark}</td>`];
+    if (showBu) cells.push(`<td class="num ${opiuSignedClass(row.bu)}" data-opiu-col="bu">${cell(row.bu, buCur)}</td>`);
+    if (showMain) cells.push(`<td class="num ${opiuSignedClass(row.main)}" data-opiu-col="main">${cell(row.main, mainCur)}</td>`);
+    if (showPart) cells.push(`<td class="num ${opiuSignedClass(partVal)}" data-opiu-col="partnership">${cell(partVal, partCur)}</td>`);
+    rowsHtml.push(`<tr class="${cls}" data-opiu-key="${esc(row.key || "")}"${hint}>${cells.join("")}</tr>`);
+  }
+
+  const heads = ["<th></th>"];
+  if (showBu) heads.push(`<th>Б/У · ${esc(r.bu?.warehouse_name || "смн")}</th>`);
+  if (showMain) heads.push("<th>Основной · $</th>");
+  if (showPart) heads.push("<th>Партнёрство · $</th>");
+
+  const openingBits = [];
+  const closingBits = [];
+  if (showBu) { openingBits.push(opiuMoney(r.bu?.opening, buCur)); closingBits.push(opiuMoney(r.bu?.closing, buCur)); }
+  if (showMain) { openingBits.push(opiuMoney(r.main?.opening, mainCur)); closingBits.push(opiuMoney(r.main?.closing, mainCur)); }
+  if (showPart) { openingBits.push(opiuMoney(r.partnership?.opening, partCur)); closingBits.push(opiuMoney(r.partnership?.closing, partCur)); }
+
   return `
+    ${renderOpiuFoydaHtml(r)}
+    <h4 class="section-title" style="margin:1.25rem 0 .5rem">Сальдо / сверка капитала</h4>
+    ${filter === "all" ? renderOpiuDiagnostics(r) : ""}
+    ${renderOpiuOpeningsPanel(r)}
     <div class="opiu-saldo-bar opiu-saldo-bar-4">
-      <div class="opiu-saldo-item">
-        <span>Сальдо на начало · ${esc(r.date_from || "")}</span>
-        <strong>${opiuMoney(r.bu?.opening, buCur)} <span class="hint">/</span> ${opiuMoney(r.main?.opening, mainCur)} <span class="hint">/</span> ${opiuMoney(r.partnership?.opening, partCur)}</strong>
+      <div class="opiu-saldo-item opiu-opening-saldo" title="Нажмите — разбивка">
+        <span>Сальдо на начало · ${esc(r.date_from || "")} · ${(r.openings?.mode === "manual") ? "вручную" : "авто"}</span>
+        <strong>${openingBits.join(' <span class="hint">/</span> ')}</strong>
       </div>
-      <div class="opiu-saldo-item">
+      <div class="opiu-saldo-item opiu-closing-saldo" title="Нажмите — разбивка">
         <span>Сальдо на конец · ${esc(r.closing_as_of || r.date_to || "")}</span>
-        <strong>${opiuMoney(r.bu?.closing, buCur)} <span class="hint">/</span> ${opiuMoney(r.main?.closing, mainCur)} <span class="hint">/</span> ${opiuMoney(r.partnership?.closing, partCur)}</strong>
+        <strong>${closingBits.join(' <span class="hint">/</span> ')}</strong>
       </div>
       <div class="opiu-saldo-item">
-        <span>Курс USD на конец</span>
-        <strong>1 $ = ${fmt(r.exchange_rate_usd || 0)} смн</strong>
+        <span>Курс USD${filter === "all" ? " · $ вместе" : ""}</span>
+        <strong>1$=${fmt(r.exchange_rate_usd || 0)}${filter === "all" ? ` · ${opiuMoney(r.novye?.closing, "USD")}` : ""}</strong>
       </div>
     </div>
     <div class="card opiu-summary-card"><div class="card-body table-wrap">
       <table class="data-table opiu-summary-table">
-        <thead>
-          <tr>
-            <th></th>
-            <th>Б/У · ${esc(r.bu?.warehouse_name || "смн")}</th>
-            <th>Основной · ${esc(r.main?.warehouse_name || "$")}</th>
-            <th>Партнёрство · ${esc(r.partnership?.warehouse_name || "$")}</th>
-          </tr>
-        </thead>
-        <tbody>${rows}</tbody>
+        <thead><tr>${heads.join("")}</tr></thead>
+        <tbody>${rowsHtml.join("")}</tbody>
       </table>
       <p class="hint" style="margin-top:.75rem">
-        Должно = сальдо начало + Z-прибыль.
-        Конец = склад + (дебиторка − кредиторка) + (нал + карты).
-        У Партнёрства в сальдо только склад — деньги и долги $ в колонке Основной (без двойного счёта).
+        Логика Excel: начало + Z = должно; Б/У конец = склад+долги+касса; $ конец += расходы как аренда.
+        ${filter === "all" ? `Сверка: разница$(склад$+расходы$) + разница БУ$. Конец $ вместе: <strong>${opiuMoney(r.novye?.closing, "USD")}</strong>.` : "Показан один склад по фильтру сверху."}
       </p>
     </div></div>
-    <h4 class="section-title" style="margin:1rem 0 .5rem">Разница между складами (остаток на конец, $)</h4>
-    ${renderOpiuComparisons(r)}`;
+    ${filter === "all" ? `<h4 class="section-title" style="margin:1rem 0 .5rem">Сверка</h4>${renderOpiuComparisons(r)}` : ""}`;
 }
 
-async function renderOpiuClassic(q) {
-  const r = await api(q("/api/reports/opiu"));
-  const multi = r.multi_currency;
-  const money = (n, cur) => (multi && !cur ? "—" : fmtCurrency(n, cur || currency_meta("TJS")));
-  return `
-    <div class="report-header"><h3>ОПиУ · классика${r.warehouse_name ? ` · ${esc(r.warehouse_name)}` : ""}</h3><p>${r.period_label || ""}</p></div>
-    ${renderCurrencyBreakdown(r.by_currency)}
-    <div class="report-kpi">
-      <div class="report-box"><div class="lbl">Выручка</div><div class="val">${multi ? "см. валюты" : money(r.revenue, r.by_currency?.[0])}</div></div>
-      <div class="report-box"><div class="lbl">Валовая прибыль</div><div class="val">${multi ? "см. валюты" : money(r.gross_profit, r.by_currency?.[0])}</div></div>
-      <div class="report-box"><div class="lbl">Расходы</div><div class="val">${money(r.operating_expenses, currency_meta("TJS"))}</div></div>
-      <div class="report-box"><div class="lbl">Чистая прибыль</div><div class="val" style="color:var(--success)">${multi ? "см. валюты" : money(r.net_profit, r.by_currency?.[0])}</div></div>
-    </div>
-    ${(r.expenses_by_category || []).length ? `<div class="card"><div class="card-header"><h3>Расходы по категориям</h3><p class="hint" style="margin:0">Нажмите строку, чтобы открыть записи и откатить</p></div><div class="card-body table-wrap"><table class="data-table"><thead><tr><th>Категория</th><th>Отдел</th><th>Сумма</th></tr></thead><tbody>
-      ${r.expenses_by_category.map((e) => `<tr class="row-clickable" data-exp-cat="${esc(e.category)}" data-exp-dept="${esc(e.department || "main")}">
-        <td>${esc(e.category)}</td>
-        <td>${e.department === "accessories" ? "Аксессуары" : "Основной"}</td>
-        <td>${fmtCurrency(e.amount, currency_meta("TJS"))}</td>
-      </tr>`).join("")}
-    </tbody></table></div></div>` : ""}
-    ${renderExpensesByWarehouse(r.operating_expenses, r.expenses_by_warehouse)}`;
+function bindOpiuPeriodFilter() {
+  const apply = () => {
+    const from = document.getElementById("opiu-from")?.value || "";
+    const to = document.getElementById("opiu-to")?.value || "";
+    const topFrom = document.getElementById("report-from");
+    const topTo = document.getElementById("report-to");
+    if (topFrom) topFrom.value = from;
+    if (topTo) topTo.value = to;
+    loadReport();
+  };
+  document.getElementById("opiu-apply-dates")?.addEventListener("click", apply);
+  document.getElementById("opiu-from")?.addEventListener("change", apply);
+  document.getElementById("opiu-to")?.addEventListener("change", apply);
 }
 
 async function renderOpiuReport(q) {
+  if (opiuViewMode === "classic") opiuViewMode = "summary";
   const modeBar = `
     <div class="segmented opiu-mode-seg" id="opiu-view-mode" style="margin-bottom:1rem">
       <button type="button" class="seg ${opiuViewMode === "summary" ? "active" : ""}" data-opiu-mode="summary">Итог</button>
       <button type="button" class="seg ${opiuViewMode === "detail" ? "active" : ""}" data-opiu-mode="detail">Разбивка</button>
-      <button type="button" class="seg ${opiuViewMode === "classic" ? "active" : ""}" data-opiu-mode="classic">Классика</button>
     </div>`;
 
-  if (opiuViewMode === "classic") {
-    const classic = await renderOpiuClassic(q);
-    document.getElementById("report-content").innerHTML = modeBar + classic;
-    document.querySelectorAll("#report-content tr.row-clickable[data-exp-cat]").forEach((tr) => {
-      tr.addEventListener("click", () => openExpenseCategoryDetail(tr.dataset.expCat, tr.dataset.expDept || "main"));
-    });
-  } else {
-    const r = await api(q("/api/reports/opiu-summary"));
-    const body = opiuViewMode === "detail"
-      ? renderOpiuSummaryTable(r) + renderOpiuDetailBlocks(r)
-      : renderOpiuSummaryTable(r);
-    document.getElementById("report-content").innerHTML = `
-      ${modeBar}
-      <div class="report-header">
-        <h3>ОПиУ · сводка месяца</h3>
-        <p>${esc(r.period_label || "")} · ${esc(r.date_from || "")} — ${esc(r.date_to || "")}</p>
+  const r = await api(q("/api/reports/opiu-summary"));
+  const body = opiuViewMode === "detail"
+    ? renderOpiuSummaryTable(r) + renderOpiuDetailBlocks(r)
+    : renderOpiuSummaryTable(r);
+  const fromVal = document.getElementById("report-from")?.value || r.date_from || "";
+  const toVal = document.getElementById("report-to")?.value || r.date_to || "";
+  document.getElementById("report-content").innerHTML = `
+    ${modeBar}
+    <div class="report-header opiu-report-header">
+      <h3>ОПиУ · фоида + сверка</h3>
+      <div class="opiu-period-filter">
+        <label>С <input type="date" id="opiu-from" class="input" value="${esc(fromVal)}"></label>
+        <label>По <input type="date" id="opiu-to" class="input" value="${esc(toVal)}"></label>
+        <button type="button" class="btn btn-secondary" id="opiu-apply-dates">Показать</button>
+        <span class="opiu-period-hint">${esc(r.period_label || "")}</span>
       </div>
-      ${body}`;
-  }
+    </div>
+    ${body}`;
+  bindOpiuPeriodFilter();
+  bindOpiuRowClicks(r);
+  bindOpiuOpeningsPanel();
 
   document.querySelectorAll("#opiu-view-mode .seg").forEach((b) => {
     b.onclick = () => {
@@ -6539,21 +7059,101 @@ async function loadReport() {
       </tbody></table></div></div>`;
     return;
   }
-  if (reportType === "cashiers") {
-    const r = await api(q("/api/reports/cashiers"));
+  if (reportType === "expenses") {
+    const period = document.getElementById("report-period")?.value || "month";
+    const from = document.getElementById("report-from")?.value || "";
+    const to = document.getElementById("report-to")?.value || "";
+    let url = `/api/expenses?period=${encodeURIComponent(period)}`;
+    if (from) url += `&date_from=${encodeURIComponent(from)}`;
+    if (to) url += `&date_to=${encodeURIComponent(to)}`;
+    const all = await api(url);
+    const items = Array.isArray(all) ? all : [];
+    const expenses = items.filter((x) => (x.kind || "expense") !== "payout");
+    const payouts = items.filter((x) => (x.kind || "") === "payout");
+    const byCat = {};
+    for (const x of expenses) {
+      const cat = x.category || "—";
+      const cur = (x.currency_code || "TJS").toUpperCase();
+      if (!byCat[cat]) byCat[cat] = { count: 0, byCur: {} };
+      byCat[cat].count += 1;
+      byCat[cat].byCur[cur] = (byCat[cat].byCur[cur] || 0) + (+x.amount || 0);
+    }
+    const catRows = Object.entries(byCat).sort((a, b) => {
+      const sa = Object.values(a[1].byCur).reduce((s, n) => s + n, 0);
+      const sb = Object.values(b[1].byCur).reduce((s, n) => s + n, 0);
+      return sb - sa;
+    });
+    const moneyCell = (amount, code) => fmtCurrency(+amount || 0, currency_meta(code || "TJS"));
+    const periodLabel = [from, to].filter(Boolean).join(" — ")
+      || ({ day: "Сегодня", week: "Неделя", month: "Месяц", quarter: "Квартал", year: "Год", all: "Всё время" }[period] || period);
+    const expTotalByCur = {};
+    for (const x of expenses) {
+      const cur = (x.currency_code || "TJS").toUpperCase();
+      expTotalByCur[cur] = (expTotalByCur[cur] || 0) + (+x.amount || 0);
+    }
+    const payTotal = payouts.reduce((s, x) => s + (+x.amount || 0), 0);
     combinedEl.classList.add("hidden");
     document.getElementById("report-content").innerHTML = `
-      <div class="report-header"><h3>Отчёт по кассирам${r.warehouse_name ? ` · ${esc(r.warehouse_name)}` : ""}</h3><p>${r.period_label || ""}</p></div>
-      <div class="card"><div class="card-body table-wrap"><table class="data-table">
-        <thead><tr><th>Кассир</th><th>Продаж</th><th>Выручка</th><th>Прибыль</th><th>Оплаты</th></tr></thead>
-        <tbody>${(r.cashiers || []).map((c) => `<tr>
-          <td><strong>${esc(c.cashier_name)}</strong> <span class="hint">${esc(c.currency_code || "")}</span></td>
-          <td>${c.sales_count}</td>
-          <td>${moneyLine(c.revenue, c.currency_code)}</td>
-          <td>${moneyLine(c.profit, c.currency_code)}</td>
-          <td style="font-size:.85rem">${(c.by_payment || []).map((p) => `${esc(p.name)} ${moneyLine(p.amount, p.currency_code || c.currency_code)}`).join("<br>") || "—"}</td>
-        </tr>`).join("") || '<tr><td colspan="5" style="text-align:center;color:var(--muted)">Нет данных</td></tr>'}
-        </tbody></table></div></div>`;
+      <div class="report-header">
+        <h3>Расходы с кассы</h3>
+        <p>${esc(periodLabel)} · ${expenses.length} записей</p>
+      </div>
+      <div class="report-kpi">
+        <div class="report-box"><div class="lbl">Расходов</div><div class="val">${expenses.length}</div></div>
+        <div class="report-box"><div class="lbl">Сумма расходов</div><div class="val value-multi">${
+          Object.keys(expTotalByCur).length
+            ? Object.entries(expTotalByCur).map(([c, a]) => moneyCell(a, c)).join(" · ")
+            : moneyCell(0, "TJS")
+        }</div></div>
+        <div class="report-box"><div class="lbl">Выплат (отдельно)</div><div class="val">${payouts.length} · ${moneyCell(payTotal, "TJS")}</div></div>
+      </div>
+      <div class="card" style="margin-bottom:1rem"><div class="card-header"><h3>По категориям</h3></div>
+        <div class="card-body table-wrap"><table class="data-table">
+          <thead><tr><th>Категория</th><th>Кол-во</th><th>Сумма</th></tr></thead>
+          <tbody>
+            ${catRows.map(([cat, v]) => `<tr class="row-clickable" data-exp-cat="${esc(cat)}" data-exp-dept="main">
+              <td>${esc(cat)}</td>
+              <td>${v.count}</td>
+              <td>${Object.entries(v.byCur).map(([c, a]) => moneyCell(a, c)).join(" · ")}</td>
+            </tr>`).join("") || '<tr><td colspan="3" class="hint">Нет расходов за период</td></tr>'}
+          </tbody>
+        </table>
+        <p class="hint" style="margin-top:.5rem">Клик по категории — список записей и откат</p>
+        </div></div>
+      <div class="card"><div class="card-header"><h3>Все расходы за период</h3></div>
+        <div class="card-body table-wrap"><table class="data-table">
+          <thead><tr><th>Дата</th><th>Категория</th><th>Сумма</th><th>Оплата</th><th>Описание</th><th>Склад</th><th>Кто</th></tr></thead>
+          <tbody>
+            ${expenses.slice().sort((a, b) => String(a.expense_date || "").localeCompare(String(b.expense_date || "")) || (a.id || 0) - (b.id || 0)).map((x) => `<tr>
+              <td>${esc((x.expense_date || "").slice(0, 10))}</td>
+              <td>${esc(x.category || "—")}</td>
+              <td class="num">${moneyCell(x.amount, x.currency_code)}</td>
+              <td>${esc(x.payment_method_name || x.payment_method_code || "—")}</td>
+              <td>${esc(x.description || "—")}</td>
+              <td>${esc(x.warehouse_name || "—")}</td>
+              <td>${esc(x.created_by || "—")}</td>
+            </tr>`).join("") || '<tr><td colspan="7" class="hint">Нет расходов</td></tr>'}
+          </tbody>
+        </table></div></div>
+      ${payouts.length ? `<div class="card" style="margin-top:1rem"><div class="card-header"><h3>Выплаты за период (${payouts.length})</h3></div>
+        <div class="card-body table-wrap"><table class="data-table">
+          <thead><tr><th>Дата</th><th>Кому</th><th>Сумма</th><th>Склад</th><th>Оплата</th><th>Кто</th></tr></thead>
+          <tbody>
+            ${payouts.slice().sort((a, b) => String(b.expense_date || "").localeCompare(String(a.expense_date || ""))).slice(0, 100).map((x) => `<tr>
+              <td>${esc((x.expense_date || "").slice(0, 10))}</td>
+              <td>${esc(x.payee || x.description || "—")}</td>
+              <td class="num">${moneyCell(x.amount, x.currency_code)}</td>
+              <td>${esc(x.warehouse_name || "—")}</td>
+              <td>${esc(x.payment_method_name || x.payment_method_code || "—")}</td>
+              <td>${esc(x.created_by || "—")}</td>
+            </tr>`).join("")}
+          </tbody>
+        </table>
+        ${payouts.length > 100 ? `<p class="hint">Показаны первые 100 из ${payouts.length}</p>` : ""}
+        </div></div>` : ""}`;
+    document.querySelectorAll("#report-content tr.row-clickable[data-exp-cat]").forEach((tr) => {
+      tr.addEventListener("click", () => openExpenseCategoryDetail(tr.dataset.expCat, tr.dataset.expDept || "main"));
+    });
     return;
   }
 

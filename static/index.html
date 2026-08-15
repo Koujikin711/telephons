@@ -10,7 +10,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/style.css?v=55">
+  <link rel="stylesheet" href="/static/style.css?v=59">
   <style>
     /* Critical POS layout — survives stale CSS cache */
     .pos-desk { display: flex; flex-direction: column; gap: 1rem; width: 100%; }
@@ -902,7 +902,7 @@
               <button class="seg" data-rtype="opiu">ОПиУ</button>
               <button class="seg" data-rtype="dds">ДДС</button>
               <button class="seg" data-rtype="balance">Баланс</button>
-              <button class="seg" data-rtype="cashiers">Кассиры</button>
+              <button class="seg" data-rtype="expenses">Расходы</button>
               <button class="seg" data-rtype="customs">Таможня</button>
             </div>
             <div class="segmented" id="report-scope">
@@ -1531,7 +1531,7 @@
   </dialog>
 
   <div id="toast" class="toast"></div>
-  <script src="/static/app.js?v=90"></script>
+  <script src="/static/app.js?v=117"></script>
   <script>
     if ("serviceWorker" in navigator) {
       navigator.serviceWorker.register("/sw.js").then((reg) => {
